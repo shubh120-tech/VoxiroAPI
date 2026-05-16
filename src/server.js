@@ -49,6 +49,7 @@ app.use("/api", rateLimit({
 }));
 
 // ── Body Parsing ──────────────────────────────────────────────
+// ── Webhook FIRST before body parsing ────────────────────────
 app.use("/webhook", express.raw({ type: "application/json" }), (req, res, next) => {
   if (req.body && Buffer.isBuffer(req.body)) {
     req.rawBody = req.body;
@@ -57,6 +58,8 @@ app.use("/webhook", express.raw({ type: "application/json" }), (req, res, next) 
   next();
 });
 
+// Then import and use webhook router
+app.use("/webhook", whatsappWebhook);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 

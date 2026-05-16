@@ -1,17 +1,16 @@
 import axios from "axios";
 import { query } from "../db/postgres.js";
 
-const META_BASE = process.env.META_BASE_URL || "https://graph.facebook.com";
+const META_BASE = process.env.META_BASE_URL    || "https://graph.facebook.com";
 const VERSION   = process.env.META_API_VERSION || "v19.0";
 
 /**
- * Send a text message to a WhatsApp number.
+ * Send a WhatsApp message and return the response (includes message ID).
  */
 export async function sendWhatsAppMessage({ phoneNumberId, accessToken, to, message }) {
   try {
-    // Simulate typing for human feel (1-3 seconds based on message length)
+    // Typing delay for human feel
     const typingDelay = Math.min(1000 + message.length * 15, 4000);
-    await sendTypingIndicator({ phoneNumberId, accessToken, to });
     await sleep(typingDelay);
 
     const response = await axios.post(
@@ -31,7 +30,8 @@ export async function sendWhatsAppMessage({ phoneNumberId, accessToken, to, mess
       }
     );
 
-    return response.data;
+    return response.data; // contains messages[0].id for status tracking
+
   } catch (err) {
     console.error("WhatsApp send error:", err.response?.data || err.message);
     throw err;
@@ -39,26 +39,7 @@ export async function sendWhatsAppMessage({ phoneNumberId, accessToken, to, mess
 }
 
 /**
- * Send typing indicator — makes agent feel human.
- */
-async function sendTypingIndicator({ phoneNumberId, accessToken, to }) {
-  try {
-    await axios.post(
-      `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
-      {
-        messaging_product: "whatsapp",
-        status:            "read",
-        message_id:        "dummy",
-      },
-      { headers: { Authorization: `Bearer ${accessToken}` } }
-    );
-  } catch {
-    // Typing indicator failure is non-critical
-  }
-}
-
-/**
- * Notify the business owner on their WhatsApp number.
+ * Notify business owner on their WhatsApp number.
  */
 export async function notifyOwnerWhatsApp(businessId, message) {
   try {
@@ -72,6 +53,7 @@ export async function notifyOwnerWhatsApp(businessId, message) {
       WHERE wc.business_id = $1
         AND ns.whatsapp_alerts = TRUE
         AND ns.owner_notify_number IS NOT NULL
+        AND ns.owner_notify_number != ''
     `, [businessId]);
 
     if (!rows.length) return;
@@ -98,7 +80,7 @@ export async function notifyOwnerWhatsApp(businessId, message) {
  */
 export async function getWhatsAppCredentials(businessId) {
   const { rows } = await query(`
-    SELECT phone_number_id, access_token
+    SELECT phone_number_id, access_token, display_name
     FROM whatsapp_configs
     WHERE business_id = $1
   `, [businessId]);

@@ -210,15 +210,34 @@ router.patch("/agent/toggle", async (req, res) => {
 });
 
 // ── Conversations ─────────────────────────────────────────────
+// ── Replace the GET /agent/conversations endpoint in dashboard.js ──
+// Find this:
+//   router.get("/agent/conversations", async (req, res) => {
+// Replace the whole route with this:
+
 router.get("/agent/conversations", async (req, res) => {
   try {
     const { page = 1, limit = 30, status } = req.query;
     const offset = (page - 1) * limit;
-    let sql    = `SELECT * FROM conversations WHERE business_id = $1`;
+
+    let sql = `
+      SELECT
+        c.*,
+        wc.display_name AS whatsapp_display_name
+      FROM conversations c
+      LEFT JOIN whatsapp_configs wc ON wc.business_id = c.business_id
+      WHERE c.business_id = $1
+    `;
     const params = [req.user.business_id];
-    if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
-    sql += ` ORDER BY last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+    if (status) {
+      params.push(status);
+      sql += ` AND c.status = $${params.length}`;
+    }
+
+    sql += ` ORDER BY c.last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
+
     const { rows } = await query(sql, params);
     res.json({ conversations: rows });
   } catch (err) {
@@ -226,11 +245,20 @@ router.get("/agent/conversations", async (req, res) => {
   }
 });
 
+// ── Also replace GET /agent/conversations/:id/messages ──
+// To include status field:
+
 router.get("/agent/conversations/:id/messages", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT * FROM messages
-      WHERE conversation_id = $1 AND business_id = $2
+      SELECT
+        id, conversation_id, business_id,
+        role, content, status,
+        wa_message_id, is_read,
+        created_at
+      FROM messages
+      WHERE conversation_id = $1
+        AND business_id     = $2
       ORDER BY created_at ASC
     `, [req.params.id, req.user.business_id]);
     res.json({ messages: rows });

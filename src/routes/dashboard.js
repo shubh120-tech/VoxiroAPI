@@ -355,8 +355,22 @@ router.put("/settings/whatsapp", async (req, res) => {
       return res.status(400).json({ message: "Phone Number ID is required" });
     }
 
+    // Check if this phone_number_id belongs to another business
+    const { rows: existing } = await query(`
+      SELECT business_id FROM whatsapp_configs 
+      WHERE phone_number_id = $1 
+        AND business_id != $2
+    `, [phoneNumberId, req.user.business_id]);
+
+    if (existing.length > 0) {
+      return res.status(409).json({ 
+        message: "This WhatsApp number is already connected to another Voxiro account. Each WhatsApp number can only be connected to one business." 
+      });
+    }
+
     await query(`
-      INSERT INTO whatsapp_configs (business_id, phone_number_id, access_token, webhook_secret)
+      INSERT INTO whatsapp_configs 
+        (business_id, phone_number_id, access_token, webhook_secret)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (business_id) DO UPDATE
       SET phone_number_id = $2,
@@ -365,12 +379,7 @@ router.put("/settings/whatsapp", async (req, res) => {
           webhook_secret  = CASE WHEN $4 IS NOT NULL AND $4 != '' 
                             THEN $4 ELSE whatsapp_configs.webhook_secret END,
           updated_at      = NOW()
-    `, [
-      req.user.business_id,
-      phoneNumberId,
-      accessToken   || null,
-      webhookSecret || null,
-    ]);
+    `, [req.user.business_id, phoneNumberId, accessToken || null, webhookSecret || null]);
 
     res.json({ success: true });
   } catch (err) {

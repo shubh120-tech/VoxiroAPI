@@ -76,13 +76,16 @@ async function processIncomingMessage({
   waMessageId,
 }) {
   // 1. Find which business owns this WhatsApp number
-  const { rows: bizRows } = await query(`
-    SELECT b.id AS business_id, wc.access_token
-    FROM whatsapp_configs wc
-    JOIN businesses b ON b.id = wc.business_id
-    WHERE wc.phone_number_id = $1
-      AND b.is_active = TRUE
-  `, [phoneNumberId]);
+  // Find which business owns this WhatsApp number
+const { rows: bizRows } = await query(`
+  SELECT b.id AS business_id, wc.access_token
+  FROM whatsapp_configs wc
+  JOIN businesses b ON b.id = wc.business_id
+  WHERE wc.phone_number_id = $1
+    AND b.is_active = TRUE
+  ORDER BY wc.updated_at DESC
+  LIMIT 1
+`, [phoneNumberId]);
 
   if (!bizRows.length) {
     console.warn(`No business found for phoneNumberId: ${phoneNumberId}`);

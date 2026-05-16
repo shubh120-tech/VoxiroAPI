@@ -5,6 +5,7 @@ import helmet       from "helmet";
 import morgan       from "morgan";
 import rateLimit    from "express-rate-limit";
 import { processFollowUps } from "./agents/Followupcron.js"
+import whatsappEmbeddedRouter from "./routes/whatsappEmbedded.js";
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -50,6 +51,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Voxiro Backend" });
 });
 
+
 // ── WhatsApp Webhook ──────────────────────────────────────────
 app.use("/webhook", express.raw({ type: "*/*" }), (req, res, next) => {
   if (req.body && Buffer.isBuffer(req.body)) {
@@ -77,6 +79,7 @@ app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api/admin",  adminRouter);
+app.use("/api", whatsappEmbeddedRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────
 app.use((req, res) => {

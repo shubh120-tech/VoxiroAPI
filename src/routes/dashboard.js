@@ -350,18 +350,32 @@ router.put("/settings/profile", async (req, res) => {
 router.put("/settings/whatsapp", async (req, res) => {
   try {
     const { phoneNumberId, accessToken, webhookSecret } = req.body;
+
+    if (!phoneNumberId) {
+      return res.status(400).json({ message: "Phone Number ID is required" });
+    }
+
     await query(`
       INSERT INTO whatsapp_configs (business_id, phone_number_id, access_token, webhook_secret)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (business_id) DO UPDATE
       SET phone_number_id = $2,
-          access_token    = CASE WHEN $3 != '' THEN $3 ELSE access_token END,
-          webhook_secret  = CASE WHEN $4 != '' THEN $4 ELSE webhook_secret END,
+          access_token    = CASE WHEN $3 IS NOT NULL AND $3 != '' 
+                            THEN $3 ELSE whatsapp_configs.access_token END,
+          webhook_secret  = CASE WHEN $4 IS NOT NULL AND $4 != '' 
+                            THEN $4 ELSE whatsapp_configs.webhook_secret END,
           updated_at      = NOW()
-    `, [req.user.business_id, phoneNumberId, accessToken, webhookSecret]);
+    `, [
+      req.user.business_id,
+      phoneNumberId,
+      accessToken   || null,
+      webhookSecret || null,
+    ]);
+
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ message: "Failed to update WhatsApp config" });
+    console.error("WhatsApp config error:", err.message);
+    res.status(500).json({ message: err.message });
   }
 });
 

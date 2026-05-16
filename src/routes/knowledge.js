@@ -1,44 +1,71 @@
-import express  from "express";
-import multer   from "multer";
-import AWS      from "aws-sdk";
-import { query } from "../db/postgres.js";
+import express      from "express";
+import multer       from "multer";
+import { v2 as cloudinary } from "cloudinary";
+import { Readable } from "stream";
+import { query }    from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
+import Anthropic    from "@anthropic-ai/sdk";
 
 const router = express.Router();
 router.use(authMiddleware);
 
-// Multer — memory storage before sending to S3
+// ── Cloudinary Config ─────────────────────────────────────────
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// ── Multer — memory storage ───────────────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
-    const allowed = ["application/pdf", "application/msword",
+    const allowed = [
+      "application/pdf",
+      "application/msword",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       "application/vnd.ms-excel",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      "image/jpeg", "image/png", "text/plain"];
+      "image/jpeg",
+      "image/png",
+      "text/plain",
+    ];
     if (allowed.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error("File type not supported"));
+      cb(new Error("File type not supported. Use PDF, Word, Excel, Image or TXT."));
     }
   },
 });
 
-const s3 = new AWS.S3({
-  accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region:          process.env.AWS_REGION,
-});
+// ── Upload to Cloudinary ──────────────────────────────────────
+async function uploadToCloudinary(buffer, filename, mimetype) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder:        "voxiro/knowledge",
+        resource_type: "auto",
+        public_id:     `${Date.now()}_${filename.replace(/\s+/g, "_")}`,
+      },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      }
+    );
+    Readable.from(buffer).pipe(stream);
+  });
+}
 
-// Upload document
+// ── Upload Document ───────────────────────────────────────────
 router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "No file provided" });
+    if (!req.file) {
+      return res.status(400).json({ message: "No file provided" });
+    }
 
-    const bId     = req.user.business_id;
-    const ext     = req.file.originalname.split(".").pop().toLowerCase();
-    const s3Key   = `${bId}/${Date.now()}_${req.file.originalname}`;
+    const bId = req.user.business_id;
+    const ext  = req.file.originalname.split(".").pop().toLowerCase();
 
     // Check doc limit for plan
     const { rows: sub } = await query(`
@@ -51,60 +78,72 @@ router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
     `, [bId]);
 
     if (sub.length && parseInt(sub[0].doc_count) >= parseInt(sub[0].doc_limit)) {
-      return res.status(403).json({ message: `Document limit reached for your plan (${sub[0].doc_limit} docs)` });
+      return res.status(403).json({
+        message: `Document limit reached for your plan (${sub[0].doc_limit} docs max). Please upgrade.`
+      });
     }
 
-    // Upload to S3
-    await s3.upload({
-      Bucket:      process.env.AWS_S3_BUCKET,
-      Key:         s3Key,
-      Body:        req.file.buffer,
-      ContentType: req.file.mimetype,
-    }).promise();
+    // Upload to Cloudinary
+    const uploadResult = await uploadToCloudinary(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype
+    );
 
-    // Save to DB with status pending
+    // Save to DB with status processing
     const { rows } = await query(`
-      INSERT INTO knowledge_docs (business_id, file_name, file_size, file_type, s3_key, status)
+      INSERT INTO knowledge_docs
+        (business_id, file_name, file_size, file_type, s3_key, status)
       VALUES ($1, $2, $3, $4, $5, 'processing')
       RETURNING *
-    `, [bId, req.file.originalname, req.file.size, ext, s3Key]);
+    `, [
+      bId,
+      req.file.originalname,
+      req.file.size,
+      ext,
+      uploadResult.secure_url, // store Cloudinary URL in s3_key column
+    ]);
 
-    // Process asynchronously — extract text and update agent system prompt
-    processDocumentAsync(rows[0].id, bId, req.file.buffer, ext).catch(console.error);
+    // Process document asynchronously
+    processDocumentAsync(rows[0].id, bId, req.file.buffer, ext, req.file.mimetype)
+      .catch(console.error);
 
     res.status(201).json(rows[0]);
+
   } catch (err) {
     console.error("Upload error:", err);
     res.status(500).json({ message: err.message || "Upload failed" });
   }
 });
 
-// Reprocess a document
+// ── Reprocess Document ────────────────────────────────────────
 router.post("/knowledge/:id/reprocess", async (req, res) => {
   try {
-    await query("UPDATE knowledge_docs SET status = 'processing' WHERE id = $1 AND business_id = $2",
-      [req.params.id, req.user.business_id]);
+    await query(
+      "UPDATE knowledge_docs SET status = 'processing' WHERE id = $1 AND business_id = $2",
+      [req.params.id, req.user.business_id]
+    );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to reprocess" });
   }
 });
 
-/**
- * Extract text from document and save to DB.
- * This runs in background — doesn't block the response.
- */
-async function processDocumentAsync(docId, businessId, buffer, ext) {
+// ── Process Document Async ────────────────────────────────────
+async function processDocumentAsync(docId, businessId, buffer, ext, mimetype) {
   try {
     let extractedText = "";
 
-    // Basic text extraction — extend with proper parsers per type
     if (ext === "txt") {
+      // Plain text — read directly
       extractedText = buffer.toString("utf-8");
     } else {
-      // For PDF/DOCX/XLSX — use Anthropic vision to extract text
-      extractedText = await extractWithClaude(buffer, ext);
+      // Use Claude to extract text from PDF/image/doc
+      extractedText = await extractWithClaude(buffer, mimetype);
     }
+
+    // Clean extracted text
+    extractedText = extractedText.trim().slice(0, 50000); // limit to 50k chars
 
     // Save extracted text
     await query(`
@@ -116,33 +155,50 @@ async function processDocumentAsync(docId, businessId, buffer, ext) {
     // Rebuild agent system prompt with new knowledge
     await rebuildAgentPrompt(businessId);
 
+    console.log(`✅ Document processed: ${docId}`);
+
   } catch (err) {
-    console.error("Document processing error:", err);
+    console.error("Document processing error:", err.message);
     await query(`
       UPDATE knowledge_docs
-      SET status = 'error', error_message = $1 WHERE id = $2
+      SET status = 'error', error_message = $1, updated_at = NOW()
+      WHERE id = $2
     `, [err.message, docId]);
   }
 }
 
-async function extractWithClaude(buffer, ext) {
-  const Anthropic = (await import("@anthropic-ai/sdk")).default;
+// ── Extract Text Using Claude Vision ─────────────────────────
+async function extractWithClaude(buffer, mimetype) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const base64    = buffer.toString("base64");
 
-  const base64 = buffer.toString("base64");
-  const mediaType = ext === "pdf" ? "application/pdf" : "image/jpeg";
+  // Determine media type for Claude
+  let mediaType = mimetype;
+  if (!["application/pdf", "image/jpeg", "image/png", "image/gif", "image/webp"].includes(mimetype)) {
+    // For unsupported types, return empty string
+    return "";
+  }
+
+  const contentType = mimetype === "application/pdf" ? "document" : "image";
 
   const response = await anthropic.messages.create({
-    model:     process.env.ANTHROPIC_MODEL,
+    model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
     max_tokens: 4096,
     messages: [{
-      role: "user",
+      role:    "user",
       content: [
         {
-          type:   "document",
-          source: { type: "base64", media_type: mediaType, data: base64 },
+          type:   contentType,
+          source: {
+            type:       "base64",
+            media_type: mediaType,
+            data:        base64,
+          },
         },
-        { type: "text", text: "Extract all text content from this document. Return only the extracted text, no commentary." },
+        {
+          type: "text",
+          text: "Extract all text content from this document. Include all details like prices, services, policies, contact info, and any other information. Return only the extracted text, no commentary or formatting.",
+        },
       ],
     }],
   });
@@ -150,21 +206,33 @@ async function extractWithClaude(buffer, ext) {
   return response.content[0]?.text || "";
 }
 
+// ── Rebuild Agent System Prompt With New Knowledge ────────────
 async function rebuildAgentPrompt(businessId) {
-  // Get all processed docs for this business
   const { rows } = await query(`
-    SELECT extracted_text FROM knowledge_docs
-    WHERE business_id = $1 AND status = 'processed' AND extracted_text IS NOT NULL
+    SELECT file_name, extracted_text
+    FROM knowledge_docs
+    WHERE business_id = $1
+      AND status = 'processed'
+      AND extracted_text IS NOT NULL
+      AND extracted_text != ''
+    ORDER BY created_at DESC
   `, [businessId]);
 
-  const knowledge = rows.map(r => r.extracted_text).join("\n\n---\n\n");
+  if (!rows.length) return;
+
+  // Build knowledge section
+  const knowledge = rows.map(r =>
+    `=== ${r.file_name} ===\n${r.extracted_text}`
+  ).join("\n\n---\n\n");
 
   // Update agent config with compiled knowledge
   await query(`
     UPDATE agent_configs
-    SET system_prompt = system_prompt || $1, updated_at = NOW()
+    SET system_prompt = $1, updated_at = NOW()
     WHERE business_id = $2
-  `, [`\n\nKNOWLEDGE BASE:\n${knowledge}`, businessId]);
+  `, [knowledge, businessId]);
+
+  console.log(`✅ Agent knowledge updated for business: ${businessId}`);
 }
 
 export default router;

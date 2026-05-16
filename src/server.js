@@ -4,6 +4,7 @@ import cors         from "cors";
 import helmet       from "helmet";
 import morgan       from "morgan";
 import rateLimit    from "express-rate-limit";
+import { processFollowUps } from "./agents/Followupcron.js"
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -17,10 +18,10 @@ import whatsappWebhook   from "./webhook/whatsapp.js";
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-// ── Trust Proxy — required for Railway + ngrok ────────────────
+// ── Trust Proxy ───────────────────────────────────────────────
 app.set("trust proxy", 1);
 
-// ── CORS — allow all origins ──────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
@@ -44,26 +45,23 @@ app.use("/api", rateLimit({
   max:      200,
 }));
 
-// ── Health Check — before anything else ──────────────────────
+// ── Health Check ──────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Voxiro Backend" });
 });
 
-// ── WhatsApp Webhook — raw body needed for signature check ────
+// ── WhatsApp Webhook ──────────────────────────────────────────
 app.use("/webhook", express.raw({ type: "*/*" }), (req, res, next) => {
   if (req.body && Buffer.isBuffer(req.body)) {
     req.rawBody = req.body;
-    try {
-      req.body = JSON.parse(req.body.toString());
-    } catch {
-      req.body = {};
-    }
+    try { req.body = JSON.parse(req.body.toString()); }
+    catch { req.body = {}; }
   }
   next();
 });
 app.use("/webhook", whatsappWebhook);
 
-// ── Body Parsing — after webhook ──────────────────────────────
+// ── Body Parsing ──────────────────────────────────────────────
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -96,6 +94,11 @@ app.listen(PORT, () => {
   console.log(`\n🚀 Voxiro Backend running on port ${PORT}`);
   console.log(`   Environment: ${process.env.NODE_ENV || "development"}`);
   console.log(`   Health:      http://localhost:${PORT}/health\n`);
+
+  // ── Follow-up Cron — every 15 minutes ──────────────────────
+  console.log("⏰ Follow-up scheduler started — runs every 15 minutes");
+  processFollowUps(); // run once on startup
+  setInterval(processFollowUps, 15 * 60 * 1000);
 });
 
 export default app;

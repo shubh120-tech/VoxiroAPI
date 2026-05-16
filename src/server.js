@@ -17,24 +17,20 @@ import whatsappWebhook   from "./webhook/whatsapp.js";
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
-// ── Trust Proxy — required for ngrok + Railway ────────────────
+// ── Trust Proxy — required for Railway + ngrok ────────────────
 app.set("trust proxy", 1);
-// Allow all origins including ngrok
+
+// ── CORS — allow all origins ──────────────────────────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
+  if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
-// ── Security Middleware ───────────────────────────────────────
-app.use(helmet());
-app.use(cors({
-  origin: true,
-  credentials: true,
-}));
+
+// ── Security ──────────────────────────────────────────────────
+app.use(helmet({ crossOriginResourcePolicy: false }));
 
 // ── Rate Limiting ─────────────────────────────────────────────
 app.use("/api/auth", rateLimit({
@@ -45,21 +41,29 @@ app.use("/api/auth", rateLimit({
 
 app.use("/api", rateLimit({
   windowMs: 1 * 60 * 1000,
-  max:      100,
+  max:      200,
 }));
 
-// ── Body Parsing ──────────────────────────────────────────────
-// ── Webhook FIRST before body parsing ────────────────────────
-app.use("/webhook", express.raw({ type: "application/json" }), (req, res, next) => {
+// ── Health Check — before anything else ──────────────────────
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Voxiro Backend" });
+});
+
+// ── WhatsApp Webhook — raw body needed for signature check ────
+app.use("/webhook", express.raw({ type: "*/*" }), (req, res, next) => {
   if (req.body && Buffer.isBuffer(req.body)) {
     req.rawBody = req.body;
-    req.body    = JSON.parse(req.body.toString());
+    try {
+      req.body = JSON.parse(req.body.toString());
+    } catch {
+      req.body = {};
+    }
   }
   next();
 });
-
-// Then import and use webhook router
 app.use("/webhook", whatsappWebhook);
+
+// ── Body Parsing — after webhook ──────────────────────────────
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -68,13 +72,7 @@ if (process.env.NODE_ENV !== "test") {
   app.use(morgan("dev"));
 }
 
-// ── Health Check ──────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Voxiro Backend" });
-});
-
 // ── Routes ────────────────────────────────────────────────────
-app.use("/webhook",    whatsappWebhook);
 app.use("/join",       magicLinkRouter);
 app.use("/api/auth",   authRouter);
 app.use("/api",        dashboardRouter);

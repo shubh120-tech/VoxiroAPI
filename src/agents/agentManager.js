@@ -1,10 +1,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { buildSystemPrompt } from "./systemPrompt.js";
-import { saveLeadTool,          executeSaveLead          } from "./tools/saveLead.js";
-import { confirmOrderTool,      executeConfirmOrder       } from "./tools/confirmOrder.js";
-import { bookAppointmentTool,   executeBookAppointment    } from "./tools/bookAppointment.js";
-import { checkAvailabilityTool, executeCheckAvailability  } from "./tools/checkAvailability.js";
-import { notifyOwnerTool,       executeNotifyOwner        } from "./tools/notifyOwner.js";
+import { saveLeadTool,           executeSaveLead           } from "./tools/saveLead.js";
+import { confirmOrderTool,       executeConfirmOrder        } from "./tools/confirmOrder.js";
+import { bookAppointmentTool,    executeBookAppointment     } from "./tools/bookAppointment.js";
+import { checkAvailabilityTool,  executeCheckAvailability   } from "./tools/checkAvailability.js";
+import { notifyOwnerTool,        executeNotifyOwner         } from "./tools/notifyOwner.js";
+import { scheduleFollowupTool,   executeScheduleFollowup    } from "./tools/schedulefollowup.js";
 import { query } from "../db/postgres.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -15,16 +16,11 @@ const TOOLS = [
   bookAppointmentTool,
   checkAvailabilityTool,
   notifyOwnerTool,
+  scheduleFollowupTool,
 ];
 
-// Full history — never forgets any message in the conversation
 const MAX_HISTORY = 100;
 
-/**
- * Main entry point — called when a WhatsApp message arrives.
- * Uses regular Claude Messages API with full conversation history.
- * Agent remembers EVERYTHING said in the conversation — message 1, 21, 200.
- */
 export async function handleIncomingMessage({
   businessId,
   conversationId,
@@ -32,45 +28,37 @@ export async function handleIncomingMessage({
   customerName,
   message,
 }) {
-  // 1. Check if owner took over — agent stays silent
   const { rows: convRows } = await query(
     "SELECT status FROM conversations WHERE id = $1",
     [conversationId]
   );
   if (convRows[0]?.status === "manual") return null;
 
-  // 2. Save incoming message to DB
   await saveMessage({ conversationId, businessId, role: "customer", content: message });
 
-  // 3. Update conversation last message
   await query(`
     UPDATE conversations
     SET last_message = $1, last_message_at = NOW(), updated_at = NOW()
     WHERE id = $2
   `, [message, conversationId]);
 
-  // 4. Build system prompt for this business
   const systemPrompt = await buildSystemPrompt(businessId);
+  const history      = await loadConversationHistory(conversationId);
 
-  // 5. Load FULL conversation history from DB
-  const history = await loadConversationHistory(conversationId);
-
-  // 6. Build messages — full history + new message
   const messages = [
     ...history,
     { role: "user", content: message },
   ];
 
-  // 7. Call Claude with full context
   const reply = await callClaude({
     systemPrompt,
     messages,
     businessId,
     conversationId,
     customerPhone,
+    customerName,
   });
 
-  // 8. Save agent reply
   if (reply) {
     await saveMessage({ conversationId, businessId, role: "agent", content: reply });
   }
@@ -78,10 +66,6 @@ export async function handleIncomingMessage({
   return reply;
 }
 
-/**
- * Load full conversation history from DB.
- * customer → user, agent/owner → assistant
- */
 async function loadConversationHistory(conversationId) {
   const { rows } = await query(`
     SELECT role, content FROM messages
@@ -96,11 +80,14 @@ async function loadConversationHistory(conversationId) {
   }));
 }
 
-/**
- * Call Claude Messages API.
- * Handles tool calls in a loop until agent gives final text reply.
- */
-async function callClaude({ systemPrompt, messages, businessId, conversationId, customerPhone }) {
+async function callClaude({
+  systemPrompt,
+  messages,
+  businessId,
+  conversationId,
+  customerPhone,
+  customerName,
+}) {
   try {
     let response = await anthropic.messages.create({
       model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
@@ -110,7 +97,6 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
       messages,
     });
 
-    // Keep looping until no more tool calls
     while (response.stop_reason === "tool_use") {
       const toolUseBlocks = response.content.filter(b => b.type === "tool_use");
       const toolResults   = [];
@@ -122,6 +108,7 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
           businessId,
           conversationId,
           customerPhone,
+          customerName,
         });
         toolResults.push({
           type:        "tool_result",
@@ -130,7 +117,6 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
         });
       }
 
-      // Add tool results and call Claude again
       messages = [
         ...messages,
         { role: "assistant", content: response.content },
@@ -146,7 +132,6 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
       });
     }
 
-    // Extract final text
     const textReply = response.content
       .filter(b => b.type === "text")
       .map(b => b.text)
@@ -161,24 +146,19 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
   }
 }
 
-/**
- * Route tool calls to the right executor.
- */
-async function executeTool({ toolName, input, businessId, conversationId, customerPhone }) {
-  const ctx = { businessId, conversationId, customerPhone, input };
+async function executeTool({ toolName, input, businessId, conversationId, customerPhone, customerName }) {
+  const ctx = { businessId, conversationId, customerPhone, customerName, input };
   switch (toolName) {
     case "save_lead":          return executeSaveLead(ctx);
     case "confirm_order":      return executeConfirmOrder(ctx);
     case "book_appointment":   return executeBookAppointment(ctx);
     case "check_availability": return executeCheckAvailability(ctx);
     case "notify_owner":       return executeNotifyOwner(ctx);
+    case "schedule_followup":  return executeScheduleFollowup(ctx);
     default:                   return { error: `Unknown tool: ${toolName}` };
   }
 }
 
-/**
- * Save a message to the DB.
- */
 async function saveMessage({ conversationId, businessId, role, content }) {
   await query(`
     INSERT INTO messages (conversation_id, business_id, role, content)

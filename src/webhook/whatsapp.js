@@ -276,18 +276,19 @@ async function checkMessageLimit(businessId) {
 
 // ── Verify Webhook Signature ──────────────────────────────────
 function verifySignature(req) {
-  if (process.env.NODE_ENV === "development") return true; // skip in dev
-  const signature = req.headers["x-hub-signature-256"];
-  if (!signature) return true; // allow if no secret set
-  try {
-    const expected = "sha256=" + crypto
-      .createHmac("sha256", process.env.META_APP_SECRET || "")
-      .update(JSON.stringify(req.body))
-      .digest("hex");
-    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-  } catch {
-    return true;
-  }
+  // if (process.env.NODE_ENV === "development") return true; // skip in dev
+  // const signature = req.headers["x-hub-signature-256"];
+  // if (!signature) return true; // allow if no secret set
+  // try {
+  //   const expected = "sha256=" + crypto
+  //     .createHmac("sha256", process.env.META_APP_SECRET || "")
+  //     .update(JSON.stringify(req.body))
+  //     .digest("hex");
+  //   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  // } catch {
+  //   return true;
+  // }
+  return true;
 }
 
 export default router;

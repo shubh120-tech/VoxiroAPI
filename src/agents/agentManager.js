@@ -5,7 +5,7 @@ import { confirmOrderTool,       executeConfirmOrder        } from "./tools/conf
 import { bookAppointmentTool,    executeBookAppointment     } from "./tools/bookAppointment.js";
 import { checkAvailabilityTool,  executeCheckAvailability   } from "./tools/checkAvailability.js";
 import { notifyOwnerTool,        executeNotifyOwner         } from "./tools/notifyOwner.js";
-import { scheduleFollowupTool,   executeScheduleFollowup    } from "./tools/schedulefollowup.js";
+import { scheduleFollowupTool,   executeScheduleFollowup    } from "./tools/scheduleFollowup.js";
 import { query } from "../db/postgres.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });

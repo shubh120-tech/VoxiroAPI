@@ -31,7 +31,6 @@ export async function buildSystemPrompt(businessId) {
         AND extracted_text IS NOT NULL
         AND extracted_text != ''
       ORDER BY created_at DESC
-      LIMIT 10
     `, [businessId]),
   ]);
 

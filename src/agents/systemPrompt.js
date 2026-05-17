@@ -1,7 +1,7 @@
 import { query } from "../db/postgres.js";
 
 export async function buildSystemPrompt(businessId) {
-  const [configResult, knowledgeResult] = await Promise.all([
+  const [configResult, regularDocsResult] = await Promise.all([
     query(`
       SELECT
         b.name            AS business_name,
@@ -15,25 +15,25 @@ export async function buildSystemPrompt(businessId) {
         ac.greeting,
         ac.services,
         ac.pricing,
-        ac.system_prompt  AS knowledge_base,
-        ns.owner_notify_number
+        ac.system_prompt  AS consolidated_knowledge
       FROM businesses b
       JOIN agent_configs ac         ON ac.business_id = b.id
       JOIN notification_settings ns ON ns.business_id = b.id
       WHERE b.id = $1
     `, [businessId]),
 
+    // Only load NON-chat docs (PDFs, Word, Excel etc.)
+    // Chat knowledge comes from consolidated_knowledge in agent_configs
     query(`
-      SELECT file_name, file_type, extracted_text
+      SELECT file_name, extracted_text
       FROM knowledge_docs
       WHERE business_id = $1
+        AND file_type != 'whatsapp_chat'
         AND status = 'processed'
         AND extracted_text IS NOT NULL
         AND extracted_text != ''
-      ORDER BY
-        CASE WHEN file_type = 'whatsapp_chat' THEN 0 ELSE 1 END,
-        created_at DESC
-      LIMIT 10
+      ORDER BY created_at DESC
+      LIMIT 5
     `, [businessId]),
   ]);
 
@@ -41,25 +41,16 @@ export async function buildSystemPrompt(businessId) {
 
   const biz  = configResult.rows[0];
   const tone = TONE_MAP[biz.tone] || TONE_MAP.friendly;
-  const docs = knowledgeResult.rows;
+  const regularDocs = regularDocsResult.rows;
 
-  const chatDocs    = docs.filter(d => d.file_type === "whatsapp_chat");
-  const regularDocs = docs.filter(d => d.file_type !== "whatsapp_chat");
+  // Use consolidated knowledge (from consolidation process)
+  // This is ONE clean document instead of 49 raw chats
+  const consolidatedKnowledge = biz.consolidated_knowledge || "";
 
-  // Build knowledge sections
-  let knowledgeSection = "";
-
-  if (chatDocs.length > 0) {
-    knowledgeSection += `\n\nHOW THIS BUSINESS NEGOTIATES AND COMMUNICATES:
-(Learned from real conversations — follow this exactly)
-
-${chatDocs.map(d => d.extracted_text).join("\n\n---\n\n")}`;
-  }
-
-  if (regularDocs.length > 0) {
-    knowledgeSection += `\n\nBUSINESS KNOWLEDGE BASE:
-${regularDocs.map(d => `--- ${d.file_name} ---\n${d.extracted_text}`).join("\n\n")}`;
-  }
+  // Build regular docs section
+  const regularDocsSection = regularDocs.length > 0
+    ? `\n\nBUSINESS DOCUMENTS:\n${regularDocs.map(d => `--- ${d.file_name} ---\n${d.extracted_text}`).join("\n\n")}`
+    : "";
 
   return `
 You are ${biz.agent_name}, a professional representative at ${biz.business_name}.
@@ -114,7 +105,7 @@ CONVERSATION RULES:
 BUSINESS BOUNDARY:
 - Only discuss topics related to ${biz.business_name}
 - If customer asks unrelated questions → politely redirect
-- "I can only help with ${biz.business_name} queries. What can I help you with?"
+- Say: "I can only help with ${biz.business_name} queries. What can I help you with?"
 
 TOOLS — USE WHEN APPROPRIATE:
 - save_lead: Customer shows buying interest
@@ -128,10 +119,10 @@ FOLLOW-UP DETECTION:
 - "busy" / "later" / "call me tomorrow" → schedule_followup
 - "let me think" / "discuss with family" → schedule_followup in 2 days
 - Always CALL the tool — never just say "I will follow up"
-${knowledgeSection}
 
 GREETING:
 ${biz.greeting || `Hello! Welcome to ${biz.business_name}. How can I help you?`}
+${consolidatedKnowledge ? `\n\nHOW THIS BUSINESS COMMUNICATES AND NEGOTIATES:\n(This is the consolidated knowledge from real conversations — follow this exactly)\n\n${consolidatedKnowledge}` : ""}${regularDocsSection}
 `.trim();
 }
 

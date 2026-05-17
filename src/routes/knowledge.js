@@ -1,7 +1,6 @@
 import express      from "express";
 import multer       from "multer";
-import { v2 as cloudinary } from "cloudinary";
-import { Readable } from "stream";
+import AWS          from "aws-sdk";
 import { query }    from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 import Anthropic    from "@anthropic-ai/sdk";
@@ -9,17 +8,21 @@ import Anthropic    from "@anthropic-ai/sdk";
 const router = express.Router();
 router.use(authMiddleware);
 
-// ── Cloudinary Config ─────────────────────────────────────────
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key:    process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
+// ── Cloudflare R2 Config (S3-compatible) ─────────────────────
+const r2 = new AWS.S3({
+  endpoint: `https://${process.env.CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  accessKeyId:     process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+  secretAccessKey: process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+  region:          "auto",
+  signatureVersion: "v4",
 });
 
-// ── Multer ────────────────────────────────────────────────────
+const BUCKET = process.env.CLOUDFLARE_R2_BUCKET || "voxiro-knowledge";
+
+// ── Multer — memory storage ───────────────────────────────────
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 10 * 1024 * 1024 },
+  limits:  { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
     const allowed = [
       "application/pdf",
@@ -35,22 +38,31 @@ const upload = multer({
   },
 });
 
-// ── Upload to Cloudinary ──────────────────────────────────────
-async function uploadToCloudinary(buffer, filename) {
-  return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      { folder: "voxiro/knowledge", resource_type: "auto", public_id: `${Date.now()}_${filename.replace(/\s+/g, "_")}` },
-      (error, result) => { if (error) reject(error); else resolve(result); }
-    );
-    Readable.from(buffer).pipe(stream);
-  });
+// ── Upload to Cloudflare R2 ───────────────────────────────────
+async function uploadToR2(buffer, filename, mimetype, businessId) {
+  const key = `${businessId}/${Date.now()}_${filename.replace(/\s+/g, "_")}`;
+
+  await r2.putObject({
+    Bucket:      BUCKET,
+    Key:         key,
+    Body:        buffer,
+    ContentType: mimetype,
+  }).promise();
+
+  return key;
 }
 
-// ── Detect if file is a WhatsApp chat export ──────────────────
+// ── Delete from Cloudflare R2 ─────────────────────────────────
+async function deleteFromR2(key) {
+  try {
+    await r2.deleteObject({ Bucket: BUCKET, Key: key }).promise();
+  } catch (err) {
+    console.error("R2 delete error:", err.message);
+  }
+}
+
+// ── Detect WhatsApp Chat Export ───────────────────────────────
 function isWhatsAppChatExport(text) {
-  // WhatsApp exports have lines like:
-  // "17/05/2026, 10:30 - John: Hello"
-  // "[17/05/2026, 10:30:00] John: Hello"
   const patterns = [
     /\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}/,
     /\[\d{1,2}\/\d{1,2}\/\d{2,4},\s+\d{1,2}:\d{2}/,
@@ -60,11 +72,9 @@ function isWhatsAppChatExport(text) {
   return patterns.some(p => p.test(text.slice(0, 2000)));
 }
 
-// ── Process WhatsApp Chat Export with Claude ──────────────────
+// ── Process WhatsApp Chat Export ──────────────────────────────
 async function processWhatsAppChat(chatText, businessName) {
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-  // Limit chat to avoid token overuse
+  const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const trimmedChat = chatText.slice(0, 30000);
 
   const response = await anthropic.messages.create({
@@ -80,7 +90,7 @@ Analyze this chat export and extract:
 2. HOW BUSINESS RESPONDS — Exact phrases and style used to answer
 3. OBJECTION HANDLING — How does the business handle price objections, hesitation, "too expensive", "let me think"
 4. CLOSING TECHNIQUES — How does the business close a sale or booking
-5. TONE AND STYLE — Is it formal/informal? Do they use Hindi/English/Hinglish? Any specific phrases they always use?
+5. TONE AND STYLE — Is it formal/informal? Hindi/English/Hinglish? Specific phrases always used?
 6. PRICING CONVERSATIONS — How do they discuss pricing?
 7. FOLLOW-UP STYLE — How do they follow up with leads?
 
@@ -103,7 +113,7 @@ router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
     const bId = req.user.business_id;
     const ext  = req.file.originalname.split(".").pop().toLowerCase();
 
-    // Check doc limit
+    // Check doc limit for plan
     const { rows: sub } = await query(`
       SELECT COUNT(kd.id) AS doc_count, p.doc_limit
       FROM subscriptions s
@@ -114,27 +124,35 @@ router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
     `, [bId]);
 
     if (sub.length && parseInt(sub[0].doc_count) >= parseInt(sub[0].doc_limit)) {
-      return res.status(403).json({ message: `Document limit reached for your plan (${sub[0].doc_limit} docs max). Please upgrade.` });
+      return res.status(403).json({
+        message: `Document limit reached for your plan (${sub[0].doc_limit} docs max). Please upgrade.`,
+      });
     }
 
-    // Upload to Cloudinary
-    const uploadResult = await uploadToCloudinary(req.file.buffer, req.file.originalname);
-
-    // Detect if WhatsApp chat export
+    // Detect WhatsApp chat export
     let fileType = ext;
     if (ext === "txt") {
-      const textPreview = req.file.buffer.toString("utf-8").slice(0, 2000);
-      if (isWhatsAppChatExport(textPreview)) {
+      const preview = req.file.buffer.toString("utf-8").slice(0, 2000);
+      if (isWhatsAppChatExport(preview)) {
         fileType = "whatsapp_chat";
       }
     }
 
+    // Upload to Cloudflare R2
+    const r2Key = await uploadToR2(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      bId
+    );
+
     // Save to DB
     const { rows } = await query(`
-      INSERT INTO knowledge_docs (business_id, file_name, file_size, file_type, s3_key, status)
+      INSERT INTO knowledge_docs
+        (business_id, file_name, file_size, file_type, s3_key, status)
       VALUES ($1, $2, $3, $4, $5, 'processing')
       RETURNING *
-    `, [bId, req.file.originalname, req.file.size, fileType, uploadResult.secure_url]);
+    `, [bId, req.file.originalname, req.file.size, fileType, r2Key]);
 
     // Process async
     processDocumentAsync(rows[0].id, bId, req.file.buffer, fileType, req.file.mimetype)
@@ -151,14 +169,57 @@ router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// ── Reprocess ─────────────────────────────────────────────────
+// ── Reprocess Document ────────────────────────────────────────
 router.post("/knowledge/:id/reprocess", async (req, res) => {
   try {
-    await query("UPDATE knowledge_docs SET status = 'processing' WHERE id = $1 AND business_id = $2",
-      [req.params.id, req.user.business_id]);
+    // Get doc details
+    const { rows } = await query(
+      "SELECT * FROM knowledge_docs WHERE id = $1 AND business_id = $2",
+      [req.params.id, req.user.business_id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "Document not found" });
+
+    await query(
+      "UPDATE knowledge_docs SET status = 'processing' WHERE id = $1",
+      [req.params.id]
+    );
+
+    // Re-download from R2 and reprocess
+    const r2Object = await r2.getObject({ Bucket: BUCKET, Key: rows[0].s3_key }).promise();
+    const buffer   = r2Object.Body;
+
+    processDocumentAsync(rows[0].id, req.user.business_id, buffer, rows[0].file_type, rows[0].file_type)
+      .catch(console.error);
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to reprocess" });
+  }
+});
+
+// ── Delete Document ───────────────────────────────────────────
+router.delete("/knowledge/:id", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT s3_key FROM knowledge_docs WHERE id = $1 AND business_id = $2",
+      [req.params.id, req.user.business_id]
+    );
+
+    if (rows.length && rows[0].s3_key) {
+      await deleteFromR2(rows[0].s3_key);
+    }
+
+    await query(
+      "DELETE FROM knowledge_docs WHERE id = $1 AND business_id = $2",
+      [req.params.id, req.user.business_id]
+    );
+
+    // Rebuild agent knowledge after deletion
+    await rebuildAgentPrompt(req.user.business_id);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete document" });
   }
 });
 
@@ -168,35 +229,28 @@ async function processDocumentAsync(docId, businessId, buffer, fileType, mimetyp
     let extractedText = "";
 
     if (fileType === "whatsapp_chat") {
-      // Smart WhatsApp chat processing
       const rawText = buffer.toString("utf-8");
-
-      // Get business name for context
       const { rows } = await query("SELECT name FROM businesses WHERE id = $1", [businessId]);
       const businessName = rows[0]?.name || "the business";
-
-      console.log(`📱 Processing WhatsApp chat export for ${businessName}...`);
+      console.log(`📱 Processing WhatsApp chat for ${businessName}...`);
       extractedText = await processWhatsAppChat(rawText, businessName);
 
     } else if (fileType === "txt") {
       extractedText = buffer.toString("utf-8");
 
     } else {
-      // PDF, DOCX, images — use Claude vision
       extractedText = await extractWithClaude(buffer, mimetype);
     }
 
     // Limit size
     extractedText = extractedText.trim().slice(0, 50000);
 
-    // Save extracted text
     await query(`
       UPDATE knowledge_docs
       SET extracted_text = $1, status = 'processed', updated_at = NOW()
       WHERE id = $2
     `, [extractedText, docId]);
 
-    // Rebuild agent knowledge
     await rebuildAgentPrompt(businessId);
     console.log(`✅ Document processed: ${docId}`);
 
@@ -210,7 +264,7 @@ async function processDocumentAsync(docId, businessId, buffer, fileType, mimetyp
   }
 }
 
-// ── Extract Text from PDF/Image using Claude ──────────────────
+// ── Extract Text Using Claude Vision ─────────────────────────
 async function extractWithClaude(buffer, mimetype) {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const base64    = buffer.toString("base64");
@@ -242,7 +296,7 @@ async function extractWithClaude(buffer, mimetype) {
   return response.content[0]?.text || "";
 }
 
-// ── Rebuild Agent System Prompt With All Knowledge ────────────
+// ── Rebuild Agent Knowledge From All Docs ─────────────────────
 async function rebuildAgentPrompt(businessId) {
   const { rows } = await query(`
     SELECT file_name, file_type, extracted_text
@@ -252,13 +306,12 @@ async function rebuildAgentPrompt(businessId) {
       AND extracted_text IS NOT NULL
       AND extracted_text != ''
     ORDER BY
-      CASE WHEN file_type = 'whatsapp_chat' THEN 0 ELSE 1 END, -- chat exports first
+      CASE WHEN file_type = 'whatsapp_chat' THEN 0 ELSE 1 END,
       created_at DESC
   `, [businessId]);
 
   if (!rows.length) return;
 
-  // Separate chat exports from regular docs
   const chatExports = rows.filter(r => r.file_type === "whatsapp_chat");
   const regularDocs = rows.filter(r => r.file_type !== "whatsapp_chat");
 
@@ -274,7 +327,6 @@ async function rebuildAgentPrompt(businessId) {
     knowledge += regularDocs.map(r => `--- ${r.file_name} ---\n${r.extracted_text}`).join("\n\n");
   }
 
-  // Save to agent_configs system_prompt field
   await query(`
     UPDATE agent_configs
     SET system_prompt = $1, updated_at = NOW()

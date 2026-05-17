@@ -156,19 +156,20 @@ router.patch("/appointments/:id/status", async (req, res) => {
 // ── Agent ─────────────────────────────────────────────────────
 router.get("/agent/status", async (req, res) => {
   try {
-    const [agent, sub, convs] = await Promise.all([
+    const [agent, sub, convs, unread] = await Promise.all([
       query("SELECT agent_name, is_active FROM agent_configs WHERE business_id = $1", [req.user.business_id]),
       query("SELECT s.messages_used, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [req.user.business_id]),
       query("SELECT COUNT(*) FROM conversations WHERE business_id = $1 AND status != 'closed'", [req.user.business_id]),
+      query("SELECT COUNT(*) FROM conversations WHERE business_id = $1 AND status = 'needs-help'", [req.user.business_id]),
     ]);
     res.json({
       agentName:           agent.rows[0]?.agent_name || "Aria",
       active:              agent.rows[0]?.is_active   || false,
       used:                sub.rows[0]?.messages_used || 0,
       limit:               sub.rows[0]?.message_limit || 0,
-      activeConversations: parseInt(convs.rows[0]?.count) || 0,
-      unreadCount:         0,
-      notifCount:          0,
+      activeConversations: parseInt(convs.rows[0]?.count)  || 0,
+      unreadCount:         parseInt(unread.rows[0]?.count) || 0,
+      notifCount:          parseInt(unread.rows[0]?.count) || 0,
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load agent status" });
@@ -210,11 +211,6 @@ router.patch("/agent/toggle", async (req, res) => {
 });
 
 // ── Conversations ─────────────────────────────────────────────
-// ── Replace the GET /agent/conversations endpoint in dashboard.js ──
-// Find this:
-//   router.get("/agent/conversations", async (req, res) => {
-// Replace the whole route with this:
-
 router.get("/agent/conversations", async (req, res) => {
   try {
     const { page = 1, limit = 30, status } = req.query;
@@ -244,9 +240,6 @@ router.get("/agent/conversations", async (req, res) => {
     res.status(500).json({ message: "Failed to load conversations" });
   }
 });
-
-// ── Also replace GET /agent/conversations/:id/messages ──
-// To include status field:
 
 router.get("/agent/conversations/:id/messages", async (req, res) => {
   try {
@@ -296,21 +289,35 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
     );
     if (!conv.length) return res.status(404).json({ message: "Conversation not found" });
 
-    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3)`,
-      [req.params.id, req.user.business_id, message]);
+    // Save owner message with status sent
+    await query(`
+      INSERT INTO messages (conversation_id, business_id, role, content, status)
+      VALUES ($1, $2, 'owner', $3, 'sent')
+    `, [req.params.id, req.user.business_id, message]);
 
+    // Send via WhatsApp
     const { rows: wc } = await query(
       "SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id = $1",
       [req.user.business_id]
     );
+
     if (wc.length) {
       const { sendWhatsAppMessage } = await import("../whatsapp/sender.js");
-      await sendWhatsAppMessage({
+      const result = await sendWhatsAppMessage({
         phoneNumberId: wc[0].phone_number_id,
         accessToken:   wc[0].access_token,
         to:            conv[0].customer_phone,
         message,
       });
+
+      // Save wa_message_id for status tracking
+      if (result?.messages?.[0]?.id) {
+        await query(`
+          UPDATE messages SET wa_message_id = $1
+          WHERE conversation_id = $2 AND role = 'owner'
+          ORDER BY created_at DESC LIMIT 1
+        `, [result.messages[0].id, req.params.id]);
+      }
     }
 
     res.json({ success: true });
@@ -326,7 +333,7 @@ router.get("/settings", async (req, res) => {
     const [biz, agent, wc, notif, sub] = await Promise.all([
       query("SELECT * FROM businesses WHERE id = $1", [bId]),
       query("SELECT * FROM agent_configs WHERE business_id = $1", [bId]),
-      query("SELECT phone_number_id, whatsapp_number, is_verified FROM whatsapp_configs WHERE business_id = $1", [bId]),
+      query("SELECT phone_number_id, whatsapp_number, is_verified, display_name FROM whatsapp_configs WHERE business_id = $1", [bId]),
       query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]),
       query("SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [bId]),
     ]);
@@ -385,29 +392,43 @@ router.put("/settings/whatsapp", async (req, res) => {
 
     // Check if this phone_number_id belongs to another business
     const { rows: existing } = await query(`
-      SELECT business_id FROM whatsapp_configs 
-      WHERE phone_number_id = $1 
+      SELECT business_id FROM whatsapp_configs
+      WHERE phone_number_id = $1
         AND business_id != $2
     `, [phoneNumberId, req.user.business_id]);
 
     if (existing.length > 0) {
-      return res.status(409).json({ 
-        message: "This WhatsApp number is already connected to another Voxiro account. Each WhatsApp number can only be connected to one business." 
+      return res.status(409).json({
+        message: "This WhatsApp number is already connected to another Voxiro account. Each WhatsApp number can only be connected to one business.",
       });
     }
 
     await query(`
-      INSERT INTO whatsapp_configs 
+      INSERT INTO whatsapp_configs
         (business_id, phone_number_id, access_token, webhook_secret)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (business_id) DO UPDATE
       SET phone_number_id = $2,
-          access_token    = CASE WHEN $3 IS NOT NULL AND $3 != '' 
+          access_token    = CASE WHEN $3 IS NOT NULL AND $3 != ''
                             THEN $3 ELSE whatsapp_configs.access_token END,
-          webhook_secret  = CASE WHEN $4 IS NOT NULL AND $4 != '' 
+          webhook_secret  = CASE WHEN $4 IS NOT NULL AND $4 != ''
                             THEN $4 ELSE whatsapp_configs.webhook_secret END,
           updated_at      = NOW()
     `, [req.user.business_id, phoneNumberId, accessToken || null, webhookSecret || null]);
+
+    // Try to fetch display name from Meta
+    try {
+      const { fetchAndSaveDisplayName } = await import("../webhook/whatsapp.js");
+      const { rows: wc } = await query(
+        "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
+        [req.user.business_id]
+      );
+      if (wc[0]?.access_token) {
+        await fetchAndSaveDisplayName(req.user.business_id, phoneNumberId, wc[0].access_token);
+      }
+    } catch {
+      // Non-critical
+    }
 
     res.json({ success: true });
   } catch (err) {

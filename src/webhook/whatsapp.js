@@ -126,7 +126,7 @@ async function processIncomingMessage({
     message:        messageText,
     phoneNumberId,
     accessToken:    access_token,
-    waMessageId:    msg.id,  // for marking as read + typing simulation
+    waMessageId:    waMessageId,  // for marking as read + typing simulation
   });
 }
 

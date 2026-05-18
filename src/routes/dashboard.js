@@ -314,8 +314,11 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
       if (result?.messages?.[0]?.id) {
         await query(`
           UPDATE messages SET wa_message_id = $1
-          WHERE conversation_id = $2 AND role = 'owner'
-          ORDER BY created_at DESC LIMIT 1
+          WHERE id = (
+            SELECT id FROM messages
+            WHERE conversation_id = $2 AND role = 'owner'
+            ORDER BY created_at DESC LIMIT 1
+          )
         `, [result.messages[0].id, req.params.id]);
       }
     }

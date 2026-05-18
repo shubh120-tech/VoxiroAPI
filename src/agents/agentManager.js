@@ -49,8 +49,8 @@ function isSimpleReply(message) {
 
 // ── Dynamic history length based on conversation size ─────────
 function getMaxHistory(conversationLength) {
-  if (conversationLength > 30) return 8;
-  if (conversationLength > 15) return 12;
+  if (conversationLength > 30) return 16;
+  if (conversationLength > 15) return 16;
   return 20;
 }
 
@@ -110,14 +110,10 @@ export async function handleIncomingMessage({
     // ── Get system prompt (cached) ──────────────────────────
     const systemPrompt = await getCachedPrompt(businessId);
 
-    // ── Load conversation history (dynamic length) ──────────
-    const { rows: allMsgs } = await query(
-      "SELECT COUNT(*) FROM messages WHERE conversation_id = $1",
-      [conversationId]
-    );
-    const totalMsgs  = parseInt(allMsgs[0].count) || 0;
-    const maxHistory = getMaxHistory(totalMsgs);
-    const history    = await loadConversationHistory(conversationId, maxHistory);
+    // ── Load history: first 6 msgs + last 14 msgs ──────────
+    // Agent never forgets customer name/details (in first msgs)
+    // While still having recent context (last msgs)
+    const history = await loadConversationHistory(conversationId, 20);
 
     const messages = [
       ...history,
@@ -179,18 +175,63 @@ function getHoldingReply(message) {
 }
 
 // ── Load conversation history ─────────────────────────────────
+// Always keeps FIRST 6 messages (customer details) + LAST N messages (recent context)
+// This way agent never forgets name, domain, deadline etc.
 async function loadConversationHistory(conversationId, limit = 20) {
-  const { rows } = await query(`
+  // Get total message count
+  const { rows: countRows } = await query(
+    "SELECT COUNT(*) FROM messages WHERE conversation_id = $1",
+    [conversationId]
+  );
+  const total = parseInt(countRows[0].count) || 0;
+
+  // If total fits in limit — just return all
+  if (total <= limit) {
+    const { rows } = await query(`
+      SELECT role, content FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at ASC
+    `, [conversationId]);
+    return rows.map(toMessage);
+  }
+
+  // Otherwise: first 6 messages + last (limit - 6) messages
+  const firstCount = 6;
+  const lastCount  = limit - firstCount;
+
+  const { rows: firstRows } = await query(`
     SELECT role, content FROM messages
     WHERE conversation_id = $1
     ORDER BY created_at ASC
     LIMIT $2
-  `, [conversationId, limit]);
+  `, [conversationId, firstCount]);
 
-  return rows.map(row => ({
+  const { rows: lastRows } = await query(`
+    SELECT role, content FROM messages
+    WHERE conversation_id = $1
+    ORDER BY created_at DESC
+    LIMIT $2
+  `, [conversationId, lastCount]);
+
+  // Reverse lastRows to get chronological order
+  lastRows.reverse();
+
+  // Combine: first messages + separator + recent messages
+  const combined = [
+    ...firstRows,
+    // Add a system note so Claude knows there's a gap
+    { role: "assistant", content: "[Earlier conversation context omitted — customer details above are still valid]" },
+    ...lastRows,
+  ];
+
+  return combined.map(toMessage);
+}
+
+function toMessage(row) {
+  return {
     role:    row.role === "customer" ? "user" : "assistant",
     content: row.content,
-  }));
+  };
 }
 
 // ── Call Claude with prompt caching ──────────────────────────

@@ -7,6 +7,7 @@ import { checkAvailabilityTool, executeCheckAvailability  } from "./tools/checkA
 import { notifyOwnerTool,       executeNotifyOwner        } from "./tools/notifyOwner.js";
 import { scheduleFollowupTool,  executeScheduleFollowup   } from "./tools/scheduleFollowup.js";
 import { sendWhatsAppMessages,  splitIntoMessages          } from "../whatsapp/sender.js";
+import { fetchRelevantContext } from "./knowledgeFetcher.js";
 import { query } from "../db/postgres.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -236,21 +237,31 @@ function toMessage(row) {
 
 // ── Call Claude with prompt caching ──────────────────────────
 async function callClaudeWithCache({
-  systemPrompt, messages, businessId, conversationId, customerPhone, customerName,
+  systemPrompt, dynamicContext, messages, businessId, conversationId, customerPhone, customerName,
 }) {
   try {
     let response = await anthropic.messages.create({
       model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-      max_tokens: 400, // reduced from 1024 — agent replies are short
+      max_tokens: 400,
       system: [
         {
           type: "text",
           text: systemPrompt,
-          cache_control: { type: "ephemeral" }, // ← PROMPT CACHING
+          cache_control: { type: "ephemeral" }, // ← cached — paid once per 5 min
         },
       ],
       tools:    TOOLS,
-      messages,
+      // Inject dynamic context as last user message context
+      messages: dynamicContext
+        ? [
+            ...messages.slice(0, -1),
+            {
+              role: "user",
+              content: messages[messages.length - 1].content +
+                "[RELEVANT BUSINESS DATA FOR THIS MESSAGE:" + dynamicContext + "]",
+            },
+          ]
+        : messages,
     });
 
     // Log cache usage for monitoring

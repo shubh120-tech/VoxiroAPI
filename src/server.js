@@ -6,6 +6,7 @@ import morgan       from "morgan";
 import rateLimit    from "express-rate-limit";
 import { processFollowUps } from "./agents/Followupcron.js"
 import whatsappEmbeddedRouter from "./routes/whatsappEmbedded.js";
+import businessKnowledgeRouter from "./routes/businessKnowledge.js";
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -80,6 +81,7 @@ app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api/admin",  adminRouter);
 app.use("/api", whatsappEmbeddedRouter);
+app.use("/api", businessKnowledgeRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────
 app.use((req, res) => {

@@ -5,7 +5,15 @@ import jwt from "jsonwebtoken";
 
 export const notifyOwnerTool = {
   name: "notify_owner",
-  description: "Notify the business owner when a customer needs human assistance. Use this for complaints, refunds, complex issues, or anything you cannot handle.",
+  description: `Notify the business owner when:
+- Customer needs human assistance
+- Customer sends payment screenshot or proof
+- Customer asks for a call or human
+- Negotiation goes beyond your authority
+- Customer is upset or complaining
+- Complex scope that needs expert review
+- Customer hasn't responded to 2+ questions
+Always notify owner AND tell customer "I've notified our team, they'll reach out shortly."`,
   input_schema: {
     type: "object",
     properties: {

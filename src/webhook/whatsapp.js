@@ -2,7 +2,7 @@ import express from "express";
 import crypto  from "crypto";
 import { query } from "../db/postgres.js";
 import { handleIncomingMessage } from "../agents/agentManager.js";
-import { sendWhatsAppMessage, getWhatsAppCredentials } from "../whatsapp/sender.js";
+import { sendWhatsAppMessage, notifyOwnerWhatsApp, getWhatsAppCredentials } from "../whatsapp/sender.js";
 
 const router = express.Router();
 
@@ -47,16 +47,29 @@ router.post("/", async (req, res) => {
         const metadata = value.metadata;
 
         for (const msg of messages) {
-          // Only handle text messages for now
-          if (msg.type !== "text") continue;
+          const customerPhone = msg.from;
+          const customerName  = value.contacts?.[0]?.profile?.name || null;
+          const phoneNumberId = metadata.phone_number_id;
 
-          await processIncomingMessage({
-            phoneNumberId:  metadata.phone_number_id,
-            customerPhone:  msg.from,
-            customerName:   value.contacts?.[0]?.profile?.name || null,
-            messageText:    msg.text.body,
-            waMessageId:    msg.id,
-          });
+          if (msg.type === "text") {
+            // Normal text message — process with agent
+            await processIncomingMessage({
+              phoneNumberId,
+              customerPhone,
+              customerName,
+              messageText: msg.text.body,
+              waMessageId: msg.id,
+            });
+
+          } else if (["image", "document", "video", "audio", "sticker"].includes(msg.type)) {
+            // Any media/document — notify owner immediately
+            await processMediaMessage({
+              phoneNumberId,
+              customerPhone,
+              customerName,
+              msg,
+            });
+          }
         }
       }
     }
@@ -189,6 +202,109 @@ async function checkMessageLimit(businessId) {
  */
 function verifySignature(req) {
   return true;
+}
+
+// ── Process Media / Document Message ────────────────────────
+async function processMediaMessage({ phoneNumberId, customerPhone, customerName, msg }) {
+  try {
+    // Find business
+    const { rows: bizRows } = await query(`
+      SELECT b.id AS business_id, wc.access_token
+      FROM whatsapp_configs wc
+      JOIN businesses b ON b.id = wc.business_id
+      WHERE wc.phone_number_id = $1 AND b.is_active = TRUE
+      ORDER BY wc.updated_at DESC LIMIT 1
+    `, [phoneNumberId]);
+
+    if (!bizRows.length) return;
+    const { business_id, access_token } = bizRows[0];
+
+    // Get or create conversation
+    const conversation = await getOrCreateConversation({
+      businessId:   business_id,
+      customerPhone,
+      customerName,
+    });
+
+    // Cancel pending follow-ups
+    await cancelPendingFollowUps(business_id, customerPhone);
+
+    // Build description of what was received
+    const typeLabels = {
+      image:    "image/screenshot",
+      document: "document",
+      video:    "video",
+      audio:    "voice message",
+      sticker:  "sticker",
+    };
+    const typeLabel = typeLabels[msg.type] || "file";
+    const caption   = msg[msg.type]?.caption || "";
+    const filename  = msg[msg.type]?.filename || "";
+
+    // Detect if payment related
+    const isPayment = /pay|paid|upi|gpay|phonepe|paytm|neft|imps|receipt|transaction|txn|screenshot|advance|deposit|भुगतान|पेमेंट/i
+      .test(`${caption} ${filename}`);
+
+    // Save to DB
+    const dbContent = isPayment
+      ? `[Payment ${typeLabel} received${caption ? `: ${caption}` : ""}]`
+      : `[${typeLabel} received${caption ? `: ${caption}` : ""}${filename ? ` (${filename})` : ""}]`;
+
+    await query(`
+      INSERT INTO messages (conversation_id, business_id, role, content)
+      VALUES ($1, $2, 'customer', $3)
+    `, [conversation.id, business_id, dbContent]);
+
+    await query(`
+      UPDATE conversations
+      SET last_message = $1, last_message_at = NOW(), customer_last_seen = NOW()
+      WHERE id = $2
+    `, [dbContent, conversation.id]);
+
+    // Send acknowledgement to customer
+    const ackMsg = isPayment
+      ? `Thank you! I have received your payment confirmation and shared it with the team. We will verify and confirm shortly.`
+      : `Thank you! I have received your ${typeLabel} and shared it with the team. They will review and get back to you shortly.`;
+
+    await sendWhatsAppMessage({
+      phoneNumberId,
+      accessToken: access_token,
+      to:          customerPhone,
+      message:     ackMsg,
+    });
+
+    await query(`
+      INSERT INTO messages (conversation_id, business_id, role, content)
+      VALUES ($1, $2, 'agent', $3)
+    `, [conversation.id, business_id, ackMsg]);
+
+    // Switch conversation to manual — agent stops replying
+    await query(`
+      UPDATE conversations SET status = 'manual', updated_at = NOW()
+      WHERE id = $1
+    `, [conversation.id]);
+
+    // Notify owner on WhatsApp
+    const name       = customerName || customerPhone;
+    const icon       = isPayment ? "💰" : "📎";
+    const subject    = isPayment ? "Payment received" : `${typeLabel} received`;
+    const ownerMsg   = `${icon} ${subject} from ${name}
+
+`
+      + (caption   ? `Caption: "${caption}"
+`   : "")
+      + (filename  ? `File: ${filename}
+`        : "")
+      + `
+Please review and respond from the dashboard.`;
+
+    await notifyOwnerWhatsApp(business_id, ownerMsg);
+
+    console.log(`${icon} Media (${typeLabel}) from ${customerPhone} — owner notified, agent paused`);
+
+  } catch (err) {
+    console.error("Media message error:", err.message);
+  }
 }
 
 // ── Cancel Pending Follow-ups ────────────────────────────────

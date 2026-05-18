@@ -232,22 +232,76 @@ export async function notifyOwnerWhatsApp(businessId, message) {
         AND ns.owner_notify_number != ''
     `, [businessId]);
 
-    if (!rows.length) return;
+    if (!rows.length) {
+      console.warn("Owner notify: no number configured");
+      return;
+    }
+
     const { phone_number_id, access_token, owner_notify_number } = rows[0];
 
-    await axios.post(
+    // Normalize phone number — ensure + prefix, remove spaces/dashes
+    const normalizedNumber = normalizePhone(owner_notify_number);
+
+    // Strip any markdown formatting from message — WhatsApp API rejects some chars
+    const cleanMessage = message
+      .replace(/\*\*/g, "")   // remove **bold**
+      .replace(/_{2}/g, "")   // remove __underline__
+      .trim();
+
+    console.log(`📲 Notifying owner: ${normalizedNumber}`);
+
+    const response = await axios.post(
       `${META_BASE}/${VERSION}/${phone_number_id}/messages`,
       {
         messaging_product: "whatsapp",
-        to:                owner_notify_number,
+        recipient_type:    "individual",
+        to:                normalizedNumber,
         type:              "text",
-        text:              { body: message },
+        text:              { body: cleanMessage, preview_url: false },
       },
-      { headers: { Authorization: `Bearer ${access_token}` } }
+      {
+        headers: {
+          Authorization:  `Bearer ${access_token}`,
+          "Content-Type": "application/json",
+        },
+      }
     );
+
+    console.log(`✅ Owner notified successfully`);
+    return response.data;
+
   } catch (err) {
-    console.error("Owner notify error:", err.message);
+    console.error("Owner notify error:", err.response?.data || err.message);
   }
+}
+
+/**
+ * Normalize phone number to WhatsApp format.
+ * Examples:
+ *   "8439120420"    → "+918439120420"  (India default)
+ *   "+918439120420" → "+918439120420"  (already correct)
+ *   "918439120420"  → "+918439120420"
+ *   "+1 234 567 890" → "+1234567890"
+ */
+function normalizePhone(phone) {
+  // Remove all spaces, dashes, parentheses
+  let cleaned = phone.replace(/[\s\-().]/g, "");
+
+  // Already has + prefix
+  if (cleaned.startsWith("+")) return cleaned;
+
+  // Has country code without + (91XXXXXXXXXX)
+  if (cleaned.length === 12 && cleaned.startsWith("91")) {
+    return "+" + cleaned;
+  }
+
+  // 10 digit Indian number — add +91
+  if (cleaned.length === 10) {
+    return "+91" + cleaned;
+  }
+
+  // Otherwise just add +
+  return "+" + cleaned;
 }
 
 /**

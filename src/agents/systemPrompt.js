@@ -49,7 +49,7 @@ export async function buildSystemPrompt(businessId) {
   const regularDocs = regularDocsResult.rows;
 
   // Limit consolidated knowledge to 3000 words max
-  const consolidatedKnowledge = (biz.consolidated_knowledge || "").slice(0, 12000);
+  const consolidatedKnowledge = (biz.consolidated_knowledge || "").slice(0, 6000);
 
   const regularDocsSection = regularDocs.length > 0
     ? `\nBUSINESS DOCUMENTS:\n${regularDocs.map(d => `--- ${d.file_name} ---\n${d.extracted_text.slice(0, 2000)}`).join("\n\n")}`

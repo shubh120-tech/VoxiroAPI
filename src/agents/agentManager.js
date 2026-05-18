@@ -6,7 +6,7 @@ import { bookAppointmentTool,   executeBookAppointment    } from "./tools/bookAp
 import { checkAvailabilityTool, executeCheckAvailability  } from "./tools/checkAvailability.js";
 import { notifyOwnerTool,       executeNotifyOwner        } from "./tools/notifyOwner.js";
 import { scheduleFollowupTool,  executeScheduleFollowup   } from "./tools/scheduleFollowup.js";
-import { sendWhatsAppMessages, sendWhatsAppMessage, splitIntoMessages } from "../whatsapp/sender.js";
+import { sendWhatsAppMessages,  splitIntoMessages          } from "../whatsapp/sender.js";
 import { query } from "../db/postgres.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -20,25 +20,42 @@ const TOOLS = [
   scheduleFollowupTool,
 ];
 
-// Keep last 20 messages — enough context, low cost
-const MAX_HISTORY = 20;
+// ── Processing lock — prevents double replies ─────────────────
+const processingLock = new Set();
 
-// ── Prompt cache (5 min) — avoid rebuilding every message ─────
+// ── Prompt cache (5 min TTL) ──────────────────────────────────
 const promptCache = new Map();
 
-async function getCachedSystemPrompt(businessId) {
+async function getCachedPrompt(businessId) {
   const key    = `prompt_${businessId}`;
   const cached = promptCache.get(key);
   if (cached && cached.expiry > Date.now()) return cached.prompt;
-
   const prompt = await buildSystemPrompt(businessId);
   promptCache.set(key, { prompt, expiry: Date.now() + 5 * 60 * 1000 });
   return prompt;
 }
 
+// ── Simple reply detection — skip Claude for one-word replies ─
+const SIMPLE_REPLIES = new Set([
+  "ok", "okay", "k", "fine", "sure", "yes", "no", "thanks",
+  "thank you", "thankyou", "ty", "hi", "hello", "hey",
+  "haan", "nahi", "na", "ha", "theek hai", "theek", "done",
+  "got it", "noted", "👍", "👌", "🙏", "✅",
+]);
+
+function isSimpleReply(message) {
+  return SIMPLE_REPLIES.has(message.toLowerCase().trim());
+}
+
+// ── Dynamic history length based on conversation size ─────────
+function getMaxHistory(conversationLength) {
+  if (conversationLength > 30) return 8;
+  if (conversationLength > 15) return 12;
+  return 20;
+}
+
 /**
- * Main entry — called when WhatsApp message arrives.
- * Returns array of reply parts to send as separate messages.
+ * Main entry point — called when WhatsApp message arrives.
  */
 export async function handleIncomingMessage({
   businessId,
@@ -49,76 +66,126 @@ export async function handleIncomingMessage({
   phoneNumberId,
   accessToken,
 }) {
-  // Check if manual mode
-  const { rows: convRows } = await query(
-    "SELECT status FROM conversations WHERE id = $1",
-    [conversationId]
-  );
-  if (convRows[0]?.status === "manual") return null;
-
-  // Save customer message
-  await saveMessage({ conversationId, businessId, role: "customer", content: message });
-
-  // Update last message
-  await query(`
-    UPDATE conversations
-    SET last_message = $1, last_message_at = NOW(), updated_at = NOW()
-    WHERE id = $2
-  `, [message, conversationId]);
-
-  // Build prompt (cached)
-  const systemPrompt = await getCachedSystemPrompt(businessId);
-
-  // Load conversation history
-  const history = await loadConversationHistory(conversationId);
-
-  const messages = [
-    ...history,
-    { role: "user", content: message },
-  ];
-
-  // Call Claude
-  const reply = await callClaude({
-    systemPrompt,
-    messages,
-    businessId,
-    conversationId,
-    customerPhone,
-    customerName,
-  });
-
-  if (!reply) return null;
-
-  // Split reply into human-like parts
-  const parts = splitIntoMessages(reply);
-
-  // Send each part as separate WhatsApp message
-  if (phoneNumberId && accessToken) {
-    const results = await sendWhatsAppMessages({ phoneNumberId, accessToken, to: customerPhone, messages: parts });
-
-    // Save all parts to DB
-    for (let i = 0; i < parts.length; i++) {
-      const waId = results[i]?.messages?.[0]?.id || null;
-      await saveMessage({
-        conversationId, businessId, role: "agent",
-        content: parts[i], waMessageId: waId,
-      });
-    }
-  } else {
-    // Fallback — save combined reply
-    await saveMessage({ conversationId, businessId, role: "agent", content: parts.join("\n\n") });
+  // ── Prevent double processing ─────────────────────────────
+  const lockKey = `${conversationId}_${message.slice(0, 50)}`;
+  if (processingLock.has(lockKey)) {
+    console.log("⚠️  Duplicate message — skipping");
+    return null;
   }
+  processingLock.add(lockKey);
+  setTimeout(() => processingLock.delete(lockKey), 30000);
 
-  return parts;
+  try {
+    // ── Check manual mode ───────────────────────────────────
+    const { rows: convRows } = await query(
+      "SELECT status FROM conversations WHERE id = $1",
+      [conversationId]
+    );
+    if (convRows[0]?.status === "manual") return null;
+
+    // ── Save customer message ───────────────────────────────
+    await saveMessage({ conversationId, businessId, role: "customer", content: message });
+    await query(`
+      UPDATE conversations
+      SET last_message = $1, last_message_at = NOW(), updated_at = NOW()
+      WHERE id = $2
+    `, [message, conversationId]);
+
+    // ── Handle simple one-word replies without Claude ───────
+    if (isSimpleReply(message)) {
+      const holding = getHoldingReply(message);
+      if (holding) {
+        if (phoneNumberId && accessToken) {
+          await sendWhatsAppMessages({
+            phoneNumberId, accessToken,
+            to: customerPhone,
+            messages: [holding],
+          });
+        }
+        await saveMessage({ conversationId, businessId, role: "agent", content: holding });
+        return [holding];
+      }
+    }
+
+    // ── Get system prompt (cached) ──────────────────────────
+    const systemPrompt = await getCachedPrompt(businessId);
+
+    // ── Load conversation history (dynamic length) ──────────
+    const { rows: allMsgs } = await query(
+      "SELECT COUNT(*) FROM messages WHERE conversation_id = $1",
+      [conversationId]
+    );
+    const totalMsgs  = parseInt(allMsgs[0].count) || 0;
+    const maxHistory = getMaxHistory(totalMsgs);
+    const history    = await loadConversationHistory(conversationId, maxHistory);
+
+    const messages = [
+      ...history,
+      { role: "user", content: message },
+    ];
+
+    // ── Call Claude with prompt caching ─────────────────────
+    const reply = await callClaudeWithCache({
+      systemPrompt,
+      messages,
+      businessId,
+      conversationId,
+      customerPhone,
+      customerName,
+    });
+
+    if (!reply) return null;
+
+    // ── Split into human-like parts ─────────────────────────
+    const parts = splitIntoMessages(reply);
+
+    // ── Send messages + save to DB ──────────────────────────
+    if (phoneNumberId && accessToken) {
+      const results = await sendWhatsAppMessages({
+        phoneNumberId, accessToken,
+        to: customerPhone,
+        messages: parts,
+      });
+
+      for (let i = 0; i < parts.length; i++) {
+        const waId = results[i]?.messages?.[0]?.id || null;
+        await saveMessage({ conversationId, businessId, role: "agent", content: parts[i], waMessageId: waId });
+      }
+    } else {
+      await saveMessage({ conversationId, businessId, role: "agent", content: parts.join("\n\n") });
+    }
+
+    return parts;
+
+  } finally {
+    // Always release lock
+    processingLock.delete(lockKey);
+  }
 }
 
-async function loadConversationHistory(conversationId) {
+// ── Holding replies for simple messages ──────────────────────
+function getHoldingReply(message) {
+  const msg = message.toLowerCase().trim();
+  if (["thanks", "thank you", "thankyou", "ty", "🙏"].includes(msg)) {
+    return "You're welcome! Is there anything else I can help you with?";
+  }
+  if (["hi", "hello", "hey"].includes(msg)) {
+    return null; // Let Claude handle greetings
+  }
+  if (["ok", "okay", "k", "done", "noted", "got it", "👍", "👌", "✅"].includes(msg)) {
+    return null; // Let Claude handle confirmations — context matters
+  }
+  return null;
+}
+
+// ── Load conversation history ─────────────────────────────────
+async function loadConversationHistory(conversationId, limit = 20) {
   const { rows } = await query(`
     SELECT role, content FROM messages
     WHERE conversation_id = $1
     ORDER BY created_at ASC
     LIMIT $2
-  `, [conversationId, MAX_HISTORY]);
+  `, [conversationId, limit]);
 
   return rows.map(row => ({
     role:    row.role === "customer" ? "user" : "assistant",
@@ -126,16 +193,32 @@ async function loadConversationHistory(conversationId) {
   }));
 }
 
-async function callClaude({ systemPrompt, messages, businessId, conversationId, customerPhone, customerName }) {
+// ── Call Claude with prompt caching ──────────────────────────
+async function callClaudeWithCache({
+  systemPrompt, messages, businessId, conversationId, customerPhone, customerName,
+}) {
   try {
     let response = await anthropic.messages.create({
       model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
-      system:     systemPrompt,
-      tools:      TOOLS,
+      max_tokens: 400, // reduced from 1024 — agent replies are short
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" }, // ← PROMPT CACHING
+        },
+      ],
+      tools:    TOOLS,
       messages,
     });
 
+    // Log cache usage for monitoring
+    const usage = response.usage;
+    if (usage?.cache_read_input_tokens > 0) {
+      console.log(`💰 Cache hit: ${usage.cache_read_input_tokens} tokens cached (saved $${((usage.cache_read_input_tokens * 0.9) / 1000000).toFixed(6)})`);
+    }
+
+    // Handle tool calls
     while (response.stop_reason === "tool_use") {
       const toolUseBlocks = response.content.filter(b => b.type === "tool_use");
       const toolResults   = [];
@@ -145,7 +228,11 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
           toolName: tool.name, input: tool.input,
           businessId, conversationId, customerPhone, customerName,
         });
-        toolResults.push({ type: "tool_result", tool_use_id: tool.id, content: JSON.stringify(result) });
+        toolResults.push({
+          type:        "tool_result",
+          tool_use_id: tool.id,
+          content:     JSON.stringify(result),
+        });
       }
 
       messages = [
@@ -156,9 +243,15 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
 
       response = await anthropic.messages.create({
         model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
-        max_tokens: 1024,
-        system:     systemPrompt,
-        tools:      TOOLS,
+        max_tokens: 400,
+        system: [
+          {
+            type: "text",
+            text: systemPrompt,
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        tools:    TOOLS,
         messages,
       });
     }
@@ -177,6 +270,7 @@ async function callClaude({ systemPrompt, messages, businessId, conversationId, 
   }
 }
 
+// ── Execute tool ──────────────────────────────────────────────
 async function executeTool({ toolName, input, businessId, conversationId, customerPhone, customerName }) {
   const ctx = { businessId, conversationId, customerPhone, customerName, input };
   switch (toolName) {
@@ -190,6 +284,7 @@ async function executeTool({ toolName, input, businessId, conversationId, custom
   }
 }
 
+// ── Save message to DB ────────────────────────────────────────
 async function saveMessage({ conversationId, businessId, role, content, waMessageId = null }) {
   await query(`
     INSERT INTO messages (conversation_id, business_id, role, content, wa_message_id, status)

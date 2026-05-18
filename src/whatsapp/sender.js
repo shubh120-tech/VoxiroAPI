@@ -38,34 +38,32 @@ export async function markMessageAsRead({ phoneNumberId, accessToken, waMessageI
  * - Makes occasional typo pauses
  */
 function getSalesExecDelay(message, isFirstMessage = true) {
-  const words    = message.trim().split(/\s+/).length;
-  const chars    = message.length;
+  const chars = message.length;
 
-  // Reading delay — exec reads incoming message first
-  const readDelay = isFirstMessage ? (1000 + Math.random() * 2000) : 0;
+  // Reading delay — only for first message in a response
+  const readDelay = isFirstMessage ? (300 + Math.random() * 500) : 0; // 0.3-0.8s
 
-  // Thinking delay — depends on message complexity
-  const isQuotation  = /quotation|price|fee|amount|₹|payment/i.test(message);
-  const isComplex    = chars > 150 || isQuotation;
-  const isSimple     = chars < 30;
+  // Thinking delay — quick for simple, slightly longer for complex
+  const isQuotation = /quotation|price|fee|amount|₹|payment/i.test(message);
+  const isComplex   = chars > 150 || isQuotation;
+  const isSimple    = chars < 25;
 
   let thinkDelay;
-  if (isSimple)    thinkDelay = 500  + Math.random() * 1000;   // 0.5-1.5s
-  else if (isComplex) thinkDelay = 3000 + Math.random() * 4000; // 3-7s (checking details)
-  else             thinkDelay = 1500 + Math.random() * 2500;   // 1.5-4s
+  if (isSimple)        thinkDelay = 300 + Math.random() * 500;   // 0.3-0.8s
+  else if (isComplex)  thinkDelay = 800 + Math.random() * 1200;  // 0.8-2s
+  else                 thinkDelay = 500 + Math.random() * 800;   // 0.5-1.3s
 
-  // Typing delay — human types ~200 chars/min (40 words/min)
-  // That's ~300ms per word or ~50ms per character
-  const charsPerMin  = 200;
-  const typingDelay  = (chars / charsPerMin) * 60 * 1000;
+  // Typing speed — ~400 chars/min (fast but human)
+  const charsPerMin = 400;
+  const typingDelay = (chars / charsPerMin) * 60 * 1000;
 
-  // Random variation — humans are not consistent
-  const variation = (Math.random() * 0.3 - 0.15) * typingDelay; // ±15%
+  // Small random variation ±10%
+  const variation = (Math.random() * 0.2 - 0.1) * typingDelay;
 
   const total = readDelay + thinkDelay + typingDelay + variation;
 
-  // Clamp: min 1.5s, max 18s
-  return Math.min(Math.max(total, 1500), 18000);
+  // Clamp: min 0.8s, max 6s — fast enough to feel human, not robotic
+  return Math.min(Math.max(total, 800), 6000);
 }
 
 /**
@@ -170,52 +168,50 @@ export async function sendWhatsAppMessages({
 }
 
 /**
- * Split agent reply into multiple short messages.
- * Each part sent separately with typing delays.
+ * Split agent reply into messages.
+ *
+ * Rules:
+ * - Sections marked with [SINGLE] stay as one message
+ * - Double newlines = separate messages
+ * - Single newlines in SHORT lines = separate messages
+ * - Long paragraphs (quotation/payment/trust) stay together
  */
 export function splitIntoMessages(reply) {
   if (!reply) return [];
 
-  // Split by double newlines (paragraphs)
+  // Detect if this is a single-block reply (quotation, payment, trust)
+  // These should NOT be split — they look more professional as one message
+  const isSingleBlock = (
+    /quotation|fees:|payment:|₹.*\n.*₹|installment|gst:|registration/i.test(reply) ||
+    reply.split("\n").filter(l => l.trim()).length <= 3
+  );
+
+  if (isSingleBlock) {
+    return [reply.trim()];
+  }
+
+  // Split by double newlines (paragraph breaks)
   const parts = reply
     .split(/\n{2,}/)
     .map(p => p.trim())
     .filter(p => p.length > 0);
 
-  if (parts.length === 1) {
-    // Check single newlines
-    const lines = reply
-      .split(/\n/)
-      .map(l => l.trim())
-      .filter(l => l.length > 0);
-
-    if (lines.length > 1 && lines.every(l => l.length < 120)) {
-      return lines;
-    }
+  if (parts.length > 1) {
+    return parts;
   }
 
-  // Break long parts into shorter ones
-  const final = [];
-  for (const part of parts) {
-    if (part.length <= 220) {
-      final.push(part);
-    } else {
-      // Split at sentence boundaries
-      const sentences = part.match(/[^.!?]+[.!?]+/g) || [part];
-      let current = "";
-      for (const s of sentences) {
-        if ((current + s).length > 220 && current) {
-          final.push(current.trim());
-          current = s;
-        } else {
-          current += s;
-        }
-      }
-      if (current.trim()) final.push(current.trim());
-    }
+  // Single paragraph — check if it has multiple short lines
+  const lines = reply
+    .split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 0);
+
+  if (lines.length > 1 && lines.every(l => l.length < 100)) {
+    return lines;
   }
 
-  return final.length > 0 ? final : [reply];
+  // Single message
+  return [reply.trim()];
 }
 
 /**

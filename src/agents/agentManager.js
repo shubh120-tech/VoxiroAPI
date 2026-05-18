@@ -66,6 +66,7 @@ export async function handleIncomingMessage({
   message,
   phoneNumberId,
   accessToken,
+  waMessageId = null,  // for read receipt + typing simulation
 }) {
   // ── Prevent double processing ─────────────────────────────
   const lockKey = `${conversationId}_${message.slice(0, 50)}`;
@@ -140,8 +141,9 @@ export async function handleIncomingMessage({
     if (phoneNumberId && accessToken) {
       const results = await sendWhatsAppMessages({
         phoneNumberId, accessToken,
-        to: customerPhone,
-        messages: parts,
+        to:           customerPhone,
+        messages:     parts,
+        waMessageId,  // mark as read + show typing
       });
 
       for (let i = 0; i < parts.length; i++) {

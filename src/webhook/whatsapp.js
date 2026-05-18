@@ -117,7 +117,7 @@ async function processIncomingMessage({
     WHERE business_id = $1
   `, [business_id]);
 
-  // 5. Run agent — sends multi-part messages automatically
+  // 5. Run agent — sends multi-part messages with typing indicators
   await handleIncomingMessage({
     businessId:     business_id,
     conversationId: conversation.id,
@@ -126,6 +126,7 @@ async function processIncomingMessage({
     message:        messageText,
     phoneNumberId,
     accessToken:    access_token,
+    waMessageId:    msg.id,  // for marking as read + typing simulation
   });
 }
 
@@ -184,7 +185,18 @@ async function checkMessageLimit(businessId) {
  * Verify Meta webhook signature.
  */
 function verifySignature(req) {
-  return true;
+  const signature = req.headers["x-hub-signature-256"];
+  if (!signature) return false;
+
+  const expected = "sha256=" + crypto
+    .createHmac("sha256", process.env.META_APP_SECRET || "")
+    .update(JSON.stringify(req.body))
+    .digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expected)
+  );
 }
 
 export default router;

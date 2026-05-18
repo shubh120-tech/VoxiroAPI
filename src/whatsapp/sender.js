@@ -7,11 +7,91 @@ const VERSION   = process.env.META_API_VERSION || "v19.0";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Send a single WhatsApp message.
- * Returns response data including message ID for status tracking.
+ * Mark a customer message as read — shows blue ticks on customer's phone.
+ * Call this immediately when message arrives.
  */
-export async function sendWhatsAppMessage({ phoneNumberId, accessToken, to, message }) {
+export async function markMessageAsRead({ phoneNumberId, accessToken, waMessageId }) {
+  if (!waMessageId) return;
   try {
+    await axios.post(
+      `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        status:            "read",
+        message_id:        waMessageId,
+      },
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+  } catch (err) {
+    // Non-critical — don't throw
+    console.error("Mark read error:", err.message);
+  }
+}
+
+/**
+ * Calculate human-like sales executive typing delay.
+ *
+ * A real sales exec behavior:
+ * - Reads message first (1-3s)
+ * - Thinks about reply (1-5s)
+ * - Types at ~40 words/min (human typing speed)
+ * - Makes occasional typo pauses
+ */
+function getSalesExecDelay(message, isFirstMessage = true) {
+  const words    = message.trim().split(/\s+/).length;
+  const chars    = message.length;
+
+  // Reading delay — exec reads incoming message first
+  const readDelay = isFirstMessage ? (1000 + Math.random() * 2000) : 0;
+
+  // Thinking delay — depends on message complexity
+  const isQuotation  = /quotation|price|fee|amount|₹|payment/i.test(message);
+  const isComplex    = chars > 150 || isQuotation;
+  const isSimple     = chars < 30;
+
+  let thinkDelay;
+  if (isSimple)    thinkDelay = 500  + Math.random() * 1000;   // 0.5-1.5s
+  else if (isComplex) thinkDelay = 3000 + Math.random() * 4000; // 3-7s (checking details)
+  else             thinkDelay = 1500 + Math.random() * 2500;   // 1.5-4s
+
+  // Typing delay — human types ~200 chars/min (40 words/min)
+  // That's ~300ms per word or ~50ms per character
+  const charsPerMin  = 200;
+  const typingDelay  = (chars / charsPerMin) * 60 * 1000;
+
+  // Random variation — humans are not consistent
+  const variation = (Math.random() * 0.3 - 0.15) * typingDelay; // ±15%
+
+  const total = readDelay + thinkDelay + typingDelay + variation;
+
+  // Clamp: min 1.5s, max 18s
+  return Math.min(Math.max(total, 1500), 18000);
+}
+
+/**
+ * Send a single WhatsApp message with sales-exec-like delay.
+ */
+export async function sendWhatsAppMessage({
+  phoneNumberId,
+  accessToken,
+  to,
+  message,
+  waMessageId    = null,
+  isFirstMessage = true,
+}) {
+  try {
+    // 1. Mark as read immediately — blue ticks appear
+    if (waMessageId) {
+      await markMessageAsRead({ phoneNumberId, accessToken, waMessageId });
+      // Small pause after read — exec is "reading"
+      await sleep(500 + Math.random() * 800);
+    }
+
+    // 2. Sales exec delay — read + think + type
+    const delay = getSalesExecDelay(message, isFirstMessage);
+    await sleep(delay);
+
+    // 3. Send message
     const response = await axios.post(
       `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
       {
@@ -28,7 +108,9 @@ export async function sendWhatsAppMessage({ phoneNumberId, accessToken, to, mess
         },
       }
     );
+
     return response.data;
+
   } catch (err) {
     console.error("WhatsApp send error:", err.response?.data || err.message);
     throw err;
@@ -36,72 +118,97 @@ export async function sendWhatsAppMessage({ phoneNumberId, accessToken, to, mess
 }
 
 /**
- * Send multiple WhatsApp messages with human-like delays.
- * Splits agent reply into multiple short messages.
- * Each part sent separately with typing delay between them.
+ * Send MULTIPLE messages with sales-exec-like delays between each.
+ *
+ * Simulates a real sales person:
+ * - Reads message (only for first)
+ * - Thinks
+ * - Types each part naturally
+ * - Small pause between parts (finishing one thought, starting next)
  */
-export async function sendWhatsAppMessages({ phoneNumberId, accessToken, to, messages }) {
+export async function sendWhatsAppMessages({
+  phoneNumberId,
+  accessToken,
+  to,
+  messages,
+  waMessageId = null,
+}) {
   const results = [];
+
   for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    if (!msg.trim()) continue;
+    const msg     = messages[i];
+    const isFirst = i === 0;
+    if (!msg?.trim()) continue;
 
-    // Typing delay based on message length (feels human)
-    const typingDelay = Math.min(600 + msg.length * 30, 3000);
-    await sleep(typingDelay);
+    // First message: mark as read immediately
+    if (isFirst && waMessageId) {
+      await markMessageAsRead({ phoneNumberId, accessToken, waMessageId });
+      await sleep(400 + Math.random() * 600); // exec is "reading"
+    }
 
-    const result = await sendWhatsAppMessage({ phoneNumberId, accessToken, to, message: msg });
+    // Send with appropriate delay
+    const result = await sendWhatsAppMessage({
+      phoneNumberId,
+      accessToken,
+      to,
+      message:       msg,
+      waMessageId:   null, // already marked read above
+      isFirstMessage: isFirst,
+    });
+
     results.push(result);
 
-    // Small pause between messages
+    // Pause between parts — human pauses before typing next thought
     if (i < messages.length - 1) {
-      await sleep(400 + Math.random() * 600);
+      // Short pause: like exec hits send then immediately starts typing next
+      const pauseBetween = 600 + Math.random() * 1000; // 0.6-1.6s
+      await sleep(pauseBetween);
     }
   }
+
   return results;
 }
 
 /**
- * Parse agent reply into multiple short messages.
- * Splits on newlines, keeping each part concise.
+ * Split agent reply into multiple short messages.
+ * Each part sent separately with typing delays.
  */
 export function splitIntoMessages(reply) {
   if (!reply) return [];
 
-  // Split by double newlines first (paragraphs)
+  // Split by double newlines (paragraphs)
   const parts = reply
     .split(/\n{2,}/)
     .map(p => p.trim())
     .filter(p => p.length > 0);
 
-  // If only one part, check if it needs splitting by single newlines
   if (parts.length === 1) {
+    // Check single newlines
     const lines = reply
       .split(/\n/)
       .map(l => l.trim())
       .filter(l => l.length > 0);
 
-    // If multiple short lines → send as separate messages
-    if (lines.length > 1 && lines.every(l => l.length < 100)) {
+    if (lines.length > 1 && lines.every(l => l.length < 120)) {
       return lines;
     }
   }
 
-  // Flatten any part that's too long (>200 chars) into sub-parts
+  // Break long parts into shorter ones
   const final = [];
   for (const part of parts) {
-    if (part.length <= 200) {
+    if (part.length <= 220) {
       final.push(part);
     } else {
-      // Split long parts by sentence
+      // Split at sentence boundaries
       const sentences = part.match(/[^.!?]+[.!?]+/g) || [part];
       let current = "";
-      for (const sentence of sentences) {
-        if ((current + sentence).length > 200 && current) {
+      for (const s of sentences) {
+        if ((current + s).length > 220 && current) {
           final.push(current.trim());
-          current = sentence;
+          current = s;
         } else {
-          current += sentence;
+          current += s;
         }
       }
       if (current.trim()) final.push(current.trim());
@@ -132,12 +239,16 @@ export async function notifyOwnerWhatsApp(businessId, message) {
     if (!rows.length) return;
     const { phone_number_id, access_token, owner_notify_number } = rows[0];
 
-    await sendWhatsAppMessage({
-      phoneNumberId: phone_number_id,
-      accessToken:   access_token,
-      to:            owner_notify_number,
-      message,
-    });
+    await axios.post(
+      `${META_BASE}/${VERSION}/${phone_number_id}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to:                owner_notify_number,
+        type:              "text",
+        text:              { body: message },
+      },
+      { headers: { Authorization: `Bearer ${access_token}` } }
+    );
   } catch (err) {
     console.error("Owner notify error:", err.message);
   }

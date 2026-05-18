@@ -68,9 +68,14 @@ export async function buildSystemPrompt(businessId) {
   const socialLinks = company.social_links || {};
   const companyBlock = buildCompanyBlock({ biz, company, socialLinks });
 
+  // Current time in IST for agent context
+  const nowIST = new Date(Date.now() + (5.5 * 60 * 60 * 1000));
+  const currentTimeIST = nowIST.toISOString().replace('T', ' ').slice(0, 16) + ' IST';
+
   const prompt = `
 You are ${biz.agent_name}, a sales representative at ${biz.business_name}.
 You are a real human — never say you are an AI or bot.
+Current date and time: ${currentTimeIST} (use this for scheduling follow-ups)
 
 BUSINESS:
 Name: ${biz.business_name}

@@ -4,9 +4,7 @@ import cors         from "cors";
 import helmet       from "helmet";
 import morgan       from "morgan";
 import rateLimit    from "express-rate-limit";
-import { processFollowUps } from "./agents/Followupcron.js"
-import whatsappEmbeddedRouter from "./routes/whatsappEmbedded.js";
-import businessKnowledgeRouter from "./routes/businessKnowledge.js";
+import { processFollowUps } from "./agents/followUpCron.js";
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -52,7 +50,6 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Voxiro Backend" });
 });
 
-
 // ── WhatsApp Webhook ──────────────────────────────────────────
 app.use("/webhook", express.raw({ type: "*/*" }), (req, res, next) => {
   if (req.body && Buffer.isBuffer(req.body)) {
@@ -80,8 +77,6 @@ app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api/admin",  adminRouter);
-app.use("/api", whatsappEmbeddedRouter);
-app.use("/api", businessKnowledgeRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────
 app.use((req, res) => {
@@ -100,10 +95,10 @@ app.listen(PORT, () => {
   console.log(`   Environment: ${process.env.NODE_ENV || "development"}`);
   console.log(`   Health:      http://localhost:${PORT}/health\n`);
 
-  // ── Follow-up Cron — every 15 minutes ──────────────────────
-  console.log("⏰ Follow-up scheduler started — runs every 15 minutes");
+  // ── Follow-up Cron — every 5 minutes ───────────────────────
+  console.log("⏰ Follow-up scheduler started — runs every 5 minutes");
   processFollowUps(); // run once on startup
-  setInterval(processFollowUps, 15 * 60 * 1000);
+  setInterval(processFollowUps, 5 * 60 * 1000); // every 5 mins
 });
 
 export default app;

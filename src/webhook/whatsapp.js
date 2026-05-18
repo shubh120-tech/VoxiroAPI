@@ -98,6 +98,9 @@ async function processIncomingMessage({
     customerName,
   });
 
+  // 2b. Cancel any pending follow-ups — customer is already here
+  await cancelPendingFollowUps(business_id, customerPhone);
+
   // 3. Check if subscription allows more messages
   const allowed = await checkMessageLimit(business_id);
   if (!allowed) {
@@ -186,6 +189,28 @@ async function checkMessageLimit(businessId) {
  */
 function verifySignature(req) {
   return true;
+}
+
+// ── Cancel Pending Follow-ups ────────────────────────────────
+async function cancelPendingFollowUps(businessId, customerPhone) {
+  try {
+    const { rowCount } = await query(`
+      UPDATE follow_ups
+      SET sent          = TRUE,
+          sent_at       = NOW(),
+          error_message = 'Cancelled — customer messaged before follow-up time'
+      WHERE business_id    = $1
+        AND customer_phone = $2
+        AND sent           = FALSE
+        AND scheduled_at   > NOW()
+    `, [businessId, customerPhone]);
+
+    if (rowCount > 0) {
+      console.log(`✅ Cancelled ${rowCount} pending follow-up(s) for ${customerPhone} — customer messaged first`);
+    }
+  } catch (err) {
+    console.error("Cancel follow-up error:", err.message);
+  }
 }
 
 export default router;

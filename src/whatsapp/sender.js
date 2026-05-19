@@ -74,8 +74,9 @@ export async function sendWhatsAppMessage({
   accessToken,
   to,
   message,
-  waMessageId    = null,
-  isFirstMessage = true,
+  waMessageId      = null,   // incoming message to mark as read
+  replyToMessageId = null,   // message to quote in reply
+  isFirstMessage   = true,
 }) {
   try {
     // 1. Mark as read immediately — blue ticks appear
@@ -89,16 +90,23 @@ export async function sendWhatsAppMessage({
     const delay = getSalesExecDelay(message, isFirstMessage);
     await sleep(delay);
 
-    // 3. Send message
+    // 3. Send message (with optional quote context)
+    const payload = {
+      messaging_product: "whatsapp",
+      recipient_type:    "individual",
+      to,
+      type:              "text",
+      text:              { body: message, preview_url: false },
+    };
+
+    // Add quote context if replying to a specific message
+    if (replyToMessageId) {
+      payload.context = { message_id: replyToMessageId };
+    }
+
     const response = await axios.post(
       `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
-      {
-        messaging_product: "whatsapp",
-        recipient_type:    "individual",
-        to,
-        type:              "text",
-        text:              { body: message, preview_url: false },
-      },
+      payload,
       {
         headers: {
           Authorization:  `Bearer ${accessToken}`,
@@ -129,37 +137,41 @@ export async function sendWhatsAppMessages({
   accessToken,
   to,
   messages,
-  waMessageId = null,
+  waMessageId      = null,  // incoming message — mark as read + quote first reply
+  replyToMessageId = null,  // explicit message to quote (overrides waMessageId)
 }) {
   const results = [];
+
+  // The message to quote — use explicit or fall back to incoming message
+  const quoteId = replyToMessageId || waMessageId;
 
   for (let i = 0; i < messages.length; i++) {
     const msg     = messages[i];
     const isFirst = i === 0;
     if (!msg?.trim()) continue;
 
-    // First message: mark as read immediately
+    // Mark incoming as read immediately on first message
     if (isFirst && waMessageId) {
       await markMessageAsRead({ phoneNumberId, accessToken, waMessageId });
-      await sleep(400 + Math.random() * 600); // exec is "reading"
+      await sleep(400 + Math.random() * 600);
     }
 
     // Send with appropriate delay
+    // Only quote on the FIRST message — subsequent parts are continuation
     const result = await sendWhatsAppMessage({
       phoneNumberId,
       accessToken,
       to,
-      message:       msg,
-      waMessageId:   null, // already marked read above
-      isFirstMessage: isFirst,
+      message:         msg,
+      waMessageId:     null,
+      replyToMessageId: isFirst ? quoteId : null, // quote only first part
+      isFirstMessage:  isFirst,
     });
 
     results.push(result);
 
-    // Pause between parts — human pauses before typing next thought
     if (i < messages.length - 1) {
-      // Short pause: like exec hits send then immediately starts typing next
-      const pauseBetween = 600 + Math.random() * 1000; // 0.6-1.6s
+      const pauseBetween = 600 + Math.random() * 1000;
       await sleep(pauseBetween);
     }
   }

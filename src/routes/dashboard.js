@@ -282,7 +282,7 @@ router.post("/agent/conversations/:id/resume", async (req, res) => {
 
 router.post("/agent/conversations/:id/send", async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, replyToMessageId } = req.body;  // replyToMessageId for quoted replies
     const { rows: conv } = await query(
       "SELECT * FROM conversations WHERE id = $1 AND business_id = $2",
       [req.params.id, req.user.business_id]

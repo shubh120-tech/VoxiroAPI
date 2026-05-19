@@ -207,7 +207,6 @@ function verifySignature(req) {
 // ── Process Media / Document Message ────────────────────────
 async function processMediaMessage({ phoneNumberId, customerPhone, customerName, msg }) {
   try {
-    // Find business
     const { rows: bizRows } = await query(`
       SELECT b.id AS business_id, wc.access_token
       FROM whatsapp_configs wc
@@ -219,93 +218,123 @@ async function processMediaMessage({ phoneNumberId, customerPhone, customerName,
     if (!bizRows.length) return;
     const { business_id, access_token } = bizRows[0];
 
-    // Get or create conversation
-    const conversation = await getOrCreateConversation({
-      businessId:   business_id,
-      customerPhone,
-      customerName,
-    });
-
-    // Cancel pending follow-ups
+    const conversation = await getOrCreateConversation({ businessId: business_id, customerPhone, customerName });
     await cancelPendingFollowUps(business_id, customerPhone);
 
-    // Build description of what was received
-    const typeLabels = {
-      image:    "image/screenshot",
-      document: "document",
-      video:    "video",
-      audio:    "voice message",
-      sticker:  "sticker",
-    };
-    const typeLabel = typeLabels[msg.type] || "file";
-    const caption   = msg[msg.type]?.caption || "";
-    const filename  = msg[msg.type]?.filename || "";
+    const typeLabels = { image: "image", document: "document", video: "video", audio: "voice message", sticker: "sticker" };
+    const typeLabel  = typeLabels[msg.type] || "file";
+    const caption    = msg[msg.type]?.caption   || "";
+    const filename   = msg[msg.type]?.filename  || "";
+    const mediaId    = msg[msg.type]?.id        || null;
+    const mimeType   = msg[msg.type]?.mime_type || "";
 
-    // Detect if payment related
     const isPayment = /pay|paid|upi|gpay|phonepe|paytm|neft|imps|receipt|transaction|txn|screenshot|advance|deposit|भुगतान|पेमेंट/i
       .test(`${caption} ${filename}`);
 
-    // Save to DB
+    // Download and store media
+    let storedUrl = null;
+    if (mediaId && process.env.CLOUDFLARE_R2_ACCOUNT_ID) {
+      try {
+        storedUrl = await downloadAndStoreMedia({ mediaId, accessToken: access_token, businessId: business_id, mimeType, filename });
+        console.log(`✅ Media stored: ${storedUrl}`);
+      } catch (err) {
+        console.error("Media download/store error:", err.message);
+      }
+    }
+
     const dbContent = isPayment
-      ? `[Payment ${typeLabel} received${caption ? `: ${caption}` : ""}]`
-      : `[${typeLabel} received${caption ? `: ${caption}` : ""}${filename ? ` (${filename})` : ""}]`;
+      ? `[Payment ${typeLabel}${caption ? `: ${caption}` : ""}]`
+      : `[${typeLabel}${caption ? `: ${caption}` : ""}${filename ? ` (${filename})` : ""}]`;
+
+    // Save message with media URL
+    await query(`
+      INSERT INTO messages (conversation_id, business_id, role, content, media_url, media_type, media_filename)
+      VALUES ($1, $2, 'customer', $3, $4, $5, $6)
+    `, [conversation.id, business_id, dbContent, storedUrl, msg.type, filename || null]);
 
     await query(`
-      INSERT INTO messages (conversation_id, business_id, role, content)
-      VALUES ($1, $2, 'customer', $3)
-    `, [conversation.id, business_id, dbContent]);
-
-    await query(`
-      UPDATE conversations
-      SET last_message = $1, last_message_at = NOW(), customer_last_seen = NOW()
-      WHERE id = $2
+      UPDATE conversations SET last_message = $1, last_message_at = NOW(), customer_last_seen = NOW() WHERE id = $2
     `, [dbContent, conversation.id]);
 
-    // Send acknowledgement to customer
     const ackMsg = isPayment
       ? `Thank you! I have received your payment confirmation and shared it with the team. We will verify and confirm shortly.`
       : `Thank you! I have received your ${typeLabel} and shared it with the team. They will review and get back to you shortly.`;
 
-    await sendWhatsAppMessage({
-      phoneNumberId,
-      accessToken: access_token,
-      to:          customerPhone,
-      message:     ackMsg,
-    });
+    await sendWhatsAppMessage({ phoneNumberId, accessToken: access_token, to: customerPhone, message: ackMsg });
+    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'agent', $3)`,
+      [conversation.id, business_id, ackMsg]);
+    await query(`UPDATE conversations SET status = 'manual', updated_at = NOW() WHERE id = $1`, [conversation.id]);
 
-    await query(`
-      INSERT INTO messages (conversation_id, business_id, role, content)
-      VALUES ($1, $2, 'agent', $3)
-    `, [conversation.id, business_id, ackMsg]);
-
-    // Switch conversation to manual — agent stops replying
-    await query(`
-      UPDATE conversations SET status = 'manual', updated_at = NOW()
-      WHERE id = $1
-    `, [conversation.id]);
-
-    // Notify owner on WhatsApp
-    const name       = customerName || customerPhone;
-    const icon       = isPayment ? "💰" : "📎";
-    const subject    = isPayment ? "Payment received" : `${typeLabel} received`;
-    const ownerMsg   = `${icon} ${subject} from ${name}
-
-`
-      + (caption   ? `Caption: "${caption}"
-`   : "")
-      + (filename  ? `File: ${filename}
-`        : "")
+    const name     = customerName || customerPhone;
+    const icon     = isPayment ? "💰" : "📎";
+    const subject  = isPayment ? "Payment received" : `${typeLabel} received`;
+    const ownerMsg = `${icon} ${subject} from ${name}`
+      + (caption  ? `
+Caption: "${caption}"` : "")
+      + (filename ? `
+File: ${filename}`     : "")
       + `
-Please review and respond from the dashboard.`;
+Open dashboard to view and respond.`;
 
     await notifyOwnerWhatsApp(business_id, ownerMsg);
-
-    console.log(`${icon} Media (${typeLabel}) from ${customerPhone} — owner notified, agent paused`);
+    console.log(`${icon} Media (${typeLabel}) from ${customerPhone} — stored & owner notified`);
 
   } catch (err) {
     console.error("Media message error:", err.message);
   }
 }
+
+// ── Download Media from Meta + Store in R2 ───────────────────
+async function downloadAndStoreMedia({ mediaId, accessToken, businessId, mimeType, filename }) {
+  const META_BASE    = process.env.META_BASE_URL    || "https://graph.facebook.com";
+  const META_VERSION = process.env.META_API_VERSION || "v19.0";
+
+  // Get media URL from Meta
+  const metaRes = await axios.get(
+    `${META_BASE}/${META_VERSION}/${mediaId}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const mediaUrl = metaRes.data?.url;
+  if (!mediaUrl) throw new Error("No media URL from Meta");
+
+  // Download file
+  const fileRes = await axios.get(mediaUrl, {
+    responseType: "arraybuffer",
+    headers:      { Authorization: `Bearer ${accessToken}` },
+  });
+  const buffer = Buffer.from(fileRes.data);
+
+  // Upload to R2
+  const AWS = (await import("aws-sdk")).default;
+  const r2  = new AWS.S3({
+    endpoint:         `https://${process.env.CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    accessKeyId:      process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+    secretAccessKey:  process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+    region:           "auto",
+    signatureVersion: "v4",
+  });
+
+  const mimeMap = {
+    "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+    "application/pdf": "pdf", "audio/ogg": "ogg", "video/mp4": "mp4",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  };
+  const ext    = mimeMap[mimeType] || filename?.split(".").pop() || "bin";
+  const key    = `media/${businessId}/${Date.now()}.${ext}`;
+  const bucket = process.env.CLOUDFLARE_R2_BUCKET || "voxiro-knowledge";
+
+  await r2.putObject({ Bucket: bucket, Key: key, Body: buffer, ContentType: mimeType || "application/octet-stream" }).promise();
+
+  // Generate signed URL (valid 7 days) so dashboard can view it
+  const signedUrl = r2.getSignedUrl("getObject", {
+    Bucket:  bucket,
+    Key:     key,
+    Expires: 7 * 24 * 60 * 60, // 7 days
+  });
+
+  return signedUrl;
+}
+
 
 // ── Cancel Pending Follow-ups ────────────────────────────────
 async function cancelPendingFollowUps(businessId, customerPhone) {

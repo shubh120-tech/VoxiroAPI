@@ -1,0 +1,662 @@
+import express   from "express";
+import axios     from "axios";
+import Anthropic from "@anthropic-ai/sdk";
+import { query } from "../db/postgres.js";
+import { authMiddleware } from "../middleware/auth.js";
+
+const router = express.Router();
+router.use(authMiddleware);
+
+const bId = (req) => req.user.business_id;
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const META_BASE    = process.env.META_BASE_URL    || "https://graph.facebook.com";
+const META_VERSION = process.env.META_API_VERSION || "v19.0";
+
+// IST helpers
+const IST_OFFSET      = 5.5 * 60 * 60 * 1000;
+const SEND_HOUR_START = 10;
+const SEND_HOUR_END   = 22;
+
+function nowIST()       { return new Date(Date.now() + IST_OFFSET); }
+function getISTHour(d)  { return new Date(d.getTime() + IST_OFFSET).getUTCHours(); }
+function isValidSendTime(date) {
+  const h = getISTHour(date);
+  return h >= SEND_HOUR_START && h < SEND_HOUR_END;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  CONTACTS
+// ══════════════════════════════════════════════════════════════
+
+// Get all contacts
+router.get("/broadcast/contacts", async (req, res) => {
+  try {
+    const { search, tag } = req.query;
+    let sql    = `SELECT * FROM business_contacts WHERE business_id = $1 AND opted_out = FALSE`;
+    const params = [bId(req)];
+    if (search) { params.push(`%${search}%`); sql += ` AND (name ILIKE $${params.length} OR phone ILIKE $${params.length})`; }
+    sql += ` ORDER BY created_at DESC`;
+    const { rows } = await query(sql, params);
+    res.json({ contacts: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load contacts" });
+  }
+});
+
+// Claude-powered contact extraction from raw text
+router.post("/broadcast/contacts/extract", async (req, res) => {
+  try {
+    const { rawText } = req.body;
+    if (!rawText?.trim()) return res.status(400).json({ message: "No text provided" });
+
+    const response = await anthropic.messages.create({
+      model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
+      max_tokens: 2000,
+      messages: [{
+        role:    "user",
+        content: `Extract all contact information from this text. Return ONLY a valid JSON array, no other text.
+
+Each contact object should have:
+- phone: string (normalize to +91XXXXXXXXXX format for Indian numbers, add country code if missing)
+- name: string or null
+- email: string or null  
+- notes: string or null (any other relevant info like domain, requirement, service needed)
+
+Rules:
+- Include ALL contacts found
+- Normalize phone numbers (remove spaces, dashes, brackets)
+- Add +91 for 10-digit Indian numbers
+- Skip entries with no valid phone number
+- Return empty array [] if no contacts found
+
+Text to extract from:
+${rawText.slice(0, 5000)}`,
+      }],
+    });
+
+    const text    = response.content[0]?.text || "[]";
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    let   contacts;
+
+    try {
+      contacts = JSON.parse(cleaned);
+    } catch {
+      contacts = [];
+    }
+
+    // Validate phone numbers
+    contacts = contacts.filter(c => c.phone && c.phone.length >= 10);
+
+    res.json({ contacts, count: contacts.length });
+  } catch (err) {
+    console.error("Extract error:", err.message);
+    res.status(500).json({ message: "Failed to extract contacts" });
+  }
+});
+
+// Save extracted contacts to DB
+router.post("/broadcast/contacts/import", async (req, res) => {
+  try {
+    const { contacts } = req.body;
+    if (!contacts?.length) return res.status(400).json({ message: "No contacts to import" });
+
+    let imported = 0;
+    let skipped  = 0;
+
+    for (const contact of contacts) {
+      if (!contact.phone) continue;
+      try {
+        await query(`
+          INSERT INTO business_contacts (business_id, name, phone, email, notes, source)
+          VALUES ($1, $2, $3, $4, $5, 'import')
+          ON CONFLICT (business_id, phone) DO UPDATE
+          SET name = COALESCE($2, business_contacts.name),
+              notes = COALESCE($5, business_contacts.notes),
+              updated_at = NOW()
+        `, [bId(req), contact.name, contact.phone, contact.email, contact.notes]);
+        imported++;
+      } catch {
+        skipped++;
+      }
+    }
+
+    res.json({ success: true, imported, skipped });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to import contacts" });
+  }
+});
+
+// Delete contact
+router.delete("/broadcast/contacts/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM business_contacts WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete contact" });
+  }
+});
+
+// Opt out contact
+router.patch("/broadcast/contacts/:id/optout", async (req, res) => {
+  try {
+    await query("UPDATE business_contacts SET opted_out = TRUE WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to opt out contact" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  TEMPLATES
+// ══════════════════════════════════════════════════════════════
+
+router.get("/broadcast/templates", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE business_id = $1 ORDER BY created_at DESC",
+      [bId(req)]
+    );
+    res.json({ templates: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load templates" });
+  }
+});
+
+router.post("/broadcast/templates", async (req, res) => {
+  try {
+    const { name, category, language, header_text, body, footer_text, variables } = req.body;
+    if (!name || !body) return res.status(400).json({ message: "Name and body required" });
+
+    const { rows } = await query(`
+      INSERT INTO whatsapp_templates
+        (business_id, name, category, language, header_text, body, footer_text, variables)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      RETURNING *
+    `, [bId(req), name, category || "MARKETING", language || "en",
+        header_text, body, footer_text, variables || []]);
+
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to create template" });
+  }
+});
+
+router.put("/broadcast/templates/:id", async (req, res) => {
+  try {
+    const { name, category, language, header_text, body, footer_text, variables } = req.body;
+    const { rows } = await query(`
+      UPDATE whatsapp_templates
+      SET name = $1, category = $2, language = $3, header_text = $4,
+          body = $5, footer_text = $6, variables = $7,
+          meta_status = 'draft', updated_at = NOW()
+      WHERE id = $8 AND business_id = $9
+      RETURNING *
+    `, [name, category, language, header_text, body, footer_text, variables, req.params.id, bId(req)]);
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update template" });
+  }
+});
+
+router.delete("/broadcast/templates/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM whatsapp_templates WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete template" });
+  }
+});
+
+// Submit template to Meta for approval
+router.post("/broadcast/templates/:id/submit", async (req, res) => {
+  try {
+    const { rows: tRows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]
+    );
+    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+
+    const template = tRows[0];
+
+    // Get WhatsApp config
+    const { rows: wc } = await query(
+      "SELECT * FROM whatsapp_configs WHERE business_id = $1",
+      [bId(req)]
+    );
+    if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
+
+    // Build Meta template components
+    const components = [];
+    if (template.header_text) {
+      components.push({ type: "HEADER", format: "TEXT", text: template.header_text });
+    }
+    components.push({ type: "BODY", text: template.body });
+    if (template.footer_text) {
+      components.push({ type: "FOOTER", text: template.footer_text });
+    }
+
+    // Submit to Meta
+    const metaRes = await axios.post(
+      `${META_BASE}/${META_VERSION}/${wc[0].waba_id}/message_templates`,
+      {
+        name:       template.name.toLowerCase().replace(/\s+/g, "_"),
+        category:   template.category,
+        language:   template.language,
+        components,
+      },
+      { headers: { Authorization: `Bearer ${wc[0].access_token}` } }
+    );
+
+    // Update status
+    await query(`
+      UPDATE whatsapp_templates
+      SET meta_status = 'pending', meta_template_id = $1, updated_at = NOW()
+      WHERE id = $2
+    `, [metaRes.data?.id, req.params.id]);
+
+    res.json({ success: true, metaTemplateId: metaRes.data?.id });
+  } catch (err) {
+    const errMsg = err.response?.data?.error?.message || err.message;
+    console.error("Template submit error:", errMsg);
+    res.status(500).json({ message: errMsg });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  CAMPAIGNS
+// ══════════════════════════════════════════════════════════════
+
+router.get("/broadcast/campaigns", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT * FROM broadcast_campaigns WHERE business_id = $1 ORDER BY created_at DESC",
+      [bId(req)]
+    );
+    res.json({ campaigns: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load campaigns" });
+  }
+});
+
+router.get("/broadcast/campaigns/:id", async (req, res) => {
+  try {
+    const [camp, recipients] = await Promise.all([
+      query("SELECT * FROM broadcast_campaigns WHERE id = $1 AND business_id = $2",
+        [req.params.id, bId(req)]),
+      query("SELECT * FROM broadcast_recipients WHERE campaign_id = $1 ORDER BY created_at DESC LIMIT 100",
+        [req.params.id]),
+    ]);
+    res.json({ campaign: camp.rows[0], recipients: recipients.rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load campaign" });
+  }
+});
+
+// Create campaign
+router.post("/broadcast/campaigns", async (req, res) => {
+  try {
+    const {
+      name, message_type, template_id, message_body,
+      variables_map, scheduled_at, recurring_rule,
+      recurring_time, recurring_days,
+      recipient_source, contact_ids, lead_filter,
+    } = req.body;
+
+    if (!name) return res.status(400).json({ message: "Campaign name required" });
+    if (!message_body && !template_id) return res.status(400).json({ message: "Message required" });
+
+    // Validate scheduled time is in business hours
+    let finalScheduledAt = scheduled_at;
+    if (scheduled_at) {
+      const schedDate = new Date(scheduled_at);
+      if (!isValidSendTime(schedDate)) {
+        return res.status(400).json({
+          message: "Scheduled time must be between 10 AM and 10 PM IST",
+        });
+      }
+    }
+
+    // Create campaign
+    const { rows: campRows } = await query(`
+      INSERT INTO broadcast_campaigns
+        (business_id, name, message_type, template_id, message_body,
+         variables_map, scheduled_at, recurring_rule, recurring_time, recurring_days,
+         status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING *
+    `, [
+      bId(req), name,
+      message_type || "session",
+      template_id  || null,
+      message_body || null,
+      variables_map ? JSON.stringify(variables_map) : "{}",
+      finalScheduledAt || null,
+      recurring_rule   || null,
+      recurring_time   || null,
+      recurring_days   || null,
+      scheduled_at ? "scheduled" : "draft",
+    ]);
+
+    const campaign = campRows[0];
+
+    // Add recipients
+    const phones = await resolveRecipients(bId(req), { recipient_source, contact_ids, lead_filter });
+
+    for (const r of phones) {
+      await query(`
+        INSERT INTO broadcast_recipients
+          (campaign_id, business_id, contact_id, phone, name, variables)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT DO NOTHING
+      `, [campaign.id, bId(req), r.contact_id || null, r.phone, r.name || null, JSON.stringify(r.variables || {})]);
+    }
+
+    // Update total recipients
+    await query(`
+      UPDATE broadcast_campaigns SET total_recipients = $1 WHERE id = $2
+    `, [phones.length, campaign.id]);
+
+    res.status(201).json({ ...campaign, total_recipients: phones.length });
+  } catch (err) {
+    console.error("Create campaign error:", err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Launch campaign now
+router.post("/broadcast/campaigns/:id/launch", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT * FROM broadcast_campaigns WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]
+    );
+    if (!rows.length) return res.status(404).json({ message: "Campaign not found" });
+
+    await query("UPDATE broadcast_campaigns SET status = 'running', scheduled_at = NOW() WHERE id = $1", [req.params.id]);
+
+    // Run async
+    executeCampaign(rows[0], bId(req)).catch(console.error);
+
+    res.json({ success: true, message: "Campaign launched" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to launch campaign" });
+  }
+});
+
+// Pause campaign
+router.post("/broadcast/campaigns/:id/pause", async (req, res) => {
+  try {
+    await query("UPDATE broadcast_campaigns SET status = 'paused' WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to pause" });
+  }
+});
+
+// Delete campaign
+router.delete("/broadcast/campaigns/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM broadcast_campaigns WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  CAMPAIGN EXECUTION
+// ══════════════════════════════════════════════════════════════
+
+export async function executeCampaign(campaign, businessId) {
+  try {
+    // Get WhatsApp config
+    const { rows: wc } = await query(
+      "SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id = $1",
+      [businessId]
+    );
+    if (!wc.length) throw new Error("WhatsApp not configured");
+
+    const { phone_number_id, access_token } = wc[0];
+
+    // Get pending recipients
+    const { rows: recipients } = await query(`
+      SELECT * FROM broadcast_recipients
+      WHERE campaign_id = $1 AND status = 'pending'
+      ORDER BY created_at ASC
+    `, [campaign.id]);
+
+    console.log(`📢 Broadcasting to ${recipients.length} recipients for campaign: ${campaign.name}`);
+
+    for (const recipient of recipients) {
+      // Check campaign is still running
+      const { rows: campCheck } = await query(
+        "SELECT status FROM broadcast_campaigns WHERE id = $1",
+        [campaign.id]
+      );
+      if (campCheck[0]?.status !== "running") {
+        console.log(`⏸️ Campaign ${campaign.name} paused/stopped`);
+        break;
+      }
+
+      try {
+        let result;
+
+        if (campaign.message_type === "template" && campaign.template_id) {
+          // Send template message
+          result = await sendTemplateMessage({
+            phoneNumberId:  phone_number_id,
+            accessToken:    access_token,
+            to:             recipient.phone,
+            campaign,
+            recipient,
+          });
+        } else {
+          // Send session message — personalize with recipient name
+          let message = campaign.message_body || "";
+          message = message
+            .replace(/\{\{name\}\}/gi,  recipient.name || "there")
+            .replace(/\{\{phone\}\}/gi, recipient.phone)
+            .replace(/\{\{notes\}\}/gi, recipient.variables?.notes || "");
+
+          result = await sendSessionMessage({
+            phoneNumberId: phone_number_id,
+            accessToken:   access_token,
+            to:            recipient.phone,
+            message,
+          });
+        }
+
+        const waMessageId = result?.messages?.[0]?.id;
+
+        await query(`
+          UPDATE broadcast_recipients
+          SET status = 'sent', wa_message_id = $1, sent_at = NOW()
+          WHERE id = $2
+        `, [waMessageId, recipient.id]);
+
+        await query(`
+          UPDATE broadcast_campaigns
+          SET sent_count = sent_count + 1, updated_at = NOW()
+          WHERE id = $1
+        `, [campaign.id]);
+
+        console.log(`✅ Sent to ${recipient.phone}`);
+
+        // Delay between messages — avoid Meta rate limits (avoid spam)
+        await sleep(1500 + Math.random() * 1000);
+
+      } catch (err) {
+        const errMsg = err.response?.data?.error?.message || err.message;
+        console.error(`❌ Failed to send to ${recipient.phone}:`, errMsg);
+
+        await query(`
+          UPDATE broadcast_recipients
+          SET status = 'failed', error_message = $1
+          WHERE id = $2
+        `, [errMsg, recipient.id]);
+
+        await query(`
+          UPDATE broadcast_campaigns SET failed_count = failed_count + 1 WHERE id = $1
+        `, [campaign.id]);
+      }
+    }
+
+    // Mark completed
+    await query(`
+      UPDATE broadcast_campaigns
+      SET status = 'completed', last_run_at = NOW(), updated_at = NOW()
+      WHERE id = $1
+    `, [campaign.id]);
+
+    // Schedule next run if recurring
+    if (campaign.recurring_rule) {
+      const nextRun = calculateNextRun(campaign);
+      if (nextRun) {
+        await query(`
+          UPDATE broadcast_campaigns
+          SET status = 'scheduled', next_run_at = $1, scheduled_at = $1
+          WHERE id = $2
+        `, [nextRun.toISOString(), campaign.id]);
+
+        // Reset recipients for next run
+        await query(`
+          UPDATE broadcast_recipients SET status = 'pending' WHERE campaign_id = $1
+        `, [campaign.id]);
+      }
+    }
+
+    console.log(`✅ Campaign completed: ${campaign.name}`);
+
+  } catch (err) {
+    console.error("Campaign execution error:", err.message);
+    await query(`
+      UPDATE broadcast_campaigns SET status = 'failed', updated_at = NOW() WHERE id = $1
+    `, [campaign.id]);
+  }
+}
+
+// ── Send session message ──────────────────────────────────────
+async function sendSessionMessage({ phoneNumberId, accessToken, to, message }) {
+  const response = await axios.post(
+    `${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
+    {
+      messaging_product: "whatsapp",
+      recipient_type:    "individual",
+      to,
+      type:              "text",
+      text:              { body: message, preview_url: false },
+    },
+    { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
+  );
+  return response.data;
+}
+
+// ── Send template message ─────────────────────────────────────
+async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, recipient }) {
+  const { rows: tRows } = await query(
+    "SELECT * FROM whatsapp_templates WHERE id = $1",
+    [campaign.template_id]
+  );
+  if (!tRows.length) throw new Error("Template not found");
+  const template = tRows[0];
+
+  // Build variable components
+  const components = [];
+  const variables  = template.variables || [];
+  if (variables.length > 0) {
+    const bodyParams = variables.map(varName => ({
+      type: "text",
+      text: recipient.variables?.[varName] || campaign.variables_map?.[varName] || "",
+    }));
+    components.push({ type: "body", parameters: bodyParams });
+  }
+
+  const response = await axios.post(
+    `${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to,
+      type:     "template",
+      template: {
+        name:       template.name,
+        language:   { code: template.language || "en" },
+        components: components.length > 0 ? components : undefined,
+      },
+    },
+    { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
+  );
+  return response.data;
+}
+
+// ── Resolve recipients from source ───────────────────────────
+async function resolveRecipients(businessId, { recipient_source, contact_ids, lead_filter }) {
+  const recipients = [];
+
+  if (recipient_source === "contacts" || recipient_source === "all") {
+    const { rows } = await query(`
+      SELECT id AS contact_id, phone, name FROM business_contacts
+      WHERE business_id = $1 AND opted_out = FALSE
+    `, [businessId]);
+    recipients.push(...rows);
+  }
+
+  if (recipient_source === "leads" || recipient_source === "all") {
+    let sql    = `SELECT id AS contact_id, phone, customer_name AS name FROM leads WHERE business_id = $1`;
+    const params = [businessId];
+    if (lead_filter?.status) { params.push(lead_filter.status); sql += ` AND status = $${params.length}`; }
+    const { rows } = await query(sql, params);
+    recipients.push(...rows);
+  }
+
+  if (contact_ids?.length > 0) {
+    const { rows } = await query(`
+      SELECT id AS contact_id, phone, name FROM business_contacts
+      WHERE business_id = $1 AND id = ANY($2) AND opted_out = FALSE
+    `, [businessId, contact_ids]);
+    recipients.push(...rows);
+  }
+
+  // Deduplicate by phone
+  const seen    = new Set();
+  const unique  = [];
+  for (const r of recipients) {
+    if (!seen.has(r.phone)) {
+      seen.add(r.phone);
+      unique.push(r);
+    }
+  }
+  return unique;
+}
+
+// ── Calculate next recurring run ──────────────────────────────
+function calculateNextRun(campaign) {
+  const now  = nowIST();
+  const rule = campaign.recurring_rule;
+  const time = campaign.recurring_time || "10:00";
+  const [h, m] = time.split(":").map(Number);
+
+  const next = new Date(now);
+  next.setUTCHours(h - 5, m - 30, 0, 0); // Convert IST to UTC
+
+  if (rule === "daily") {
+    next.setUTCDate(next.getUTCDate() + 1);
+  } else if (rule === "weekly") {
+    next.setUTCDate(next.getUTCDate() + 7);
+  } else if (rule === "monthly") {
+    next.setUTCMonth(next.getUTCMonth() + 1);
+  } else {
+    return null;
+  }
+
+  return next;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+export default router;

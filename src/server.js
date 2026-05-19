@@ -4,7 +4,8 @@ import cors         from "cors";
 import helmet       from "helmet";
 import morgan       from "morgan";
 import rateLimit    from "express-rate-limit";
-import { processFollowUps } from "./agents/followUpCron.js";
+import { processFollowUps }  from "./agents/followUpCron.js";
+import { processBroadcasts } from "./agents/broadcastCron.js";
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -13,6 +14,7 @@ import adminRouter       from "./routes/admin.js";
 import knowledgeRouter   from "./routes/knowledge.js";
 import magicLinkRouter   from "./routes/magicLink.js";
 import onboardingRouter  from "./routes/onboarding.js";
+import broadcastRouter   from "./routes/broadcast.js";
 import whatsappWebhook   from "./webhook/whatsapp.js";
 
 const app  = express();
@@ -76,6 +78,7 @@ app.use("/api/auth",   authRouter);
 app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
+app.use("/api",        broadcastRouter);
 app.use("/api/admin",  adminRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────
@@ -97,8 +100,13 @@ app.listen(PORT, () => {
 
   // ── Follow-up Cron — every 5 minutes ───────────────────────
   console.log("⏰ Follow-up scheduler started — runs every 5 minutes");
-  processFollowUps(); // run once on startup
-  setInterval(processFollowUps, 5 * 60 * 1000); // every 5 mins
+  processFollowUps();
+  setInterval(processFollowUps, 5 * 60 * 1000);
+
+  // ── Broadcast Cron — every 5 minutes ─────────────────────────
+  console.log("📢 Broadcast scheduler started — runs every 5 minutes");
+  processBroadcasts();
+  setInterval(processBroadcasts, 5 * 60 * 1000);
 });
 
 export default app;

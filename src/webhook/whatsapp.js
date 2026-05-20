@@ -223,7 +223,7 @@ async function checkMessageLimit(businessId) {
  * Verify Meta webhook signature.
  */
 function verifySignature(req) {
-  return true;
+  return false;
 }
 
 // ── Process Media / Document Message ────────────────────────

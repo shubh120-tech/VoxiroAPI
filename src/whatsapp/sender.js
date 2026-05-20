@@ -7,10 +7,11 @@ const VERSION   = process.env.META_API_VERSION || "v19.0";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Mark a customer message as read — shows blue ticks on customer's phone.
- * Call this immediately when message arrives.
+ * Mark message as read AND show typing indicator.
+ * Customer sees: blue ticks + "typing..." immediately.
+ * Typing indicator auto-dismisses after 25s or when message arrives.
  */
-export async function markMessageAsRead({ phoneNumberId, accessToken, waMessageId }) {
+export async function markReadAndShowTyping({ phoneNumberId, accessToken, waMessageId }) {
   if (!waMessageId) return;
   try {
     await axios.post(
@@ -19,11 +20,39 @@ export async function markMessageAsRead({ phoneNumberId, accessToken, waMessageI
         messaging_product: "whatsapp",
         status:            "read",
         message_id:        waMessageId,
+        typing_indicator:  { type: "text" },
       },
+      {
+        headers: {
+          Authorization:  `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (err) {
+    // Non-critical — fallback to just marking read
+    try {
+      await axios.post(
+        `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
+        { messaging_product: "whatsapp", status: "read", message_id: waMessageId },
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+    } catch {}
+  }
+}
+
+/**
+ * Mark a customer message as read only (no typing indicator).
+ */
+export async function markMessageAsRead({ phoneNumberId, accessToken, waMessageId }) {
+  if (!waMessageId) return;
+  try {
+    await axios.post(
+      `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
+      { messaging_product: "whatsapp", status: "read", message_id: waMessageId },
       { headers: { Authorization: `Bearer ${accessToken}` } }
     );
   } catch (err) {
-    // Non-critical — don't throw
     console.error("Mark read error:", err.message);
   }
 }
@@ -79,11 +108,11 @@ export async function sendWhatsAppMessage({
   isFirstMessage   = true,
 }) {
   try {
-    // 1. Mark as read immediately — blue ticks appear
+    // 1. Mark as read + show typing indicator immediately
     if (waMessageId) {
-      await markMessageAsRead({ phoneNumberId, accessToken, waMessageId });
-      // Small pause after read — exec is "reading"
-      await sleep(500 + Math.random() * 800);
+      await markReadAndShowTyping({ phoneNumberId, accessToken, waMessageId });
+      // Small pause — customer sees "typing..." appear
+      await sleep(300 + Math.random() * 400);
     }
 
     // 2. Sales exec delay — read + think + type
@@ -150,10 +179,11 @@ export async function sendWhatsAppMessages({
     const isFirst = i === 0;
     if (!msg?.trim()) continue;
 
-    // Mark incoming as read immediately on first message
+    // First message: mark as read + show typing indicator
     if (isFirst && waMessageId) {
-      await markMessageAsRead({ phoneNumberId, accessToken, waMessageId });
-      await sleep(400 + Math.random() * 600);
+      await markReadAndShowTyping({ phoneNumberId, accessToken, waMessageId });
+      // Small pause — customer sees "typing..." appear
+      await sleep(300 + Math.random() * 400);
     }
 
     // Send with appropriate delay
@@ -171,8 +201,23 @@ export async function sendWhatsAppMessages({
     results.push(result);
 
     if (i < messages.length - 1) {
-      const pauseBetween = 600 + Math.random() * 1000;
-      await sleep(pauseBetween);
+      // Short pause between parts
+      await sleep(400 + Math.random() * 600);
+
+      // Re-trigger typing indicator for next part
+      // (typing indicator lasts 25s max — re-send to keep it visible)
+      try {
+        await axios.post(
+          `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
+          {
+            messaging_product: "whatsapp",
+            status:            "read",
+            message_id:        waMessageId || "placeholder",
+            typing_indicator:  { type: "text" },
+          },
+          { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
+        );
+      } catch { /* non-critical */ }
     }
   }
 

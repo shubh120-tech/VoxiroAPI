@@ -40,6 +40,25 @@ router.post("/", async (req, res) => {
 
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
+
+        // ── Template status update ──────────────────────────
+        if (change.field === "message_template_status_update") {
+          try {
+            const { handleTemplateStatusUpdate } = await import("../routes/broadcast.js");
+            await handleTemplateStatusUpdate(change.value);
+          } catch (err) {
+            console.error("Template status webhook error:", err.message);
+          }
+          continue;
+        }
+
+        // ── Handle broadcast delivery/read status ───────────
+        if (change.field === "messages" && change.value?.statuses) {
+          for (const status of change.value.statuses || []) {
+            await updateBroadcastStatus(status);
+          }
+        }
+
         if (change.field !== "messages") continue;
 
         const value    = change.value;
@@ -113,6 +132,9 @@ async function processIncomingMessage({
 
   // 2b. Cancel any pending follow-ups — customer is already here
   await cancelPendingFollowUps(business_id, customerPhone);
+
+  // 2c. If customer replied to a broadcast — mark as replied
+  await markBroadcastReplied(business_id, customerPhone);
 
   // 3. Check if subscription allows more messages
   const allowed = await checkMessageLimit(business_id);
@@ -335,6 +357,91 @@ async function downloadAndStoreMedia({ mediaId, accessToken, businessId, mimeTyp
   return signedUrl;
 }
 
+
+// ── Mark Broadcast As Replied ────────────────────────────────
+async function markBroadcastReplied(businessId, customerPhone) {
+  try {
+    const { rows } = await query(`
+      SELECT br.id, br.campaign_id
+      FROM broadcast_recipients br
+      WHERE br.business_id   = $1
+        AND br.phone         = $2
+        AND br.status        IN ('sent', 'delivered', 'read')
+        AND br.replied_at    IS NULL
+      ORDER BY br.sent_at DESC
+      LIMIT 1
+    `, [businessId, customerPhone]);
+
+    if (!rows.length) return;
+
+    const { id, campaign_id } = rows[0];
+
+    await query(`
+      UPDATE broadcast_recipients
+      SET status = 'replied', replied_at = NOW()
+      WHERE id = $1
+    `, [id]);
+
+    await query(`
+      UPDATE broadcast_campaigns
+      SET replied_count = replied_count + 1
+      WHERE id = $1
+    `, [campaign_id]);
+
+    console.log(`📢 Broadcast reply from ${customerPhone}`);
+  } catch (err) {
+    console.error("Mark broadcast replied error:", err.message);
+  }
+}
+
+// ── Update Broadcast Delivery/Read Status ────────────────────
+async function updateBroadcastStatus(status) {
+  try {
+    const { id: waMessageId, status: msgStatus, recipient_id } = status;
+    if (!waMessageId) return;
+
+    // Check if this message is from a broadcast
+    const { rows } = await query(`
+      SELECT id, campaign_id FROM broadcast_recipients
+      WHERE wa_message_id = $1
+      LIMIT 1
+    `, [waMessageId]);
+
+    if (!rows.length) return;
+
+    const recipient  = rows[0];
+    const now        = new Date().toISOString();
+    const statusMap  = { delivered: "delivered", read: "read", failed: "failed" };
+    const newStatus  = statusMap[msgStatus];
+    if (!newStatus) return;
+
+    // Update recipient status
+    await query(`
+      UPDATE broadcast_recipients
+      SET status = $1,
+          ${newStatus === "delivered" ? "delivered_at" : newStatus === "read" ? "read_at" : "error_message"} = $2
+      WHERE id = $3
+    `, [newStatus, now, recipient.id]);
+
+    // Update campaign counters
+    const counterCol = {
+      delivered: "delivered_count",
+      read:      "read_count",
+      failed:    "failed_count",
+    }[newStatus];
+
+    if (counterCol) {
+      await query(`
+        UPDATE broadcast_campaigns
+        SET ${counterCol} = ${counterCol} + 1
+        WHERE id = $1
+      `, [recipient.campaign_id]);
+    }
+
+  } catch (err) {
+    console.error("Broadcast status update error:", err.message);
+  }
+}
 
 // ── Cancel Pending Follow-ups ────────────────────────────────
 async function cancelPendingFollowUps(businessId, customerPhone) {

@@ -336,7 +336,7 @@ router.get("/settings", async (req, res) => {
     const [biz, agent, wc, notif, sub] = await Promise.all([
       query("SELECT * FROM businesses WHERE id = $1", [bId]),
       query("SELECT * FROM agent_configs WHERE business_id = $1", [bId]),
-      query("SELECT phone_number_id, whatsapp_number, is_verified, display_name FROM whatsapp_configs WHERE business_id = $1", [bId]),
+      query("SELECT phone_number_id, whatsapp_number, is_verified, display_name, waba_id FROM whatsapp_configs WHERE business_id = $1", [bId]),
       query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]),
       query("SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [bId]),
     ]);
@@ -419,19 +419,40 @@ router.put("/settings/whatsapp", async (req, res) => {
           updated_at      = NOW()
     `, [req.user.business_id, phoneNumberId, accessToken || null, webhookSecret || null]);
 
-    // Try to fetch display name from Meta
+    // Auto-fetch WABA ID + display name from Meta
     try {
-      const { fetchAndSaveDisplayName } = await import("../webhook/whatsapp.js");
       const { rows: wc } = await query(
         "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
         [req.user.business_id]
       );
-      if (wc[0]?.access_token) {
-        await fetchAndSaveDisplayName(req.user.business_id, phoneNumberId, wc[0].access_token);
+      const token = accessToken || wc[0]?.access_token;
+      if (token) {
+        // Fetch WABA ID
+        try {
+          const axios = (await import("axios")).default;
+          const wabaRes = await axios.get(
+            `${process.env.META_BASE_URL || "https://graph.facebook.com"}/${process.env.META_API_VERSION || "v19.0"}/me/whatsapp_business_accounts`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          const wabaId = wabaRes.data?.data?.[0]?.id;
+          if (wabaId) {
+            await query(
+              "UPDATE whatsapp_configs SET waba_id = $1 WHERE business_id = $2",
+              [wabaId, req.user.business_id]
+            );
+            console.log(`✅ WABA ID saved: ${wabaId}`);
+          }
+        } catch (err) {
+          console.warn("Could not fetch WABA ID:", err.message);
+        }
+
+        // Fetch display name
+        try {
+          const { fetchAndSaveDisplayName } = await import("../webhook/whatsapp.js");
+          await fetchAndSaveDisplayName(req.user.business_id, phoneNumberId, token);
+        } catch { /* non-critical */ }
       }
-    } catch {
-      // Non-critical
-    }
+    } catch { /* non-critical */ }
 
     res.json({ success: true });
   } catch (err) {

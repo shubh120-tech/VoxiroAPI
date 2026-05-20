@@ -219,15 +219,45 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       [req.params.id, bId(req)]
     );
     if (!tRows.length) return res.status(404).json({ message: "Template not found" });
-
     const template = tRows[0];
 
-    // Get WhatsApp config
+    // Get WhatsApp config including WABA ID
     const { rows: wc } = await query(
       "SELECT * FROM whatsapp_configs WHERE business_id = $1",
       [bId(req)]
     );
-    if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
+    if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured. Please save your WhatsApp credentials first." });
+
+    const { access_token, waba_id, phone_number_id } = wc[0];
+
+    if (!access_token) return res.status(400).json({ message: "Access token missing. Please update your WhatsApp credentials." });
+
+    // Auto-fetch WABA ID if not stored yet
+    let finalWabaId = waba_id;
+    if (!finalWabaId) {
+      try {
+        const wabaRes = await axios.get(
+          `${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`,
+          { headers: { Authorization: `Bearer ${access_token}` } }
+        );
+        finalWabaId = wabaRes.data?.data?.[0]?.id;
+        if (finalWabaId) {
+          await query(
+            "UPDATE whatsapp_configs SET waba_id = $1 WHERE business_id = $2",
+            [finalWabaId, bId(req)]
+          );
+          console.log(`✅ WABA ID auto-fetched: ${finalWabaId}`);
+        }
+      } catch (err) {
+        console.warn("Could not fetch WABA ID:", err.message);
+      }
+    }
+
+    if (!finalWabaId) {
+      return res.status(400).json({
+        message: "WhatsApp Business Account ID (WABA ID) not found. Please re-save your WhatsApp credentials with a valid access token.",
+      });
+    }
 
     // Build Meta template components
     const components = [];
@@ -239,32 +269,85 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       components.push({ type: "FOOTER", text: template.footer_text });
     }
 
+    // Clean template name — Meta requires lowercase, underscores only
+    const metaName = template.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+
+    console.log(`📝 Submitting template "${metaName}" to Meta WABA: ${finalWabaId}`);
+
     // Submit to Meta
     const metaRes = await axios.post(
-      `${META_BASE}/${META_VERSION}/${wc[0].waba_id}/message_templates`,
+      `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
       {
-        name:       template.name.toLowerCase().replace(/\s+/g, "_"),
+        name:       metaName,
         category:   template.category,
         language:   template.language,
         components,
       },
-      { headers: { Authorization: `Bearer ${wc[0].access_token}` } }
+      {
+        headers: {
+          Authorization:  `Bearer ${access_token}`,
+          "Content-Type": "application/json",
+        },
+      }
     );
 
-    // Update status
+    // Update template status
     await query(`
       UPDATE whatsapp_templates
       SET meta_status = 'pending', meta_template_id = $1, updated_at = NOW()
       WHERE id = $2
-    `, [metaRes.data?.id, req.params.id]);
+    `, [metaRes.data?.id?.toString(), req.params.id]);
 
+    console.log(`✅ Template submitted: ${metaName} → ID: ${metaRes.data?.id}`);
     res.json({ success: true, metaTemplateId: metaRes.data?.id });
+
   } catch (err) {
     const errMsg = err.response?.data?.error?.message || err.message;
+    const errCode = err.response?.data?.error?.code;
     console.error("Template submit error:", errMsg);
-    res.status(500).json({ message: errMsg });
+
+    // Give helpful error messages
+    let userMessage = errMsg;
+    if (errCode === 100) userMessage = "Invalid template format. Check your template body and variables.";
+    if (errCode === 190) userMessage = "Access token expired. Please update your WhatsApp token in Settings.";
+    if (errCode === 200) userMessage = "Permission denied. Make sure your token has whatsapp_business_management permission.";
+
+    res.status(500).json({ message: userMessage });
   }
 });
+
+// Handle Meta template approval webhook
+export async function handleTemplateStatusUpdate(value) {
+  try {
+    const { message_template_id, event } = value;
+    if (!message_template_id || !event) return;
+
+    const statusMap = {
+      APPROVED: "approved",
+      REJECTED: "rejected",
+      PENDING:  "pending",
+      DELETED:  "deleted",
+    };
+
+    const status = statusMap[event] || event.toLowerCase();
+
+    await query(`
+      UPDATE whatsapp_templates
+      SET meta_status      = $1,
+          rejection_reason = $2,
+          updated_at       = NOW()
+      WHERE meta_template_id = $3
+    `, [
+      status,
+      value.rejection_reason || null,
+      message_template_id.toString(),
+    ]);
+
+    console.log(`✅ Template ${message_template_id} status updated: ${status}`);
+  } catch (err) {
+    console.error("Template status update error:", err.message);
+  }
+}
 
 // ══════════════════════════════════════════════════════════════
 //  CAMPAIGNS

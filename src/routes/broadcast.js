@@ -26,6 +26,115 @@ function isValidSendTime(date) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  CONTACT LISTS
+// ══════════════════════════════════════════════════════════════
+
+// Get all lists with member count
+router.get("/broadcast/lists", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT cl.*,
+        COUNT(clm.contact_id) AS member_count
+      FROM contact_lists cl
+      LEFT JOIN contact_list_members clm ON clm.list_id = cl.id
+      WHERE cl.business_id = $1
+      GROUP BY cl.id
+      ORDER BY cl.created_at DESC
+    `, [bId(req)]);
+    res.json({ lists: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load lists" });
+  }
+});
+
+// Create list
+router.post("/broadcast/lists", async (req, res) => {
+  try {
+    const { name, description, color } = req.body;
+    if (!name) return res.status(400).json({ message: "List name required" });
+    const { rows } = await query(`
+      INSERT INTO contact_lists (business_id, name, description, color)
+      VALUES ($1, $2, $3, $4) RETURNING *
+    `, [bId(req), name, description || null, color || "#0d9488"]);
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to create list" });
+  }
+});
+
+// Update list
+router.put("/broadcast/lists/:id", async (req, res) => {
+  try {
+    const { name, description, color } = req.body;
+    const { rows } = await query(`
+      UPDATE contact_lists SET name = $1, description = $2, color = $3, updated_at = NOW()
+      WHERE id = $4 AND business_id = $5 RETURNING *
+    `, [name, description, color, req.params.id, bId(req)]);
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update list" });
+  }
+});
+
+// Delete list
+router.delete("/broadcast/lists/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM contact_lists WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete list" });
+  }
+});
+
+// Get contacts in a list
+router.get("/broadcast/lists/:id/contacts", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT bc.* FROM business_contacts bc
+      JOIN contact_list_members clm ON clm.contact_id = bc.id
+      WHERE clm.list_id = $1 AND bc.business_id = $2
+      ORDER BY bc.name ASC
+    `, [req.params.id, bId(req)]);
+    res.json({ contacts: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load list contacts" });
+  }
+});
+
+// Add contacts to list
+router.post("/broadcast/lists/:id/contacts", async (req, res) => {
+  try {
+    const { contact_ids } = req.body;
+    if (!contact_ids?.length) return res.status(400).json({ message: "No contacts provided" });
+    let added = 0;
+    for (const contactId of contact_ids) {
+      try {
+        await query(`
+          INSERT INTO contact_list_members (list_id, contact_id)
+          VALUES ($1, $2) ON CONFLICT DO NOTHING
+        `, [req.params.id, contactId]);
+        added++;
+      } catch {}
+    }
+    res.json({ success: true, added });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to add contacts" });
+  }
+});
+
+// Remove contact from list
+router.delete("/broadcast/lists/:id/contacts/:contactId", async (req, res) => {
+  try {
+    await query("DELETE FROM contact_list_members WHERE list_id = $1 AND contact_id = $2",
+      [req.params.id, req.params.contactId]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to remove contact" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
 //  CONTACTS
 // ══════════════════════════════════════════════════════════════
 

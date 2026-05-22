@@ -115,9 +115,12 @@ router.post("/team/invite", async (req, res) => {
   try {
     const { name, email, role, permissions, conversation_access } = req.body;
 
+    console.log("Invite request:", { name, email, role, businessId: bId(req) });
+
     if (!name || !email) return res.status(400).json({ message: "Name and email required" });
+    if (!role) return res.status(400).json({ message: "Role is required" });
     if (!["manager", "agent", "viewer", "custom"].includes(role)) {
-      return res.status(400).json({ message: "Invalid role" });
+      return res.status(400).json({ message: `Invalid role: ${role}. Must be manager, agent, viewer, or custom` });
     }
 
     // Check if already exists
@@ -139,14 +142,13 @@ router.post("/team/invite", async (req, res) => {
     const { rows } = await query(`
       INSERT INTO team_members
         (business_id, name, email, role, permissions, status,
-         invite_token, invite_expires_at, invited_by)
-      VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)
+         invite_token, invite_expires_at)
+      VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
       RETURNING id, name, email, role, status, created_at
     `, [
       bId(req), name, email, role,
       JSON.stringify(finalPermissions),
       inviteToken, inviteExpires,
-      req.user.id,
     ]);
 
     // Get business + inviter details for email

@@ -10,6 +10,141 @@ const router = express.Router();
 
 const bId = (req) => req.user.business_id;
 
+// ══════════════════════════════════════════════════════════════
+//  PUBLIC ROUTES — No auth required
+// ══════════════════════════════════════════════════════════════
+
+// Validate invite token
+router.get("/invite/:token", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT tm.id, tm.name, tm.email, tm.role, tm.invite_expires_at,
+             b.name AS business_name
+      FROM team_members tm
+      JOIN businesses b ON b.id = tm.business_id
+      WHERE tm.invite_token = $1
+        AND tm.status = 'pending'
+    `, [req.params.token]);
+
+    if (!rows.length) return res.status(404).json({ message: "Invalid or expired invite link" });
+
+    const member = rows[0];
+    if (new Date(member.invite_expires_at) < new Date()) {
+      return res.status(400).json({ message: "Invite link has expired. Ask the owner to resend." });
+    }
+
+    res.json({
+      name:         member.name,
+      email:        member.email,
+      role:         member.role,
+      businessName: member.business_name,
+      valid:        true,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to validate invite" });
+  }
+});
+
+// Accept invite — set password
+router.post("/invite/:token/accept", async (req, res) => {
+  try {
+    const { password } = req.body;
+    if (!password || password.length < 8) {
+      return res.status(400).json({ message: "Password must be at least 8 characters" });
+    }
+
+    const { rows } = await query(`
+      SELECT tm.*, b.id AS bid, b.name AS business_name
+      FROM team_members tm
+      JOIN businesses b ON b.id = tm.business_id
+      WHERE tm.invite_token = $1 AND tm.status = 'pending'
+    `, [req.params.token]);
+
+    if (!rows.length) return res.status(404).json({ message: "Invalid or expired invite" });
+
+    const member = rows[0];
+    if (new Date(member.invite_expires_at) < new Date()) {
+      return res.status(400).json({ message: "Invite expired. Ask the owner to resend." });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    await query(`
+      UPDATE team_members
+      SET password_hash = $1, status = 'active', invite_token = NULL, updated_at = NOW()
+      WHERE id = $2
+    `, [passwordHash, member.id]);
+
+    const token = jwt.sign(
+      {
+        id:          member.id,
+        business_id: member.business_id,
+        email:       member.email,
+        role:        member.role,
+        permissions: member.permissions,
+        type:        "team_member",
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    res.json({
+      success:      true,
+      token,
+      name:         member.name,
+      role:         member.role,
+      businessName: member.business_name,
+      permissions:  member.permissions,
+    });
+
+  } catch (err) {
+    console.error("Accept invite error:", err.message);
+    res.status(500).json({ message: "Failed to accept invite" });
+  }
+});
+
+// Team member login
+router.post("/team/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
+
+    const { rows } = await query(`
+      SELECT tm.*, b.name AS business_name
+      FROM team_members tm
+      JOIN businesses b ON b.id = tm.business_id
+      WHERE tm.email = $1 AND tm.status = 'active'
+      LIMIT 1
+    `, [email]);
+
+    if (!rows.length) return res.status(401).json({ message: "Invalid credentials" });
+
+    const member = rows[0];
+    const valid  = await bcrypt.compare(password, member.password_hash || "");
+    if (!valid) return res.status(401).json({ message: "Invalid credentials" });
+
+    await query("UPDATE team_members SET last_login_at = NOW() WHERE id = $1", [member.id]);
+
+    const token = jwt.sign(
+      {
+        id:          member.id,
+        business_id: member.business_id,
+        email:       member.email,
+        role:        member.role,
+        permissions: member.permissions,
+        type:        "team_member",
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+
+    res.json({ token, name: member.name, email: member.email, role: member.role, permissions: member.permissions, businessName: member.business_name });
+
+  } catch (err) {
+    res.status(500).json({ message: "Login failed" });
+  }
+});
+
 // ── Default permissions per role ──────────────────────────────
 export const ROLE_PERMISSIONS = {
   owner: {
@@ -283,153 +418,6 @@ router.delete("/team/:id", async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════
-//  ACCEPT INVITE (public route — no auth)
-// ══════════════════════════════════════════════════════════════
 
-router.get("/invite/:token", async (req, res) => {
-  try {
-    const { rows } = await query(`
-      SELECT tm.id, tm.name, tm.email, tm.role, tm.invite_expires_at,
-             b.name AS business_name
-      FROM team_members tm
-      JOIN businesses b ON b.id = tm.business_id
-      WHERE tm.invite_token = $1
-        AND tm.status = 'pending'
-    `, [req.params.token]);
-
-    if (!rows.length) return res.status(404).json({ message: "Invalid or expired invite link" });
-
-    const member = rows[0];
-    if (new Date(member.invite_expires_at) < new Date()) {
-      return res.status(400).json({ message: "Invite link has expired. Ask the owner to resend." });
-    }
-
-    res.json({
-      name:          member.name,
-      email:         member.email,
-      role:          member.role,
-      businessName:  member.business_name,
-      valid:         true,
-    });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to validate invite" });
-  }
-});
-
-// Accept invite — set password and activate account
-router.post("/invite/:token/accept", async (req, res) => {
-  try {
-    const { password } = req.body;
-    if (!password || password.length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-    }
-
-    const { rows } = await query(`
-      SELECT tm.*, b.id AS business_id, b.name AS business_name
-      FROM team_members tm
-      JOIN businesses b ON b.id = tm.business_id
-      WHERE tm.invite_token = $1 AND tm.status = 'pending'
-    `, [req.params.token]);
-
-    if (!rows.length) return res.status(404).json({ message: "Invalid or expired invite" });
-
-    const member = rows[0];
-    if (new Date(member.invite_expires_at) < new Date()) {
-      return res.status(400).json({ message: "Invite expired. Ask the owner to resend." });
-    }
-
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
-
-    // Activate account
-    await query(`
-      UPDATE team_members
-      SET password_hash  = $1,
-          status         = 'active',
-          invite_token   = NULL,
-          updated_at     = NOW()
-      WHERE id = $2
-    `, [passwordHash, member.id]);
-
-    // Generate JWT token
-    const token = jwt.sign(
-      {
-        id:          member.id,
-        business_id: member.business_id,
-        email:       member.email,
-        role:        member.role,
-        permissions: member.permissions,
-        type:        "team_member",
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "30d" }
-    );
-
-    res.json({
-      success:      true,
-      token,
-      name:         member.name,
-      role:         member.role,
-      businessName: member.business_name,
-      permissions:  member.permissions,
-    });
-
-  } catch (err) {
-    console.error("Accept invite error:", err.message);
-    res.status(500).json({ message: "Failed to accept invite" });
-  }
-});
-
-// Team member login
-router.post("/team/login", async (req, res) => {
-  try {
-    const { email, password, businessId } = req.body;
-    if (!email || !password) return res.status(400).json({ message: "Email and password required" });
-
-    const { rows } = await query(`
-      SELECT tm.*, b.name AS business_name
-      FROM team_members tm
-      JOIN businesses b ON b.id = tm.business_id
-      WHERE tm.email = $1
-        AND tm.status = 'active'
-        ${businessId ? "AND tm.business_id = $2" : ""}
-    `, businessId ? [email, businessId] : [email]);
-
-    if (!rows.length) return res.status(401).json({ message: "Invalid credentials" });
-
-    const member = rows[0];
-    const valid  = await bcrypt.compare(password, member.password_hash || "");
-    if (!valid) return res.status(401).json({ message: "Invalid credentials" });
-
-    // Update last login
-    await query("UPDATE team_members SET last_login_at = NOW() WHERE id = $1", [member.id]);
-
-    const token = jwt.sign(
-      {
-        id:          member.id,
-        business_id: member.business_id,
-        email:       member.email,
-        role:        member.role,
-        permissions: member.permissions,
-        type:        "team_member",
-      },
-      process.env.JWT_SECRET,
-      { expiresIn: "30d" }
-    );
-
-    res.json({
-      token,
-      name:        member.name,
-      email:       member.email,
-      role:        member.role,
-      permissions: member.permissions,
-      businessName: member.business_name,
-    });
-
-  } catch (err) {
-    res.status(500).json({ message: "Login failed" });
-  }
-});
 
 export default router;

@@ -17,6 +17,7 @@ const bId = (req) => req.user.business_id;
 
 // Validate invite token
 router.get("/invite/:token", async (req, res) => {
+  console.log("✅ Public invite route hit:", req.params.token?.slice(0, 10) + "...");
   try {
     const { rows } = await query(`
       SELECT tm.id, tm.name, tm.email, tm.role, tm.invite_expires_at,

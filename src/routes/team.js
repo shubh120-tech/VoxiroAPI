@@ -2,6 +2,7 @@ import express  from "express";
 import bcrypt   from "bcryptjs";
 import jwt      from "jsonwebtoken";
 import crypto   from "crypto";
+import axios    from "axios";
 // Email via Resend API (HTTP — works on Railway)
 import { query } from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";

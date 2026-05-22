@@ -1,17 +1,24 @@
-import pg from "pg";
+import pg     from "pg";
 import dotenv from "dotenv";
 dotenv.config();
 
 const { Pool } = pg;
 
-// Fix for Railway self-signed certificate
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+// ── SSL Config for Railway PostgreSQL ─────────────────────────
+// Railway uses self-signed certificates — we accept them properly
+// instead of disabling TLS verification globally
+const sslConfig = process.env.DATABASE_URL?.includes("railway")
+  ? { rejectUnauthorized: false }
+  : process.env.NODE_ENV === "production"
+  ? { rejectUnauthorized: false }
+  : false;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 20,
+  ssl:              sslConfig,
+  max:              20,
   idleTimeoutMillis:       30000,
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 5000,
 });
 
 pool.on("error", (err) => {

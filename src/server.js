@@ -76,11 +76,16 @@ if (process.env.NODE_ENV !== "test") {
 // ── Routes ────────────────────────────────────────────────────
 app.use("/join",       magicLinkRouter);
 app.use("/api/auth",   authRouter);
+
+// Team router FIRST — has public routes (/invite/:token) that must
+// not be intercepted by dashboardRouter's auth middleware
+app.use("/api",        teamRouter);
+
+// Protected routes — require auth
 app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api",        broadcastRouter);
-app.use("/api",        teamRouter);
 app.use("/api/admin",  adminRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────

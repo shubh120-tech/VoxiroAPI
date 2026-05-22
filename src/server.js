@@ -15,6 +15,7 @@ import knowledgeRouter   from "./routes/knowledge.js";
 import magicLinkRouter   from "./routes/magicLink.js";
 import onboardingRouter  from "./routes/onboarding.js";
 import broadcastRouter   from "./routes/broadcast.js";
+import teamRouter        from "./routes/team.js";
 import whatsappWebhook   from "./webhook/whatsapp.js";
 
 const app  = express();
@@ -79,6 +80,7 @@ app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api",        broadcastRouter);
+app.use("/api",        teamRouter);
 app.use("/api/admin",  adminRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────

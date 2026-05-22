@@ -20,15 +20,17 @@ router.get("/invite/:token", async (req, res) => {
   console.log("✅ Public invite route hit:", req.params.token?.slice(0, 10) + "...");
   try {
     const { rows } = await query(`
-      SELECT tm.id, tm.name, tm.email, tm.role, tm.invite_expires_at,
+      SELECT tm.id, tm.name, tm.email, tm.role, tm.invite_expires_at, tm.status,
              b.name AS business_name
       FROM team_members tm
       JOIN businesses b ON b.id = tm.business_id
       WHERE tm.invite_token = $1
-        AND tm.status = 'pending'
     `, [req.params.token]);
 
-    if (!rows.length) return res.status(404).json({ message: "Invalid or expired invite link" });
+    console.log("Token lookup result:", rows.length, "rows", rows[0]?.status);
+
+    if (!rows.length) return res.status(200).json({ valid: false, message: "Invalid invite link. Please ask the owner to resend your invitation." });
+    if (rows[0].status !== "pending") return res.status(200).json({ valid: false, message: `Invite already used or account is ${rows[0].status}. Try logging in instead.` });
 
     const member = rows[0];
     if (new Date(member.invite_expires_at) < new Date()) {
@@ -196,14 +198,20 @@ async function sendInviteEmail({ name, email, businessName, inviteToken, inviter
   const frontendUrl = (process.env.FRONTEND_URL || "").replace(/\/$/, "");
   const inviteLink  = `${frontendUrl}/accept-invite/${inviteToken}`;
   const apiKey      = process.env.RESEND_API_KEY;
+  // Resend free tier only allows sending from onboarding@resend.dev
+  // unless you verify your own domain
   const fromEmail   = process.env.FROM_EMAIL || "onboarding@resend.dev";
 
   if (!apiKey) throw new Error("RESEND_API_KEY not set in environment variables");
 
+  // Force use resend default if no custom domain configured
+  const finalFromEmail = fromEmail.includes("resend.dev") ? fromEmail :
+    (process.env.RESEND_DOMAIN_VERIFIED === "true" ? fromEmail : "onboarding@resend.dev");
+
   const response = await axios.post(
     "https://api.resend.com/emails",
     {
-      from:    `${businessName} via Voxiro <${fromEmail}>`,
+      from:    `${businessName} via Voxiro <${finalFromEmail}>`,
       to:      [email],
       subject: `You've been invited to join ${businessName} on Voxiro`,
       html: `

@@ -2,7 +2,7 @@ import express  from "express";
 import bcrypt   from "bcryptjs";
 import jwt      from "jsonwebtoken";
 import crypto   from "crypto";
-import nodemailer from "nodemailer";
+// Email via Resend API (HTTP — works on Railway)
 import { query } from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 
@@ -189,39 +189,54 @@ export const ROLE_PERMISSIONS = {
   },
 };
 
-// ── Send invite email ─────────────────────────────────────────
+// ── Send invite email via Resend HTTP API ────────────────────
 async function sendInviteEmail({ name, email, businessName, inviteToken, inviterName }) {
   const frontendUrl = (process.env.FRONTEND_URL || "").replace(/\/$/, "");
   const inviteLink  = `${frontendUrl}/accept-invite/${inviteToken}`;
+  const apiKey      = process.env.RESEND_API_KEY;
+  const fromEmail   = process.env.FROM_EMAIL || "onboarding@resend.dev";
 
-  // Use nodemailer with SMTP settings
-  const transporter = nodemailer.createTransport({
-    host:   process.env.SMTP_HOST   || "smtp.gmail.com",
-    port:   parseInt(process.env.SMTP_PORT || "587"),
-    secure: false,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+  if (!apiKey) throw new Error("RESEND_API_KEY not set in environment variables");
+
+  const response = await axios.post(
+    "https://api.resend.com/emails",
+    {
+      from:    `${businessName} via Voxiro <${fromEmail}>`,
+      to:      [email],
+      subject: `You've been invited to join ${businessName} on Voxiro`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <h1 style="color: #0d9488; font-size: 28px; margin: 0;">🤖 Voxiro</h1>
+          </div>
+          <h2 style="color: #1a1a1a;">You're invited to join ${businessName}</h2>
+          <p style="color: #374151;">Hi ${name},</p>
+          <p style="color: #374151;">${inviterName} has invited you to join <strong>${businessName}</strong> on Voxiro — the AI WhatsApp agent platform.</p>
+          <p style="color: #374151;">Click the button below to accept the invitation and set your password:</p>
+          <div style="text-align: center; margin: 32px 0;">
+            <a href="${inviteLink}" style="display: inline-block; background: #0d9488; color: white; padding: 14px 28px; border-radius: 10px; text-decoration: none; font-weight: bold; font-size: 16px;">
+              Accept Invitation →
+            </a>
+          </div>
+          <p style="color: #6b7280; font-size: 13px; border-top: 1px solid #e5e7eb; padding-top: 16px;">
+            This link expires in 48 hours. If you didn't expect this invite, you can ignore this email.
+          </p>
+          <p style="color: #9ca3af; font-size: 12px;">
+            Or copy this link: ${inviteLink}
+          </p>
+        </div>
+      `,
     },
-  });
+    {
+      headers: {
+        Authorization:  `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
 
-  await transporter.sendMail({
-    from:    `"${businessName} via Voxiro" <${process.env.SMTP_USER}>`,
-    to:      email,
-    subject: `You've been invited to join ${businessName} on Voxiro`,
-    html: `
-      <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;">
-        <h2 style="color: #0d9488;">You're invited to join ${businessName}</h2>
-        <p>Hi ${name},</p>
-        <p>${inviterName} has invited you to join <strong>${businessName}</strong> on Voxiro — the AI WhatsApp agent platform.</p>
-        <p>Click the button below to accept the invitation and set your password:</p>
-        <a href="${inviteLink}" style="display: inline-block; background: #0d9488; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 16px 0;">
-          Accept Invitation
-        </a>
-        <p style="color: #6b7280; font-size: 13px;">This link expires in 48 hours. If you didn't expect this invite, you can ignore this email.</p>
-      </div>
-    `,
-  });
+  console.log(`✅ Invite email sent via Resend to ${email}`);
+  return response.data;
 }
 
 // ══════════════════════════════════════════════════════════════

@@ -2,7 +2,7 @@ import express from "express";
 import crypto  from "crypto";
 import { query } from "../db/postgres.js";
 import { handleIncomingMessage } from "../agents/agentManager.js";
-import { sendWhatsAppMessage, notifyOwnerWhatsApp, getWhatsAppCredentials } from "../whatsapp/sender.js";
+import { sendWhatsAppMessage, notifyOwnerWhatsApp, getWhatsAppCredentials, markReadAndShowTyping } from "../whatsapp/sender.js";
 
 const router = express.Router();
 
@@ -71,17 +71,19 @@ router.post("/", async (req, res) => {
           const phoneNumberId = metadata.phone_number_id;
 
           if (msg.type === "text") {
-            // Normal text message — process with agent
-            await processIncomingMessage({
-              phoneNumberId,
+            // Save to pending — will be processed after 10 second batch window
+            await savePendingMessage({
+              businessId:    business_id,
               customerPhone,
               customerName,
-              messageText: msg.text.body,
-              waMessageId: msg.id,
+              phoneNumberId,
+              accessToken:   access_token,
+              messageText:   msg.text?.body || "",
+              waMessageId:   msg.id,
             });
 
           } else if (["image", "document", "video", "audio", "sticker"].includes(msg.type)) {
-            // Any media/document — notify owner immediately
+            // Media — process immediately, don't batch
             await processMediaMessage({
               phoneNumberId,
               customerPhone,
@@ -223,7 +225,18 @@ async function checkMessageLimit(businessId) {
  * Verify Meta webhook signature.
  */
 function verifySignature(req) {
-  return true;
+  const signature = req.headers["x-hub-signature-256"];
+  if (!signature) return false;
+
+  const expected = "sha256=" + crypto
+    .createHmac("sha256", process.env.META_APP_SECRET || "")
+    .update(JSON.stringify(req.body))
+    .digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expected)
+  );
 }
 
 // ── Process Media / Document Message ────────────────────────
@@ -440,6 +453,64 @@ async function updateBroadcastStatus(status) {
 
   } catch (err) {
     console.error("Broadcast status update error:", err.message);
+  }
+}
+
+// ── Save Pending Message (for 10s batch window) ─────────────
+async function savePendingMessage({
+  businessId, customerPhone, customerName,
+  phoneNumberId, accessToken, messageText, waMessageId,
+}) {
+  try {
+    // Get or create conversation first
+    const conversation = await getOrCreateConversation({
+      businessId,
+      customerPhone,
+      customerName,
+    });
+
+    // Cancel pending follow-ups — customer is active
+    await cancelPendingFollowUps(businessId, customerPhone);
+
+    // Mark as read immediately — blue ticks appear right away
+    if (waMessageId) {
+      await markReadAndShowTyping({ phoneNumberId, accessToken, waMessageId });
+    }
+
+    // Save message to pending_messages table
+    await query(`
+      INSERT INTO pending_messages
+        (business_id, conversation_id, customer_phone, customer_name,
+         phone_number_id, access_token, message_text, wa_message_id,
+         message_type, received_at, processed)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'text', NOW(), FALSE)
+    `, [
+      businessId,
+      conversation.id,
+      customerPhone,
+      customerName,
+      phoneNumberId,
+      accessToken,
+      messageText,
+      waMessageId,
+    ]);
+
+    // Also save to messages table so it shows in dashboard immediately
+    await query(`
+      INSERT INTO messages (conversation_id, business_id, role, content, wa_message_id)
+      VALUES ($1, $2, 'customer', $3, $4)
+    `, [conversation.id, businessId, messageText, waMessageId]);
+
+    await query(`
+      UPDATE conversations
+      SET last_message = $1, last_message_at = NOW(), customer_last_seen = NOW()
+      WHERE id = $2
+    `, [messageText, conversation.id]);
+
+    console.log(`⏳ Message batched from ${customerPhone} — waiting 10s`);
+
+  } catch (err) {
+    console.error("Save pending message error:", err.message);
   }
 }
 

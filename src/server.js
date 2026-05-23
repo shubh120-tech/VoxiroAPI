@@ -7,6 +7,7 @@ import rateLimit    from "express-rate-limit";
 import { processFollowUps }  from "./agents/followUpCron.js";
 import { processBroadcasts } from "./agents/broadcastCron.js";
 import { processStoreSyncs }  from "./agents/storeSyncCron.js";
+import { processMessageBatches } from "./agents/messageBatchCron.js";
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -124,6 +125,11 @@ app.listen(PORT, () => {
   console.log("🛍️  Store sync started — runs every 6 hours");
   processStoreSyncs();
   setInterval(processStoreSyncs, 6 * 60 * 60 * 1000);
+
+  // ── Message Batch Cron — every 3 seconds ──────────────────────
+  // Collects messages in 10 second window then sends combined reply
+  console.log("📦 Message batch processor started — runs every 3 seconds");
+  setInterval(processMessageBatches, 3 * 1000);
 });
 
 export default app;

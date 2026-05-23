@@ -17,8 +17,36 @@ const FRONTEND_URL          = (process.env.FRONTEND_URL || "").replace(/\/$/, ""
 // Scopes we need from Shopify
 const SCOPES = "read_products,write_products,read_orders,write_orders,read_customers,write_customers";
 
-// ── In-memory state store (replace with Redis for production) ─
-const oauthStates = new Map();
+// ── State store using DB ─────────────────────────────────────
+// More reliable than in-memory Map (survives restarts)
+async function saveOAuthState(state, businessId, shop) {
+  await query(`
+    INSERT INTO oauth_states (state, business_id, shop, expires_at)
+    VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')
+    ON CONFLICT (state) DO UPDATE SET expires_at = NOW() + INTERVAL '10 minutes'
+  `, [state, businessId, shop]).catch(async () => {
+    // Table might not exist yet — use memory fallback
+    oauthStatesMemory.set(state, { businessId, shop, createdAt: Date.now() });
+  });
+}
+
+async function getOAuthState(state) {
+  try {
+    const { rows } = await query(`
+      SELECT business_id, shop FROM oauth_states
+      WHERE state = $1 AND expires_at > NOW()
+    `, [state]);
+    if (rows.length) return { businessId: rows[0].business_id, shop: rows[0].shop };
+  } catch { /* fallback to memory */ }
+  return oauthStatesMemory.get(state) || null;
+}
+
+async function deleteOAuthState(state) {
+  query("DELETE FROM oauth_states WHERE state = $1", [state]).catch(() => {});
+  oauthStatesMemory.delete(state);
+}
+
+const oauthStatesMemory = new Map(); // fallback
 
 // ══════════════════════════════════════════════════════════════
 //  STEP 1 — Start OAuth (protected — owner must be logged in)
@@ -47,17 +75,8 @@ router.post("/store/shopify/install", authMiddleware, async (req, res) => {
     // Generate state token for CSRF protection
     const state = crypto.randomBytes(16).toString("hex");
 
-    // Store state with business ID
-    oauthStates.set(state, {
-      businessId: req.user.business_id,
-      shop:       shopDomain,
-      createdAt:  Date.now(),
-    });
-
-    // Clean up old states (older than 10 minutes)
-    for (const [key, val] of oauthStates.entries()) {
-      if (Date.now() - val.createdAt > 10 * 60 * 1000) oauthStates.delete(key);
-    }
+    // Store state with business ID (DB + memory fallback)
+    await saveOAuthState(state, req.user.business_id, shopDomain);
 
     // Build Shopify OAuth URL
     const redirectUri  = `${API_URL}/api/store/shopify/callback`;
@@ -84,11 +103,12 @@ router.get("/store/shopify/callback", async (req, res) => {
     const { shop, code, state, hmac } = req.query;
 
     // Validate state
-    const savedState = oauthStates.get(state);
+    const savedState = await getOAuthState(state);
     if (!savedState) {
+      console.error("OAuth state not found:", state);
       return res.redirect(`${FRONTEND_URL}/integrations?error=invalid_state`);
     }
-    oauthStates.delete(state);
+    await deleteOAuthState(state);
 
     // Validate HMAC signature from Shopify
     if (!validateHmac(req.query, SHOPIFY_CLIENT_SECRET)) {

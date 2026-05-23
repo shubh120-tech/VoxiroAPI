@@ -80,9 +80,9 @@ if (process.env.NODE_ENV !== "test") {
 app.use("/join",       magicLinkRouter);
 app.use("/api/auth",   authRouter);
 
-// Team router FIRST — has public routes (/invite/:token) that must
-// not be intercepted by dashboardRouter's auth middleware
-app.use("/api",        teamRouter);
+// Public routes FIRST — must not be intercepted by dashboardRouter auth
+app.use("/api",        teamRouter);        // invite routes
+app.use("/api",        shopifyOAuthRouter); // shopify OAuth callback
 
 // Protected routes — require auth
 app.use("/api",        dashboardRouter);

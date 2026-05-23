@@ -514,4 +514,34 @@ router.delete("/knowledge/:id", async (req, res) => {
   }
 });
 
+// ── Follow-ups ───────────────────────────────────────────────
+router.get("/agent/followups", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT f.*, c.customer_name, c.customer_phone AS conv_phone
+      FROM follow_ups f
+      LEFT JOIN conversations c ON c.id = f.conversation_id
+      WHERE f.business_id = $1
+      ORDER BY f.scheduled_at DESC
+      LIMIT 100
+    `, [req.user.business_id]);
+    res.json({ followups: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load follow-ups" });
+  }
+});
+
+router.patch("/agent/followups/:id/cancel", async (req, res) => {
+  try {
+    await query(`
+      UPDATE follow_ups
+      SET sent = TRUE, sent_at = NOW(), error_message = 'Cancelled manually'
+      WHERE id = $1 AND business_id = $2
+    `, [req.params.id, req.user.business_id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to cancel follow-up" });
+  }
+});
+
 export default router;

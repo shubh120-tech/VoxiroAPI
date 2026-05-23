@@ -402,6 +402,57 @@ router.delete("/knowledge/:id", async (req, res) => {
   }
 });
 
+// ── Media Proxy — generate fresh signed URL ─────────────────
+router.get("/media/:messageId", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT media_url, media_type, media_filename
+      FROM messages
+      WHERE id = $1 AND business_id = $2
+        AND media_url IS NOT NULL
+    `, [req.params.messageId, req.user.business_id]);
+
+    if (!rows.length) return res.status(404).json({ message: "Media not found" });
+
+    const { media_url, media_type, media_filename } = rows[0];
+
+    // If it's already a signed URL or external URL — redirect directly
+    if (media_url.startsWith("http")) {
+      // Generate fresh signed URL from R2 key
+      if (media_url.includes("r2.cloudflarestorage.com")) {
+        const AWS = (await import("aws-sdk")).default;
+        const r2  = new AWS.S3({
+          endpoint:         `https://${process.env.CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+          accessKeyId:      process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+          secretAccessKey:  process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+          region:           "auto",
+          signatureVersion: "v4",
+        });
+
+        // Extract key from URL
+        const urlObj = new URL(media_url);
+        const key    = urlObj.pathname.slice(1).split("/").slice(1).join("/"); // remove bucket name
+        const bucket = process.env.CLOUDFLARE_R2_BUCKET || "voxiro-knowledge";
+
+        const freshUrl = r2.getSignedUrl("getObject", {
+          Bucket:  bucket,
+          Key:     key,
+          Expires: 3600, // 1 hour
+        });
+
+        return res.redirect(freshUrl);
+      }
+
+      return res.redirect(media_url);
+    }
+
+    res.status(404).json({ message: "Invalid media URL" });
+  } catch (err) {
+    console.error("Media proxy error:", err.message);
+    res.status(500).json({ message: "Failed to load media" });
+  }
+});
+
 // ── Follow-ups ───────────────────────────────────────────────
 router.get("/followups", async (req, res) => {
   try {

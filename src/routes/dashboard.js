@@ -156,20 +156,19 @@ router.patch("/appointments/:id/status", async (req, res) => {
 // ── Agent ─────────────────────────────────────────────────────
 router.get("/agent/status", async (req, res) => {
   try {
-    const [agent, sub, convs, unread] = await Promise.all([
+    const [agent, sub, convs] = await Promise.all([
       query("SELECT agent_name, is_active FROM agent_configs WHERE business_id = $1", [req.user.business_id]),
       query("SELECT s.messages_used, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [req.user.business_id]),
       query("SELECT COUNT(*) FROM conversations WHERE business_id = $1 AND status != 'closed'", [req.user.business_id]),
-      query("SELECT COUNT(*) FROM conversations WHERE business_id = $1 AND status = 'needs-help'", [req.user.business_id]),
     ]);
     res.json({
       agentName:           agent.rows[0]?.agent_name || "Aria",
       active:              agent.rows[0]?.is_active   || false,
       used:                sub.rows[0]?.messages_used || 0,
       limit:               sub.rows[0]?.message_limit || 0,
-      activeConversations: parseInt(convs.rows[0]?.count)  || 0,
-      unreadCount:         parseInt(unread.rows[0]?.count) || 0,
-      notifCount:          parseInt(unread.rows[0]?.count) || 0,
+      activeConversations: parseInt(convs.rows[0]?.count) || 0,
+      unreadCount:         0,
+      notifCount:          0,
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load agent status" });
@@ -215,25 +214,11 @@ router.get("/agent/conversations", async (req, res) => {
   try {
     const { page = 1, limit = 30, status } = req.query;
     const offset = (page - 1) * limit;
-
-    let sql = `
-      SELECT
-        c.*,
-        wc.display_name AS whatsapp_display_name
-      FROM conversations c
-      LEFT JOIN whatsapp_configs wc ON wc.business_id = c.business_id
-      WHERE c.business_id = $1
-    `;
+    let sql    = `SELECT * FROM conversations WHERE business_id = $1`;
     const params = [req.user.business_id];
-
-    if (status) {
-      params.push(status);
-      sql += ` AND c.status = $${params.length}`;
-    }
-
-    sql += ` ORDER BY c.last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
+    sql += ` ORDER BY last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
-
     const { rows } = await query(sql, params);
     res.json({ conversations: rows });
   } catch (err) {
@@ -244,14 +229,8 @@ router.get("/agent/conversations", async (req, res) => {
 router.get("/agent/conversations/:id/messages", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT
-        id, conversation_id, business_id,
-        role, content, status,
-        wa_message_id, is_read,
-        created_at
-      FROM messages
-      WHERE conversation_id = $1
-        AND business_id     = $2
+      SELECT * FROM messages
+      WHERE conversation_id = $1 AND business_id = $2
       ORDER BY created_at ASC
     `, [req.params.id, req.user.business_id]);
     res.json({ messages: rows });
@@ -282,45 +261,30 @@ router.post("/agent/conversations/:id/resume", async (req, res) => {
 
 router.post("/agent/conversations/:id/send", async (req, res) => {
   try {
-    const { message, replyToMessageId } = req.body;  // replyToMessageId for quoted replies
+    const { message } = req.body;
     const { rows: conv } = await query(
       "SELECT * FROM conversations WHERE id = $1 AND business_id = $2",
       [req.params.id, req.user.business_id]
     );
     if (!conv.length) return res.status(404).json({ message: "Conversation not found" });
 
-    // Save owner message with status sent
-    await query(`
-      INSERT INTO messages (conversation_id, business_id, role, content, status)
-      VALUES ($1, $2, 'owner', $3, 'sent')
-    `, [req.params.id, req.user.business_id, message]);
+    // Save owner message
+    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3)`,
+      [req.params.id, req.user.business_id, message]);
 
     // Send via WhatsApp
     const { rows: wc } = await query(
       "SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id = $1",
       [req.user.business_id]
     );
-
     if (wc.length) {
       const { sendWhatsAppMessage } = await import("../whatsapp/sender.js");
-      const result = await sendWhatsAppMessage({
+      await sendWhatsAppMessage({
         phoneNumberId: wc[0].phone_number_id,
         accessToken:   wc[0].access_token,
         to:            conv[0].customer_phone,
         message,
       });
-
-      // Save wa_message_id for status tracking
-      if (result?.messages?.[0]?.id) {
-        await query(`
-          UPDATE messages SET wa_message_id = $1
-          WHERE id = (
-            SELECT id FROM messages
-            WHERE conversation_id = $2 AND role = 'owner'
-            ORDER BY created_at DESC LIMIT 1
-          )
-        `, [result.messages[0].id, req.params.id]);
-      }
     }
 
     res.json({ success: true });
@@ -336,34 +300,16 @@ router.get("/settings", async (req, res) => {
     const [biz, agent, wc, notif, sub] = await Promise.all([
       query("SELECT * FROM businesses WHERE id = $1", [bId]),
       query("SELECT * FROM agent_configs WHERE business_id = $1", [bId]),
-      query("SELECT phone_number_id, whatsapp_number, is_verified, display_name, waba_id FROM whatsapp_configs WHERE business_id = $1", [bId]),
+      query("SELECT phone_number_id, whatsapp_number, is_verified FROM whatsapp_configs WHERE business_id = $1", [bId]),
       query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]),
       query("SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [bId]),
     ]);
-
-    const b = biz.rows[0]   || {};
-    const a = agent.rows[0] || {};
-
     res.json({
-      profile: {
-        businessName: b.name              || "",
-        ownerName:    req.user.owner_name || "",
-        email:        req.user.email      || "",
-        phone:        b.phone             || "",
-        address:      b.address           || "",
-        website:      b.website           || "",
-      },
-      agent: {
-        agentName: a.agent_name || "Aria",
-        tone:      a.tone       || "friendly",
-        language:  a.language   || "English",
-        greeting:  a.greeting   || "",
-        services:  a.services   || "",
-        pricing:   a.pricing    || "",
-      },
-      whatsapp:      wc.rows[0]    || {},
-      notifications: notif.rows[0] || {},
-      billing:       sub.rows[0]   || {},
+      profile:       { ...biz.rows[0], ownerName: req.user.owner_name, email: req.user.email },
+      agent:         agent.rows[0]  || {},
+      whatsapp:      wc.rows[0]     || {},
+      notifications: notif.rows[0]  || {},
+      billing:       sub.rows[0]    || {},
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load settings" });
@@ -388,76 +334,18 @@ router.put("/settings/profile", async (req, res) => {
 router.put("/settings/whatsapp", async (req, res) => {
   try {
     const { phoneNumberId, accessToken, webhookSecret } = req.body;
-
-    if (!phoneNumberId) {
-      return res.status(400).json({ message: "Phone Number ID is required" });
-    }
-
-    // Check if this phone_number_id belongs to another business
-    const { rows: existing } = await query(`
-      SELECT business_id FROM whatsapp_configs
-      WHERE phone_number_id = $1
-        AND business_id != $2
-    `, [phoneNumberId, req.user.business_id]);
-
-    if (existing.length > 0) {
-      return res.status(409).json({
-        message: "This WhatsApp number is already connected to another Voxiro account. Each WhatsApp number can only be connected to one business.",
-      });
-    }
-
     await query(`
-      INSERT INTO whatsapp_configs
-        (business_id, phone_number_id, access_token, webhook_secret)
+      INSERT INTO whatsapp_configs (business_id, phone_number_id, access_token, webhook_secret)
       VALUES ($1, $2, $3, $4)
       ON CONFLICT (business_id) DO UPDATE
       SET phone_number_id = $2,
-          access_token    = CASE WHEN $3 IS NOT NULL AND $3 != ''
-                            THEN $3 ELSE whatsapp_configs.access_token END,
-          webhook_secret  = CASE WHEN $4 IS NOT NULL AND $4 != ''
-                            THEN $4 ELSE whatsapp_configs.webhook_secret END,
+          access_token    = CASE WHEN $3 != '' THEN $3 ELSE access_token END,
+          webhook_secret  = CASE WHEN $4 != '' THEN $4 ELSE webhook_secret END,
           updated_at      = NOW()
-    `, [req.user.business_id, phoneNumberId, accessToken || null, webhookSecret || null]);
-
-    // Auto-fetch WABA ID + display name from Meta
-    try {
-      const { rows: wc } = await query(
-        "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
-        [req.user.business_id]
-      );
-      const token = accessToken || wc[0]?.access_token;
-      if (token) {
-        // Fetch WABA ID
-        try {
-          const axios = (await import("axios")).default;
-          const wabaRes = await axios.get(
-            `${process.env.META_BASE_URL || "https://graph.facebook.com"}/${process.env.META_API_VERSION || "v19.0"}/me/whatsapp_business_accounts`,
-            { headers: { Authorization: `Bearer ${token}` } }
-          );
-          const wabaId = wabaRes.data?.data?.[0]?.id;
-          if (wabaId) {
-            await query(
-              "UPDATE whatsapp_configs SET waba_id = $1 WHERE business_id = $2",
-              [wabaId, req.user.business_id]
-            );
-            console.log(`✅ WABA ID saved: ${wabaId}`);
-          }
-        } catch (err) {
-          console.warn("Could not fetch WABA ID:", err.message);
-        }
-
-        // Fetch display name
-        try {
-          const { fetchAndSaveDisplayName } = await import("../webhook/whatsapp.js");
-          await fetchAndSaveDisplayName(req.user.business_id, phoneNumberId, token);
-        } catch { /* non-critical */ }
-      }
-    } catch { /* non-critical */ }
-
+    `, [req.user.business_id, phoneNumberId, accessToken, webhookSecret]);
     res.json({ success: true });
   } catch (err) {
-    console.error("WhatsApp config error:", err.message);
-    res.status(500).json({ message: err.message });
+    res.status(500).json({ message: "Failed to update WhatsApp config" });
   }
 });
 
@@ -515,32 +403,36 @@ router.delete("/knowledge/:id", async (req, res) => {
 });
 
 // ── Follow-ups ───────────────────────────────────────────────
-router.get("/agent/followups", async (req, res) => {
+router.get("/followups", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT f.*, c.customer_name, c.customer_phone AS conv_phone
+      SELECT
+        f.*,
+        COALESCE(c.customer_name, f.customer_name) AS customer_name,
+        COALESCE(c.customer_phone, f.customer_phone) AS customer_phone
       FROM follow_ups f
       LEFT JOIN conversations c ON c.id = f.conversation_id
       WHERE f.business_id = $1
       ORDER BY f.scheduled_at DESC
-      LIMIT 100
+      LIMIT 200
     `, [req.user.business_id]);
     res.json({ followups: rows });
   } catch (err) {
+    console.error("Followups error:", err.message);
     res.status(500).json({ message: "Failed to load follow-ups" });
   }
 });
 
-router.patch("/agent/followups/:id/cancel", async (req, res) => {
+router.patch("/followups/:id/cancel", async (req, res) => {
   try {
     await query(`
       UPDATE follow_ups
-      SET sent = TRUE, sent_at = NOW(), error_message = 'Cancelled manually'
+      SET sent = TRUE, sent_at = NOW(), error_message = 'Cancelled manually', updated_at = NOW()
       WHERE id = $1 AND business_id = $2
     `, [req.params.id, req.user.business_id]);
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ message: "Failed to cancel follow-up" });
+    res.status(500).json({ message: "Failed to cancel" });
   }
 });
 

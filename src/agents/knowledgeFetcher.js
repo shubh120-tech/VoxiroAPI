@@ -14,26 +14,32 @@ export async function fetchRelevantContext(businessId, message) {
     trust:     needsTrustInfo(msg),
     faq:       needsFaqInfo(msg),
     company:   needsCompanyInfo(msg),
+    products:  needsProductInfo(msg),
   };
 
-  const [services, faqs, payment, company] = await Promise.all([
+  const [services, faqs, payment, company, products] = await Promise.all([
     needs.services || needs.pricing ? fetchServices(businessId) : null,
     needs.faq ? fetchRelevantFaqs(businessId, message) : null,
     needs.payment ? fetchPaymentDetails(businessId) : null,
     needs.trust || needs.company ? fetchCompanyDetails(businessId) : null,
+    needs.products || needs.pricing ? fetchStoreProducts(businessId, message) : null,
   ]);
 
-  return buildContextBlock({ services, faqs, payment, company, needs });
+  return buildContextBlock({ services, faqs, payment, company, products, needs });
 }
 
 // ── Detection Functions ───────────────────────────────────────
 
 function needsServiceInfo(msg) {
-  return /service|offer|provide|work|help|do you|what kind|kya karte|kya milega|available/.test(msg);
+  return /service|offer|provide|work|help|do you|what kind|kya karte|kya milega|available|product|item|sell/.test(msg);
 }
 
 function needsPricingInfo(msg) {
   return /price|cost|fee|charge|rate|amount|kitna|rupee|₹|rs\.?|budget|expensive|cheap|discount|offer|quote|quotation/.test(msg);
+}
+
+function needsProductInfo(msg) {
+  return /product|item|buy|order|stock|available|size|color|colour|variant|catalogue|catalog|collection|shop|store/.test(msg);
 }
 
 function needsPaymentInfo(msg) {
@@ -113,9 +119,28 @@ async function fetchCompanyDetails(businessId) {
   return rows[0] || null;
 }
 
+// ── Fetch Store Products ──────────────────────────────────────
+async function fetchStoreProducts(businessId, message) {
+  try {
+    const keywords = message.toLowerCase().split(/\s+/).filter(w => w.length > 2).join("|");
+    const { rows } = await query(`
+      SELECT name, agent_description, description, price, variants,
+             in_stock, stock_count, category
+      FROM store_products
+      WHERE business_id = $1
+        AND (name ILIKE $2 OR description ILIKE $2 OR category ILIKE $2)
+      ORDER BY in_stock DESC, name ASC
+      LIMIT 8
+    `, [businessId, `%${message.split(" ").slice(0, 3).join("%")}%`]);
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
 // ── Build Context Block ───────────────────────────────────────
 
-function buildContextBlock({ services, faqs, payment, company, needs }) {
+function buildContextBlock({ services, faqs, payment, company, products, needs }) {
   let context = "";
 
   // Services & Pricing
@@ -141,6 +166,29 @@ function buildContextBlock({ services, faqs, payment, company, needs }) {
       return line;
     }).join("\n\n");
     context += "\n\nSend as ONE message. Ask customer to share screenshot after payment.";
+  }
+
+  // Store Products
+  if (products?.length > 0) {
+    context += "PRODUCTS FROM STORE (use exact prices):";
+    context += products.map(p => {
+      const desc     = p.agent_description || p.description || "";
+      const variants = p.variants || [];
+      let priceStr   = p.price ? `₹${p.price}` : "Price on request";
+      if (variants.length > 1) {
+        const prices = variants.map(v => v.price).filter(Boolean);
+        if (prices.length) {
+          const minP = Math.min(...prices);
+          const maxP = Math.max(...prices);
+          priceStr   = minP === maxP ? `₹${minP}` : `₹${minP}–₹${maxP}`;
+        }
+      }
+      const stock    = p.in_stock ? "In stock" : "Out of stock";
+      const varStr   = variants.length > 1 ? `
+  Variants: ${variants.map(v => `${v.title} (₹${v.price})`).join(", ")}` : "";
+      return `• ${p.name}: ${priceStr} | ${stock}${desc ? `
+  ${desc.slice(0, 120)}` : ""}${varStr}`;
+    }).join("");
   }
 
   // Relevant FAQs

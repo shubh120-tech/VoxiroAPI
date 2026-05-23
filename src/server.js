@@ -6,6 +6,7 @@ import morgan       from "morgan";
 import rateLimit    from "express-rate-limit";
 import { processFollowUps }  from "./agents/followUpCron.js";
 import { processBroadcasts } from "./agents/broadcastCron.js";
+import { processStoreSyncs }  from "./agents/storeSyncCron.js";
 
 // Routes
 import authRouter        from "./routes/auth.js";
@@ -16,6 +17,8 @@ import magicLinkRouter   from "./routes/magicLink.js";
 import onboardingRouter  from "./routes/onboarding.js";
 import broadcastRouter   from "./routes/broadcast.js";
 import teamRouter        from "./routes/team.js";
+import storeRouter       from "./routes/storeIntegration.js";
+import shopifyOAuthRouter from "./routes/shopifyOAuth.js";
 import whatsappWebhook   from "./webhook/whatsapp.js";
 
 const app  = express();
@@ -86,6 +89,8 @@ app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api",        broadcastRouter);
+app.use("/api",        storeRouter);
+app.use("/api",        shopifyOAuthRouter);
 app.use("/api/admin",  adminRouter);
 
 // ── 404 Handler ───────────────────────────────────────────────
@@ -114,6 +119,11 @@ app.listen(PORT, () => {
   console.log("📢 Broadcast scheduler started — runs every 5 minutes");
   processBroadcasts();
   setInterval(processBroadcasts, 5 * 60 * 1000);
+
+  // ── Store Sync Cron — every 6 hours ──────────────────────────
+  console.log("🛍️  Store sync started — runs every 6 hours");
+  processStoreSyncs();
+  setInterval(processStoreSyncs, 6 * 60 * 60 * 1000);
 });
 
 export default app;

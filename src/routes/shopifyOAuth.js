@@ -1,0 +1,368 @@
+import express from "express";
+import axios   from "axios";
+import crypto  from "crypto";
+import { query } from "../db/postgres.js";
+import { authMiddleware } from "../middleware/auth.js";
+import { syncShopifyProducts } from "./storeIntegration.js";
+
+const router = express.Router();
+
+const SHOPIFY_CLIENT_ID     = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const API_URL               = process.env.API_URL || process.env.RAILWAY_STATIC_URL
+  ? `https://${process.env.RAILWAY_STATIC_URL}`
+  : "https://voxiroapi-production.up.railway.app";
+const FRONTEND_URL          = (process.env.FRONTEND_URL || "").replace(/\/$/, "");
+
+// Scopes we need from Shopify
+const SCOPES = "read_products,write_products,read_orders,write_orders,read_customers,write_customers";
+
+// ── In-memory state store (replace with Redis for production) ─
+const oauthStates = new Map();
+
+// ══════════════════════════════════════════════════════════════
+//  STEP 1 — Start OAuth (protected — owner must be logged in)
+// ══════════════════════════════════════════════════════════════
+
+router.post("/store/shopify/install", authMiddleware, async (req, res) => {
+  try {
+    const { shop } = req.body;
+    if (!shop) return res.status(400).json({ message: "Shop URL required" });
+
+    // Clean shop URL
+    const cleanShop = shop
+      .replace(/^https?:\/\//, "")
+      .replace(/\/$/, "")
+      .trim();
+
+    // Validate shop domain
+    if (!cleanShop.includes(".myshopify.com") && !cleanShop.includes(".")) {
+      return res.status(400).json({ message: "Enter your Shopify store URL (e.g. mystore.myshopify.com)" });
+    }
+
+    const shopDomain = cleanShop.includes(".myshopify.com")
+      ? cleanShop
+      : `${cleanShop}.myshopify.com`;
+
+    // Generate state token for CSRF protection
+    const state = crypto.randomBytes(16).toString("hex");
+
+    // Store state with business ID
+    oauthStates.set(state, {
+      businessId: req.user.business_id,
+      shop:       shopDomain,
+      createdAt:  Date.now(),
+    });
+
+    // Clean up old states (older than 10 minutes)
+    for (const [key, val] of oauthStates.entries()) {
+      if (Date.now() - val.createdAt > 10 * 60 * 1000) oauthStates.delete(key);
+    }
+
+    // Build Shopify OAuth URL
+    const redirectUri  = `${API_URL}/api/store/shopify/callback`;
+    const installUrl   = `https://${shopDomain}/admin/oauth/authorize`
+      + `?client_id=${SHOPIFY_CLIENT_ID}`
+      + `&scope=${SCOPES}`
+      + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+      + `&state=${state}`;
+
+    res.json({ installUrl });
+
+  } catch (err) {
+    console.error("Shopify install error:", err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  STEP 2 — OAuth Callback (public — Shopify redirects here)
+// ══════════════════════════════════════════════════════════════
+
+router.get("/store/shopify/callback", async (req, res) => {
+  try {
+    const { shop, code, state, hmac } = req.query;
+
+    // Validate state
+    const savedState = oauthStates.get(state);
+    if (!savedState) {
+      return res.redirect(`${FRONTEND_URL}/integrations?error=invalid_state`);
+    }
+    oauthStates.delete(state);
+
+    // Validate HMAC signature from Shopify
+    if (!validateHmac(req.query, SHOPIFY_CLIENT_SECRET)) {
+      return res.redirect(`${FRONTEND_URL}/integrations?error=invalid_hmac`);
+    }
+
+    // Exchange code for access token
+    const tokenRes = await axios.post(
+      `https://${shop}/admin/oauth/access_token`,
+      {
+        client_id:     SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_CLIENT_SECRET,
+        code,
+      }
+    );
+
+    const accessToken = tokenRes.data?.access_token;
+    if (!accessToken) {
+      return res.redirect(`${FRONTEND_URL}/integrations?error=no_token`);
+    }
+
+    // Get shop details
+    const shopRes = await axios.get(
+      `https://${shop}/admin/api/2024-01/shop.json`,
+      { headers: { "X-Shopify-Access-Token": accessToken } }
+    );
+    const shopData    = shopRes.data?.shop;
+    const shopName    = shopData?.name || shop;
+    const shopEmail   = shopData?.email || "";
+    const shopDomain  = shopData?.domain || shop;
+    const currency    = shopData?.currency || "INR";
+
+    // Save integration
+    const { rows } = await query(`
+      INSERT INTO store_integrations
+        (business_id, platform, store_url, access_token, status,
+         store_name, store_email, currency)
+      VALUES ($1, 'shopify', $2, $3, 'connected', $4, $5, $6)
+      ON CONFLICT (business_id, platform) DO UPDATE
+      SET store_url    = $2,
+          access_token = $3,
+          status       = 'connected',
+          store_name   = $4,
+          store_email  = $5,
+          currency     = $6,
+          error_message = NULL,
+          updated_at   = NOW()
+      RETURNING id
+    `, [savedState.businessId, shop, accessToken, shopName, shopEmail, currency]);
+
+    const integrationId = rows[0].id;
+
+    // Register webhooks for real-time updates
+    await registerShopifyWebhooks(shop, accessToken, integrationId, savedState.businessId);
+
+    // Start product sync in background
+    syncShopifyProductsWithToken(integrationId, savedState.businessId, shop, accessToken)
+      .catch(console.error);
+
+    // Redirect back to frontend with success
+    res.redirect(`${FRONTEND_URL}/integrations?success=shopify_connected&shop=${shopName}`);
+
+  } catch (err) {
+    console.error("Shopify callback error:", err.message);
+    res.redirect(`${FRONTEND_URL}/integrations?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  SHOPIFY WEBHOOKS (product/order updates in real-time)
+// ══════════════════════════════════════════════════════════════
+
+router.post("/store/shopify/webhook", async (req, res) => {
+  res.sendStatus(200); // Always respond immediately
+
+  try {
+    const topic    = req.headers["x-shopify-topic"];
+    const shopDomain = req.headers["x-shopify-shop-domain"];
+    const body     = req.body;
+
+    // Find integration
+    const { rows } = await query(
+      "SELECT * FROM store_integrations WHERE store_url = $1 AND platform = 'shopify'",
+      [shopDomain]
+    );
+    if (!rows.length) return;
+
+    const integration = rows[0];
+
+    if (topic === "products/update" || topic === "products/create") {
+      await upsertShopifyProduct(body, integration.id, integration.business_id);
+    } else if (topic === "products/delete") {
+      await query(
+        "DELETE FROM store_products WHERE platform_product_id = $1 AND integration_id = $2",
+        [body.id?.toString(), integration.id]
+      );
+    } else if (topic === "orders/create" || topic === "orders/updated") {
+      // Tag order if it came from Voxiro
+      const voxiroNote = body.note_attributes?.find(n => n.name === "voxiro_source");
+      if (voxiroNote) {
+        await query(`
+          UPDATE store_orders SET platform_order_id = $1, tagged_in_store = TRUE
+          WHERE business_id = $2 AND customer_phone = $3
+          ORDER BY created_at DESC LIMIT 1
+        `, [body.id?.toString(), integration.business_id, body.phone]);
+      }
+    }
+  } catch (err) {
+    console.error("Shopify webhook error:", err.message);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  DISCONNECT
+// ══════════════════════════════════════════════════════════════
+
+router.delete("/store/shopify/disconnect", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT * FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+
+    if (rows.length) {
+      // Delete webhooks from Shopify
+      try {
+        const wRes = await axios.get(
+          `https://${rows[0].store_url}/admin/api/2024-01/webhooks.json`,
+          { headers: { "X-Shopify-Access-Token": rows[0].access_token } }
+        );
+        for (const webhook of wRes.data?.webhooks || []) {
+          await axios.delete(
+            `https://${rows[0].store_url}/admin/api/2024-01/webhooks/${webhook.id}.json`,
+            { headers: { "X-Shopify-Access-Token": rows[0].access_token } }
+          ).catch(() => {});
+        }
+      } catch { /* non-critical */ }
+
+      await query("DELETE FROM store_products WHERE integration_id = $1", [rows[0].id]);
+      await query("DELETE FROM store_integrations WHERE id = $1", [rows[0].id]);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to disconnect" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════════
+
+function validateHmac(query, secret) {
+  const { hmac, signature, ...rest } = query;
+  const message = Object.keys(rest)
+    .sort()
+    .map(k => `${k}=${rest[k]}`)
+    .join("&");
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(message)
+    .digest("hex");
+  return digest === hmac;
+}
+
+async function registerShopifyWebhooks(shop, accessToken, integrationId, businessId) {
+  const webhookUrl = `${API_URL}/api/store/shopify/webhook`;
+  const topics = [
+    "products/create",
+    "products/update",
+    "products/delete",
+    "orders/create",
+  ];
+
+  for (const topic of topics) {
+    try {
+      await axios.post(
+        `https://${shop}/admin/api/2024-01/webhooks.json`,
+        { webhook: { topic, address: webhookUrl, format: "json" } },
+        { headers: { "X-Shopify-Access-Token": accessToken } }
+      );
+    } catch { /* webhook might already exist */ }
+  }
+  console.log(`✅ Shopify webhooks registered for ${shop}`);
+}
+
+async function syncShopifyProductsWithToken(integrationId, businessId, shop, accessToken) {
+  let page        = 1;
+  let totalSynced = 0;
+
+  await query("UPDATE store_integrations SET status = 'syncing' WHERE id = $1", [integrationId]);
+
+  try {
+    while (true) {
+      const res = await axios.get(
+        `https://${shop}/admin/api/2024-01/products.json`,
+        {
+          headers: { "X-Shopify-Access-Token": accessToken },
+          params:  { limit: 250, page },
+        }
+      );
+
+      const products = res.data?.products || [];
+      if (!products.length) break;
+
+      for (const product of products) {
+        await upsertShopifyProduct(product, integrationId, businessId);
+        totalSynced++;
+      }
+
+      if (products.length < 250) break;
+      page++;
+    }
+
+    await query(`
+      UPDATE store_integrations
+      SET status = 'connected', last_synced_at = NOW(),
+          product_count = $1, error_message = NULL, updated_at = NOW()
+      WHERE id = $2
+    `, [totalSynced, integrationId]);
+
+    console.log(`✅ Shopify sync complete: ${totalSynced} products`);
+
+  } catch (err) {
+    await query(
+      "UPDATE store_integrations SET status = 'error', error_message = $1 WHERE id = $2",
+      [err.message, integrationId]
+    );
+  }
+}
+
+async function upsertShopifyProduct(product, integrationId, businessId) {
+  const variants = product.variants?.map(v => ({
+    id:            v.id,
+    title:         v.title,
+    price:         parseFloat(v.price || 0),
+    compare_price: v.compare_at_price ? parseFloat(v.compare_at_price) : null,
+    sku:           v.sku,
+    inventory:     v.inventory_quantity,
+    available:     v.inventory_quantity > 0 || v.inventory_management === null,
+  })) || [];
+
+  const images   = product.images?.map(img => img.src) || [];
+  const minPrice = variants.length > 0 ? Math.min(...variants.map(v => v.price)) : 0;
+  const inStock  = variants.some(v => v.available !== false);
+  const tags     = product.tags ? product.tags.split(",").map(t => t.trim()).filter(Boolean) : [];
+
+  await query(`
+    INSERT INTO store_products
+      (business_id, integration_id, platform_product_id, name, description,
+       price, variants, images, category, tags, in_stock, stock_count, platform_url, synced_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+    ON CONFLICT (integration_id, platform_product_id) DO UPDATE
+    SET name = $4, description = $5, price = $6, variants = $7,
+        images = $8, category = $9, tags = $10, in_stock = $11,
+        stock_count = $12, platform_url = $13, synced_at = NOW(), updated_at = NOW()
+  `, [
+    businessId, integrationId,
+    product.id?.toString(),
+    product.title,
+    stripHtml(product.body_html || ""),
+    minPrice,
+    JSON.stringify(variants),
+    JSON.stringify(images),
+    product.product_type || null,
+    tags,
+    inStock,
+    variants.reduce((s, v) => s + (v.inventory || 0), 0),
+    product.handle ? `https://${product.vendor}/products/${product.handle}` : null,
+  ]);
+}
+
+function stripHtml(html) {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+export default router;

@@ -496,10 +496,12 @@ async function savePendingMessage({
       waMessageId,
     ]);
 
-    // Also save to messages table so it shows in dashboard immediately
+    // Save to messages table immediately so owner sees it in dashboard
+    // Use ON CONFLICT to prevent duplicates if wa_message_id already exists
     await query(`
       INSERT INTO messages (conversation_id, business_id, role, content, wa_message_id)
       VALUES ($1, $2, 'customer', $3, $4)
+      ON CONFLICT (wa_message_id) DO NOTHING
     `, [conversation.id, businessId, messageText, waMessageId]);
 
     await query(`

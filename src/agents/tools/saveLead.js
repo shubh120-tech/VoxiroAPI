@@ -1,44 +1,105 @@
-import { query } from "../../db/postgres.js";
+import { query }               from "../../db/postgres.js";
 import { notifyOwnerWhatsApp } from "../../whatsapp/sender.js";
 
 export const saveLeadTool = {
   name: "save_lead",
-  description: "Save a customer as a lead when they show interest in products or services. Call this when a customer expresses buying intent.",
+  description: `Save customer details as a lead. Call this as soon as you collect ANY of these details:
+- Customer name
+- Domain / subject
+- Service needed (thesis, research paper, etc.)
+- Word count
+- Deadline
+- Email
+- Contact number
+
+Call this EVERY TIME you get new info — it updates the existing record.
+This is how details are stored so you never ask again.`,
+
   input_schema: {
     type: "object",
     properties: {
-      customer_name:  { type: "string",  description: "Customer's name if known" },
-      customer_phone: { type: "string",  description: "Customer's WhatsApp phone number" },
-      interest:       { type: "string",  description: "What they are interested in" },
-      notes:          { type: "string",  description: "Any additional context" },
+      customer_name:    { type: "string",  description: "Customer name" },
+      customer_phone:   { type: "string",  description: "Customer WhatsApp number" },
+      customer_email:   { type: "string",  description: "Customer email if provided" },
+      service_name:     { type: "string",  description: "Service: thesis/research paper/synopsis etc." },
+      domain_subject:   { type: "string",  description: "Domain or subject area" },
+      word_count:       { type: "string",  description: "Word count or pages if mentioned" },
+      deadline:         { type: "string",  description: "Deadline if mentioned" },
+      costing:          { type: "string",  description: "Quoted price if any" },
+      notes:            { type: "string",  description: "Any other relevant details" },
     },
-    required: ["customer_phone", "interest"],
+    required: ["customer_phone"],
   },
 };
 
-export async function executeSaveLead({ businessId, conversationId, input }) {
-  const { customer_name, customer_phone, interest, notes } = input;
+export async function executeSaveLead({ businessId, conversationId, customerPhone, input }) {
+  const {
+    customer_name, customer_phone, customer_email,
+    service_name, domain_subject, word_count,
+    deadline, costing, notes,
+  } = input;
 
-  // Upsert lead — don't duplicate if already exists
-  const { rows } = await query(`
-    INSERT INTO leads (business_id, conversation_id, customer_name, phone, interest, notes, status)
-    VALUES ($1, $2, $3, $4, $5, $6, 'new')
-    ON CONFLICT (business_id, phone)
-    DO UPDATE SET
-      interest   = EXCLUDED.interest,
-      notes      = EXCLUDED.notes,
-      updated_at = NOW()
-    RETURNING id
-  `, [businessId, conversationId, customer_name, customer_phone, interest, notes]);
+  const phone = customer_phone || customerPhone;
 
-  // Log activity
-  await query(`
-    INSERT INTO activity_logs (business_id, type, description, icon, color, ref_id, ref_type)
-    VALUES ($1, 'lead', $2, '👥', '#eff6ff', $3, 'lead')
-  `, [businessId, `New lead: ${customer_name || customer_phone} — ${interest}`, rows[0].id]);
+  // Build collected details object — only store non-null values
+  const newDetails = {};
+  if (customer_name)  newDetails.name         = customer_name;
+  if (customer_email) newDetails.email         = customer_email;
+  if (service_name)   newDetails.service       = service_name;
+  if (domain_subject) newDetails.domain        = domain_subject;
+  if (word_count)     newDetails.word_count    = word_count;
+  if (deadline)       newDetails.deadline      = deadline;
+  if (costing)        newDetails.costing       = costing;
+  if (notes)          newDetails.notes         = notes;
 
-  // Notify owner on WhatsApp
-  await notifyOwnerWhatsApp(businessId, `👥 *New Lead Captured*\nName: ${customer_name || "Unknown"}\nPhone: ${customer_phone}\nInterested in: ${interest}`);
+  // Build interest summary for leads table
+  const interestParts = [];
+  if (service_name)   interestParts.push(service_name);
+  if (domain_subject) interestParts.push(domain_subject);
+  if (word_count)     interestParts.push(word_count + " words");
+  if (deadline)       interestParts.push("deadline: " + deadline);
+  const interest = interestParts.join(", ") || notes || "Research writing service";
 
-  return { success: true, leadId: rows[0].id };
+  try {
+    // Save to leads table
+    const { rows } = await query(`
+      INSERT INTO leads
+        (business_id, conversation_id, customer_name, phone, email, interest, notes, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'new')
+      ON CONFLICT (business_id, phone) DO UPDATE
+      SET customer_name = COALESCE($3, leads.customer_name),
+          email         = COALESCE($5, leads.email),
+          interest      = $6,
+          notes         = COALESCE($7, leads.notes),
+          updated_at    = NOW()
+      RETURNING id
+    `, [businessId, conversationId, customer_name, phone, customer_email, interest, notes]);
+
+    // Store collected details in conversation for agent memory
+    if (conversationId && Object.keys(newDetails).length > 0) {
+      await query(`
+        UPDATE conversations
+        SET collected_details = COALESCE(collected_details, '{}') || $1::jsonb,
+            updated_at        = NOW()
+        WHERE id = $2
+      `, [JSON.stringify(newDetails), conversationId]);
+    }
+
+    // Log activity
+    await query(`
+      INSERT INTO activity_logs (business_id, type, description, icon, color, ref_id, ref_type)
+      VALUES ($1, 'lead', $2, '👥', '#eff6ff', $3, 'lead')
+    `, [
+      businessId,
+      `Lead updated: ${customer_name || phone} — ${interest}`,
+      rows[0].id,
+    ]).catch(() => {});
+
+    console.log(`✅ Lead saved: ${phone} — ${interest}`);
+    return { success: true, leadId: rows[0].id, savedDetails: newDetails };
+
+  } catch (err) {
+    console.error("Save lead error:", err.message);
+    return { success: false, error: err.message };
+  }
 }

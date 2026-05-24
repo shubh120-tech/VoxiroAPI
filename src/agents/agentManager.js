@@ -85,8 +85,8 @@ export async function handleIncomingMessage({
     );
     if (convRows[0]?.status === "manual") return null;
 
-    // ── Save customer message ───────────────────────────────
-    await saveMessage({ conversationId, businessId, role: "customer", content: message });
+    // ── Customer message already saved in webhook (savePendingMessage) ──
+    // Only update last_message timestamp — don't insert duplicate
     await query(`
       UPDATE conversations
       SET last_message = $1, last_message_at = NOW(), updated_at = NOW()
@@ -112,6 +112,15 @@ export async function handleIncomingMessage({
     // ── Get system prompt (cached) ──────────────────────────
     const systemPrompt = await getCachedPrompt(businessId);
 
+    // ── Fetch already collected details for this conversation ─
+    // Inject into context so agent never asks for info already given
+    const { rows: detailRows } = await query(`
+      SELECT collected_details FROM conversations WHERE id = $1
+    `, [conversationId]).catch(() => ({ rows: [] }));
+
+    const collectedDetails = detailRows[0]?.collected_details || {};
+    const hasDetails = Object.keys(collectedDetails).length > 0;
+
     // ── Two-step reply for complex questions ─────────────────
     // Send "hmm" / "let me check" first, then actual reply
     // Makes agent feel like a human thinking before answering
@@ -132,9 +141,31 @@ export async function handleIncomingMessage({
     // While still having recent context (last msgs)
     const history = await loadConversationHistory(conversationId, 20);
 
+    // Build context with collected details
+    let contextNote = "";
+    if (hasDetails) {
+      const parts = [];
+      if (collectedDetails.name)       parts.push(`Name: ${collectedDetails.name}`);
+      if (collectedDetails.domain)     parts.push(`Domain/Subject: ${collectedDetails.domain}`);
+      if (collectedDetails.service)    parts.push(`Service: ${collectedDetails.service}`);
+      if (collectedDetails.word_count) parts.push(`Word count: ${collectedDetails.word_count}`);
+      if (collectedDetails.deadline)   parts.push(`Deadline: ${collectedDetails.deadline}`);
+      if (collectedDetails.email)      parts.push(`Email: ${collectedDetails.email}`);
+      if (collectedDetails.costing)    parts.push(`Quoted: ${collectedDetails.costing}`);
+      if (parts.length > 0) {
+        contextNote = `
+
+[ALREADY COLLECTED — DO NOT ASK AGAIN:
+${parts.join("")}]`;
+      }
+    }
+
     const messages = [
       ...history,
-      { role: "user", content: message },
+      {
+        role:    "user",
+        content: message + contextNote,
+      },
     ];
 
     // ── Call Claude with prompt caching ─────────────────────

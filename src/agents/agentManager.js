@@ -112,6 +112,21 @@ export async function handleIncomingMessage({
     // ── Get system prompt (cached) ──────────────────────────
     const systemPrompt = await getCachedPrompt(businessId);
 
+    // ── Two-step reply for complex questions ─────────────────
+    // Send "hmm" / "let me check" first, then actual reply
+    // Makes agent feel like a human thinking before answering
+    if (phoneNumberId && accessToken && isComplexQuestion(message)) {
+      const thinkingMsg = getThinkingMessage(message);
+      await sendWhatsAppMessages({
+        phoneNumberId, accessToken,
+        to: customerPhone,
+        messages: [thinkingMsg],
+      });
+      await saveMessage({ conversationId, businessId, role: "agent", content: thinkingMsg });
+      // Extra pause — human is "checking"
+      await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+    }
+
     // ── Load history: first 6 msgs + last 14 msgs ──────────
     // Agent never forgets customer name/details (in first msgs)
     // While still having recent context (last msgs)
@@ -175,6 +190,40 @@ function getHoldingReply(message) {
     return null; // Let Claude handle confirmations — context matters
   }
   return null;
+}
+
+// ── Detect complex question ─────────────────────────────────
+function isComplexQuestion(message) {
+  const msg = message.toLowerCase();
+  // Pricing/quotation questions
+  if (/price|cost|fee|charge|kitna|rate|quote|quotation|amount|₹|rs\.?/.test(msg)) return true;
+  // Deadline questions
+  if (/how long|kitne din|days|weeks|urgent|rush|fast|quick/.test(msg)) return true;
+  // Sensitive questions
+  if (/refund|cancel|guarantee|trust|safe|genuine|real|proof/.test(msg)) return true;
+  // Complex service questions
+  if (/thesis|synopsis|research paper|10000|12000|15000|20000/.test(msg)) return true;
+  return false;
+}
+
+// ── Get human thinking message ────────────────────────────────
+function getThinkingMessage(message) {
+  const msg = message.toLowerCase();
+
+  if (/price|cost|fee|kitna|amount|₹/.test(msg)) {
+    const options = ["let me check", "one sec", "checking", "hmm let me see"];
+    return options[Math.floor(Math.random() * options.length)];
+  }
+  if (/urgent|rush|fast|3 day|2 day|1 day/.test(msg)) {
+    const options = ["hmm that's tight", "let me check timeline", "one sec"];
+    return options[Math.floor(Math.random() * options.length)];
+  }
+  if (/refund|cancel/.test(msg)) {
+    const options = ["let me check", "one sec", "hmm"];
+    return options[Math.floor(Math.random() * options.length)];
+  }
+  const options = ["one sec", "let me check", "hmm", "checking"];
+  return options[Math.floor(Math.random() * options.length)];
 }
 
 // ── Load conversation history ─────────────────────────────────

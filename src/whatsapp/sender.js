@@ -70,29 +70,33 @@ function getSalesExecDelay(message, isFirstMessage = true) {
   const chars = message.length;
 
   // Reading delay — only for first message in a response
-  const readDelay = isFirstMessage ? (300 + Math.random() * 500) : 0; // 0.3-0.8s
+  const readDelay = isFirstMessage ? (300 + Math.random() * 700) : 0;
 
-  // Thinking delay — quick for simple, slightly longer for complex
-  const isQuotation = /quotation|price|fee|amount|₹|payment/i.test(message);
-  const isComplex   = chars > 150 || isQuotation;
-  const isSimple    = chars < 25;
+  // Detect message type for appropriate delay
+  const isQuotation  = /quotation|price|fee|amount|₹|payment/i.test(message);
+  const isSensitive  = /refund|cancel|trust|safe|guarantee|sample|reference/i.test(message);
+  const isThinking   = /^(hmm|one sec|let me check|checking|wait)\.?$/i.test(message.trim());
+  const isComplex    = chars > 150 || isQuotation;
+  const isSimple     = chars < 25;
 
   let thinkDelay;
-  if (isSimple)        thinkDelay = 300 + Math.random() * 500;   // 0.3-0.8s
-  else if (isComplex)  thinkDelay = 800 + Math.random() * 1200;  // 0.8-2s
-  else                 thinkDelay = 500 + Math.random() * 800;   // 0.5-1.3s
+  if (isThinking)      thinkDelay = 200 + Math.random() * 300;   // Very fast — just a filler
+  else if (isSensitive) thinkDelay = 1500 + Math.random() * 2000; // 1.5-3.5s — thoughtful
+  else if (isSimple)   thinkDelay = 300 + Math.random() * 600;   // 0.3-0.9s
+  else if (isComplex)  thinkDelay = 800 + Math.random() * 1500;  // 0.8-2.3s
+  else                 thinkDelay = 500 + Math.random() * 900;   // 0.5-1.4s
 
-  // Typing speed — ~400 chars/min (fast but human)
-  const charsPerMin = 400;
+  // Typing speed — ~350 chars/min
+  const charsPerMin = 350;
   const typingDelay = (chars / charsPerMin) * 60 * 1000;
 
-  // Small random variation ±10%
-  const variation = (Math.random() * 0.2 - 0.1) * typingDelay;
+  // Natural variation ±15%
+  const variation = (Math.random() * 0.3 - 0.15) * typingDelay;
 
   const total = readDelay + thinkDelay + typingDelay + variation;
 
-  // Clamp: min 0.8s, max 6s — fast enough to feel human, not robotic
-  return Math.min(Math.max(total, 800), 6000);
+  // Clamp: min 0.6s, max 7s
+  return Math.min(Math.max(total, 600), 7000);
 }
 
 /**
@@ -108,11 +112,13 @@ export async function sendWhatsAppMessage({
   isFirstMessage   = true,
 }) {
   try {
-    // 1. Mark as read + show typing indicator immediately
+    // 1. Mark as read + show typing indicator (only if we have incoming message ID)
     if (waMessageId) {
       await markReadAndShowTyping({ phoneNumberId, accessToken, waMessageId });
-      // Small pause — customer sees "typing..." appear
       await sleep(300 + Math.random() * 400);
+    } else {
+      // No incoming message to mark — just add thinking delay
+      await sleep(500 + Math.random() * 500);
     }
 
     // 2. Sales exec delay — read + think + type
@@ -204,20 +210,21 @@ export async function sendWhatsAppMessages({
       // Short pause between parts
       await sleep(400 + Math.random() * 600);
 
-      // Re-trigger typing indicator for next part
-      // (typing indicator lasts 25s max — re-send to keep it visible)
-      try {
-        await axios.post(
-          `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
-          {
-            messaging_product: "whatsapp",
-            status:            "read",
-            message_id:        waMessageId || "placeholder",
-            typing_indicator:  { type: "text" },
-          },
-          { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
-        );
-      } catch { /* non-critical */ }
+      // Re-trigger typing indicator for next part (only if we have message ID)
+      if (waMessageId) {
+        try {
+          await axios.post(
+            `${META_BASE}/${VERSION}/${phoneNumberId}/messages`,
+            {
+              messaging_product: "whatsapp",
+              status:            "read",
+              message_id:        waMessageId,
+              typing_indicator:  { type: "text" },
+            },
+            { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
+          );
+        } catch { /* non-critical */ }
+      }
     }
   }
 

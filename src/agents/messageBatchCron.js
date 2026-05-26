@@ -37,7 +37,7 @@ export async function processMessageBatches() {
         MIN(id::text) AS first_id
       FROM pending_messages
       WHERE processed = FALSE
-        AND received_at < NOW() - INTERVAL '${BATCH_WAIT_SECONDS} seconds'
+        AND received_at < NOW() - INTERVAL '10 seconds'
       GROUP BY customer_phone, business_id, conversation_id, customer_name, phone_number_id, access_token
       ORDER BY last_received ASC
       LIMIT 20
@@ -71,7 +71,7 @@ async function processBatch(batch) {
       WHERE customer_phone = $1
         AND business_id    = $2
         AND processed      = FALSE
-        AND received_at    < NOW() - INTERVAL '${BATCH_WAIT_SECONDS} seconds'
+        AND received_at    < NOW() - INTERVAL '10 seconds'
     `, [customer_phone, business_id]);
 
     // Check conversation status — skip if manual mode

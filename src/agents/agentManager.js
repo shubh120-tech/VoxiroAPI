@@ -113,12 +113,21 @@ export async function handleIncomingMessage({
     const systemPrompt = await getCachedPrompt(businessId);
 
     // ── Fetch already collected details for this conversation ─
-    // Inject into context so agent never asks for info already given
     const { rows: detailRows } = await query(`
-      SELECT collected_details FROM conversations WHERE id = $1
+      SELECT collected_details, customer_name, customer_phone FROM conversations WHERE id = $1
     `, [conversationId]).catch(() => ({ rows: [] }));
 
-    const collectedDetails = detailRows[0]?.collected_details || {};
+    const savedDetails     = detailRows[0]?.collected_details || {};
+    const savedName        = detailRows[0]?.customer_name || customerName;
+    const savedPhone       = detailRows[0]?.customer_phone || customerPhone;
+
+    // Auto-populate from conversation — agent always knows these
+    const collectedDetails = {
+      ...savedDetails,
+      // Always inject what we already know from conversation
+      ...(savedName  && !savedDetails.name  ? { name: savedName }   : {}),
+      ...(savedPhone && !savedDetails.phone ? { phone: savedPhone } : {}),
+    };
     const hasDetails = Object.keys(collectedDetails).length > 0;
 
     // ── Two-step reply for complex questions ─────────────────
@@ -141,24 +150,23 @@ export async function handleIncomingMessage({
     // While still having recent context (last msgs)
     const history = await loadConversationHistory(conversationId, 20);
 
-    // Build context with collected details
-    let contextNote = "";
-    if (hasDetails) {
-      const parts = [];
-      if (collectedDetails.name)       parts.push(`Name: ${collectedDetails.name}`);
-      if (collectedDetails.domain)     parts.push(`Domain/Subject: ${collectedDetails.domain}`);
-      if (collectedDetails.service)    parts.push(`Service: ${collectedDetails.service}`);
-      if (collectedDetails.word_count) parts.push(`Word count: ${collectedDetails.word_count}`);
-      if (collectedDetails.deadline)   parts.push(`Deadline: ${collectedDetails.deadline}`);
-      if (collectedDetails.email)      parts.push(`Email: ${collectedDetails.email}`);
-      if (collectedDetails.costing)    parts.push(`Quoted: ${collectedDetails.costing}`);
-      if (parts.length > 0) {
-        contextNote = `
+    // Build context — inject everything we already know
+    // This is appended to every message so agent NEVER asks for known info
+    const knownParts = [];
+    knownParts.push(`WhatsApp Number: ${customerPhone} (already known — NEVER ask for this)`);
+    if (collectedDetails.name || customerName)   knownParts.push(`Name: ${collectedDetails.name || customerName} (already known — do NOT ask again)`);
+    if (collectedDetails.domain)     knownParts.push(`Domain/Subject: ${collectedDetails.domain}`);
+    if (collectedDetails.service)    knownParts.push(`Service needed: ${collectedDetails.service}`);
+    if (collectedDetails.word_count) knownParts.push(`Word count: ${collectedDetails.word_count}`);
+    if (collectedDetails.deadline)   knownParts.push(`Deadline: ${collectedDetails.deadline}`);
+    if (collectedDetails.email)      knownParts.push(`Email: ${collectedDetails.email}`);
+    if (collectedDetails.costing)    knownParts.push(`Quoted price: ${collectedDetails.costing}`);
 
-[ALREADY COLLECTED — DO NOT ASK AGAIN:
-${parts.join("")}]`;
-      }
-    }
+    const contextNote = `
+
+[CUSTOMER INFO — ALREADY KNOWN — DO NOT ASK FOR ANY OF THESE AGAIN:
+${knownParts.join("")}
+Rule: If it is listed above → you already have it → skip it → ask only what is missing from this list]`;
 
     const messages = [
       ...history,

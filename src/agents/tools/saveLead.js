@@ -3,17 +3,15 @@ import { notifyOwnerWhatsApp } from "../../whatsapp/sender.js";
 
 export const saveLeadTool = {
   name: "save_lead",
-  description: `Save customer details as a lead. Call this as soon as you collect ANY of these details:
-- Customer name
-- Domain / subject
-- Service needed (thesis, research paper, etc.)
-- Word count
-- Deadline
-- Email
-- Contact number
+  description: `Save or update customer details. Call this IMMEDIATELY whenever you learn anything new:
+- First message mentions a service ("I need research paper") → save service_name = "research paper writing"
+- Client gives their name → save it
+- Client gives domain/subject → save it
+- Client gives deadline, word count, email → save each
 
-Call this EVERY TIME you get new info — it updates the existing record.
-This is how details are stored so you never ask again.`,
+ALWAYS call this at the start of conversation with whatever is known.
+ALWAYS call after every new piece of info.
+This prevents asking for info twice — details saved here are shown back to you automatically.`,
 
   input_schema: {
     type: "object",

@@ -186,18 +186,17 @@ async function processIncomingMessage({
  * Get existing conversation or create new one.
  */
 async function getOrCreateConversation({ businessId, customerPhone, customerName }) {
-  // Look for existing open conversation
+  // Look for existing ACTIVE conversation (not stopped/manual/needs-help)
   const { rows } = await query(`
     SELECT id, status FROM conversations
     WHERE business_id    = $1
       AND customer_phone = $2
-      AND status != 'closed'
+      AND status NOT IN ('closed', 'manual', 'needs-help')
     ORDER BY created_at DESC
     LIMIT 1
   `, [businessId, customerPhone]);
 
   if (rows.length > 0) {
-    // Update customer name if we now have it
     if (customerName) {
       await query(
         "UPDATE conversations SET customer_name = $1 WHERE id = $2",
@@ -205,6 +204,21 @@ async function getOrCreateConversation({ businessId, customerPhone, customerName
       );
     }
     return rows[0];
+  }
+
+  // Also check if there's a manual/needs-help conversation
+  // If yes — keep it stopped, create a NEW conversation for this message
+  const { rows: stoppedRows } = await query(`
+    SELECT id FROM conversations
+    WHERE business_id    = $1
+      AND customer_phone = $2
+      AND status IN ('manual', 'needs-help')
+    LIMIT 1
+  `, [businessId, customerPhone]);
+
+  if (stoppedRows.length > 0) {
+    // Previous conversation is stopped — create fresh one for new message
+    console.log(`📞 New message from ${customerPhone} — creating fresh conversation (old one is stopped)`);
   }
 
   // Create new conversation

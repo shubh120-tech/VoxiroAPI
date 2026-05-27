@@ -412,8 +412,8 @@ export async function tagOrderInStore(businessId, platformOrderId, platform) {
     if (!rows.length) return;
 
     const integration = rows[0];
-    const tag         = "Voxiro | WhatsApp Order";
-    const note        = `Order placed via Voxiro WhatsApp AI Agent on ${new Date().toLocaleDateString("en-IN")}`;
+    const tag         = "Yougant | WhatsApp Order";
+    const note        = `Order placed via Yougant WhatsApp AI Agent on ${new Date().toLocaleDateString("en-IN")}`;
 
     if (platform === "shopify") {
       await axios.put(

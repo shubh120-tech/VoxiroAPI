@@ -211,17 +211,17 @@ async function sendInviteEmail({ name, email, businessName, inviteToken, inviter
   const response = await axios.post(
     "https://api.resend.com/emails",
     {
-      from:    `${businessName} via Voxiro <${finalFromEmail}>`,
+      from:    `${businessName} via Yougant <${finalFromEmail}>`,
       to:      [email],
-      subject: `You've been invited to join ${businessName} on Voxiro`,
+      subject: `You've been invited to join ${businessName} on Yougant`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
           <div style="text-align: center; margin-bottom: 24px;">
-            <h1 style="color: #0d9488; font-size: 28px; margin: 0;">🤖 Voxiro</h1>
+            <h1 style="color: #0d9488; font-size: 28px; margin: 0;">🤖 Yougant</h1>
           </div>
           <h2 style="color: #1a1a1a;">You're invited to join ${businessName}</h2>
           <p style="color: #374151;">Hi ${name},</p>
-          <p style="color: #374151;">${inviterName} has invited you to join <strong>${businessName}</strong> on Voxiro — the AI WhatsApp agent platform.</p>
+          <p style="color: #374151;">${inviterName} has invited you to join <strong>${businessName}</strong> on Yougant — the AI WhatsApp agent platform.</p>
           <p style="color: #374151;">Click the button below to accept the invitation and set your password:</p>
           <div style="text-align: center; margin: 32px 0;">
             <a href="${inviteLink}" style="display: inline-block; background: #0d9488; color: white; padding: 14px 28px; border-radius: 10px; text-decoration: none; font-weight: bold; font-size: 16px;">

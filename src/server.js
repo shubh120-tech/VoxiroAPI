@@ -55,7 +55,7 @@ app.use("/api", rateLimit({
 
 // ── Health Check ──────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Voxiro Backend" });
+  res.json({ status: "ok", timestamp: new Date().toISOString(), service: "Yougant Backend" });
 });
 
 // ── WhatsApp Webhook ──────────────────────────────────────────
@@ -109,7 +109,7 @@ app.use((err, req, res, next) => {
 
 // ── Start Server ──────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 Voxiro Backend running on port ${PORT}`);
+  console.log(`\n🚀 Yougant Backend running on port ${PORT}`);
   console.log(`   Environment: ${process.env.NODE_ENV || "development"}`);
   console.log(`   Health:      http://localhost:${PORT}/health\n`);
 

@@ -78,12 +78,18 @@ export async function handleIncomingMessage({
   setTimeout(() => processingLock.delete(lockKey), 30000);
 
   try {
-    // ── Check manual mode ───────────────────────────────────
+    // ── Check manual mode — per conversation only ───────────────
+    // manual = owner took over, needs-help = agent notified owner
+    // Both mean agent should stop for THIS conversation
+    // Other conversations are completely unaffected
     const { rows: convRows } = await query(
       "SELECT status FROM conversations WHERE id = $1",
       [conversationId]
     );
-    if (convRows[0]?.status === "manual") return null;
+    if (["manual", "needs-help"].includes(convRows[0]?.status)) {
+      console.log(`⏭️ Skipping agent reply — conversation ${conversationId} is in ${convRows[0]?.status} mode`);
+      return null;
+    }
 
     // ── Customer message already saved in webhook (savePendingMessage) ──
     // Only update last_message timestamp — don't insert duplicate

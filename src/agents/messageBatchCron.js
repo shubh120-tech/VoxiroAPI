@@ -72,13 +72,13 @@ async function processBatch(batch) {
   } = batch;
 
   try {
-    // Check conversation status
+    // Check conversation status — skip if manual or needs-help
     const { rows: convRows } = await query(
       "SELECT status FROM conversations WHERE id = $1",
       [conversation_id]
     );
-    if (convRows[0]?.status === "manual") {
-      console.log(`⏭️  Skipping ${customer_phone} — manual mode`);
+    if (["manual", "needs-help"].includes(convRows[0]?.status)) {
+      console.log(`⏭️  Skipping ${customer_phone} — conversation in ${convRows[0]?.status} mode`);
       return;
     }
 

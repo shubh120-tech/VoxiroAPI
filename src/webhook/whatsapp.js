@@ -496,13 +496,24 @@ async function savePendingMessage({
       waMessageId,
     ]);
 
-    // Save to messages table immediately so owner sees it in dashboard
-    // Use ON CONFLICT to prevent duplicates if wa_message_id already exists
-    await query(`
-      INSERT INTO messages (conversation_id, business_id, role, content, wa_message_id)
-      VALUES ($1, $2, 'customer', $3, $4)
-      ON CONFLICT (wa_message_id) DO NOTHING
-    `, [conversation.id, businessId, messageText, waMessageId]);
+    // Save to messages table — check for existing wa_message_id first
+    if (waMessageId) {
+      const { rows: existing } = await query(
+        "SELECT id FROM messages WHERE wa_message_id = $1 LIMIT 1",
+        [waMessageId]
+      );
+      if (!existing.length) {
+        await query(`
+          INSERT INTO messages (conversation_id, business_id, role, content, wa_message_id)
+          VALUES ($1, $2, 'customer', $3, $4)
+        `, [conversation.id, businessId, messageText, waMessageId]);
+      }
+    } else {
+      await query(`
+        INSERT INTO messages (conversation_id, business_id, role, content)
+        VALUES ($1, $2, 'customer', $3)
+      `, [conversation.id, businessId, messageText]);
+    }
 
     await query(`
       UPDATE conversations

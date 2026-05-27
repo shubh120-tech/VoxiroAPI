@@ -19,6 +19,7 @@ import onboardingRouter  from "./routes/onboarding.js";
 import broadcastRouter   from "./routes/broadcast.js";
 import teamRouter        from "./routes/team.js";
 import storeRouter       from "./routes/storeIntegration.js";
+import trainingRouter    from "./routes/agentTraining.js";
 import shopifyOAuthRouter from "./routes/shopifyOAuth.js";
 import whatsappWebhook   from "./webhook/whatsapp.js";
 
@@ -91,6 +92,7 @@ app.use("/api",        knowledgeRouter);
 app.use("/api",        onboardingRouter);
 app.use("/api",        broadcastRouter);
 app.use("/api",        storeRouter);
+app.use("/api",        trainingRouter);
 app.use("/api",        shopifyOAuthRouter);
 app.use("/api/admin",  adminRouter);
 

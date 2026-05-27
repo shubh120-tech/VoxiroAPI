@@ -39,14 +39,14 @@ export async function executeSaveLead({ businessId, conversationId, customerPhon
 
   const phone = customer_phone || customerPhone;
 
-  // Build collected details object — only store non-null values
+  // Build collected details — store values AND explicit skips
   const newDetails = {};
   if (customer_name)  newDetails.name         = customer_name;
   if (customer_email) newDetails.email         = customer_email;
   if (service_name)   newDetails.service       = service_name;
   if (domain_subject) newDetails.domain        = domain_subject;
-  if (word_count)     newDetails.word_count    = word_count;
-  if (deadline)       newDetails.deadline      = deadline;
+  if (word_count)     newDetails.word_count    = word_count === "not_provided" ? "SKIPPED" : word_count;
+  if (deadline)       newDetails.deadline      = deadline   === "not_provided" ? "SKIPPED" : deadline;
   if (costing)        newDetails.costing       = costing;
   if (notes)          newDetails.notes         = notes;
 

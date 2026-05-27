@@ -153,20 +153,35 @@ export async function handleIncomingMessage({
     // Build context — inject everything we already know
     // This is appended to every message so agent NEVER asks for known info
     const knownParts = [];
-    knownParts.push(`WhatsApp Number: ${customerPhone} (already known — NEVER ask for this)`);
-    if (collectedDetails.name || customerName)   knownParts.push(`Name: ${collectedDetails.name || customerName} (already known — do NOT ask again)`);
-    if (collectedDetails.domain)     knownParts.push(`Domain/Subject: ${collectedDetails.domain}`);
-    if (collectedDetails.service)    knownParts.push(`Service needed: ${collectedDetails.service}`);
-    if (collectedDetails.word_count) knownParts.push(`Word count: ${collectedDetails.word_count}`);
-    if (collectedDetails.deadline)   knownParts.push(`Deadline: ${collectedDetails.deadline}`);
-    if (collectedDetails.email)      knownParts.push(`Email: ${collectedDetails.email}`);
-    if (collectedDetails.costing)    knownParts.push(`Quoted price: ${collectedDetails.costing}`);
+    knownParts.push(`WhatsApp/Contact Number: ${customerPhone} — NEVER ask for this`);
+    if (collectedDetails.name || customerName)
+      knownParts.push(`Name: ${collectedDetails.name || customerName} — do NOT ask again`);
+    if (collectedDetails.domain)
+      knownParts.push(`Domain/Subject: ${collectedDetails.domain}`);
+    if (collectedDetails.service)
+      knownParts.push(`Service: ${collectedDetails.service}`);
+
+    // Optional fields — show if collected OR if already skipped
+    if (collectedDetails.word_count)
+      knownParts.push(collectedDetails.word_count === "SKIPPED"
+        ? `Word count: client did not provide — DO NOT ASK AGAIN`
+        : `Word count: ${collectedDetails.word_count}`);
+    if (collectedDetails.deadline)
+      knownParts.push(collectedDetails.deadline === "SKIPPED"
+        ? `Deadline: client did not provide — DO NOT ASK AGAIN`
+        : `Deadline: ${collectedDetails.deadline}`);
+    if (collectedDetails.email)
+      knownParts.push(collectedDetails.email === "SKIPPED"
+        ? `Email: client did not provide — DO NOT ASK AGAIN`
+        : `Email: ${collectedDetails.email}`);
+    if (collectedDetails.costing)
+      knownParts.push(`Quoted price: ${collectedDetails.costing}`);
 
     const contextNote = `
 
-[CUSTOMER INFO — ALREADY KNOWN — DO NOT ASK FOR ANY OF THESE AGAIN:
+[ALREADY KNOWN — SKIP EVERYTHING LISTED HERE:
 ${knownParts.join("")}
-Rule: If it is listed above → you already have it → skip it → ask only what is missing from this list]`;
+RULE: Never ask for anything listed above. Move forward with what you have.]`;
 
     const messages = [
       ...history,
@@ -232,37 +247,33 @@ function getHoldingReply(message) {
 }
 
 // ── Detect complex question ─────────────────────────────────
+// ── Two-step reply ONLY for: negotiation, very tight deadline, trust concern ──
+// NOT for regular questions, service info, domain/subject, word count etc.
 function isComplexQuestion(message) {
   const msg = message.toLowerCase();
-  // Pricing/quotation questions
-  if (/price|cost|fee|charge|kitna|rate|quote|quotation|amount|₹|rs\.?/.test(msg)) return true;
-  // Deadline questions
-  if (/how long|kitne din|days|weeks|urgent|rush|fast|quick/.test(msg)) return true;
-  // Sensitive questions
-  if (/refund|cancel|guarantee|trust|safe|genuine|real|proof/.test(msg)) return true;
-  // Complex service questions
-  if (/thesis|synopsis|research paper|10000|12000|15000|20000/.test(msg)) return true;
+  // Price negotiation only — NOT just asking price
+  if (/discount|negotiate|kam karo|thoda kam|best price|cheaper|reduce price|less price/.test(msg)) return true;
+  // Very tight deadline — 1, 2, 3 days only
+  if (/\b1 day\b|\b2 day\b|\b3 day\b|tomorrow deadline|aaj chahiye|kal chahiye|tonight|emergency/.test(msg)) return true;
+  // Trust or refund concern
+  if (/refund|scam|fake|fraud|trust|verify|genuine|proof/.test(msg)) return true;
   return false;
+  // NOTE: Do NOT add price/cost/fee here — asking price is normal, not complex
+  // NOTE: Do NOT add service/thesis/domain — those are normal questions
 }
 
-// ── Get human thinking message ────────────────────────────────
+// ── Thinking message — used only in above cases ───────────────
 function getThinkingMessage(message) {
   const msg = message.toLowerCase();
-
-  if (/price|cost|fee|kitna|amount|₹/.test(msg)) {
-    const options = ["let me check", "one sec", "checking", "hmm let me see"];
+  if (/discount|negotiate|kam karo|best price|cheaper/.test(msg)) {
+    const options = ["hmm", "let me see what's possible", "one sec"];
     return options[Math.floor(Math.random() * options.length)];
   }
-  if (/urgent|rush|fast|3 day|2 day|1 day/.test(msg)) {
-    const options = ["hmm that's tight", "let me check timeline", "one sec"];
+  if (/1 day|2 day|3 day|aaj|kal|tonight|emergency/.test(msg)) {
+    const options = ["hmm that's tight", "let me check"];
     return options[Math.floor(Math.random() * options.length)];
   }
-  if (/refund|cancel/.test(msg)) {
-    const options = ["let me check", "one sec", "hmm"];
-    return options[Math.floor(Math.random() * options.length)];
-  }
-  const options = ["one sec", "let me check", "hmm", "checking"];
-  return options[Math.floor(Math.random() * options.length)];
+  return "hmm";
 }
 
 // ── Load conversation history ─────────────────────────────────

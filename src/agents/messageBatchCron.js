@@ -99,9 +99,24 @@ async function processBatch(batch) {
     });
 
   } catch (err) {
-    console.error(`Batch error for ${customer_phone}:`, err.message);
+    const errMsg  = err.response?.data?.error?.message || err.message;
+    const errCode = err.response?.data?.error?.code;
+    console.error(`Batch error for ${customer_phone}:`, errMsg);
 
-    // Unmark as processed so it retries next cycle
+    // Token expired (401/190) — mark business as token_expired, don't retry
+    if (err.response?.status === 401 || errCode === 190) {
+      console.error(`🔑 Token expired for business ${business_id} — update token in Settings`);
+      await query(`
+        UPDATE whatsapp_configs
+        SET status = 'token_expired', updated_at = NOW()
+        WHERE business_id = $1
+      `, [business_id]).catch(() => {});
+
+      // Don't retry — token is invalid, retrying wastes API calls
+      return;
+    }
+
+    // Other errors — unmark so it retries
     await query(`
       UPDATE pending_messages
       SET processed = FALSE, processed_at = NULL

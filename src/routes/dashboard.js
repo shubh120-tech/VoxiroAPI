@@ -251,8 +251,21 @@ router.post("/agent/conversations/:id/takeover", async (req, res) => {
 
 router.post("/agent/conversations/:id/resume", async (req, res) => {
   try {
-    await query(`UPDATE conversations SET status = 'agent', updated_at = NOW() WHERE id = $1 AND business_id = $2`,
-      [req.params.id, req.user.business_id]);
+    // Reset conversation to agent mode
+    await query(`
+      UPDATE conversations
+      SET status = 'agent', updated_at = NOW()
+      WHERE id = $1 AND business_id = $2
+    `, [req.params.id, req.user.business_id]);
+
+    // Clear any stuck pending messages for this conversation
+    // So agent picks up fresh when customer replies next
+    await query(`
+      UPDATE pending_messages
+      SET processed = TRUE, processed_at = NOW()
+      WHERE conversation_id = $1 AND processed = FALSE
+    `, [req.params.id]);
+
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to resume agent" });
@@ -268,9 +281,15 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
     );
     if (!conv.length) return res.status(404).json({ message: "Conversation not found" });
 
-    // Save owner message
-    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3)`,
-      [req.params.id, req.user.business_id, message]);
+    // Save owner message and return it
+    const { rows: msgRows } = await query(
+      `INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3) RETURNING *`,
+      [req.params.id, req.user.business_id, message]
+    );
+
+    // Update conversation last message
+    await query(`UPDATE conversations SET last_message = $1, last_message_at = NOW() WHERE id = $2`,
+      [message, req.params.id]);
 
     // Send via WhatsApp
     const { rows: wc } = await query(
@@ -287,7 +306,7 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
       });
     }
 
-    res.json({ success: true });
+    res.json({ success: true, message: msgRows[0] });
   } catch (err) {
     res.status(500).json({ message: "Failed to send message" });
   }
@@ -300,7 +319,7 @@ router.get("/settings", async (req, res) => {
     const [biz, agent, wc, notif, sub] = await Promise.all([
       query("SELECT * FROM businesses WHERE id = $1", [bId]),
       query("SELECT * FROM agent_configs WHERE business_id = $1", [bId]),
-      query("SELECT phone_number_id, whatsapp_number, is_verified FROM whatsapp_configs WHERE business_id = $1", [bId]),
+      query("SELECT phone_number_id, whatsapp_number, is_verified, display_name, waba_id, status FROM whatsapp_configs WHERE business_id = $1", [bId]),
       query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]),
       query("SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [bId]),
     ]);

@@ -303,113 +303,253 @@ async function runCrawl(crawlId, businessId, startUrl) {
   const baseUrl   = new URL(startUrl).origin;
   const visited   = new Set();
   const toVisit   = [startUrl];
-  const allText   = [];
+  const allPages  = []; // { url, title, content, images }
   let   pageCount = 0;
+  const MAX_PAGES = 50;
 
-  // Priority pages to also try
-  const priorityPaths = ["/products", "/shop", "/services", "/about", "/faq", "/pricing", "/catalog", "/store"];
+  // Priority pages first
+  const priorityPaths = [
+    "/products", "/shop", "/store", "/catalog", "/collection",
+    "/services", "/pricing", "/packages", "/plans",
+    "/about", "/faq", "/contact",
+  ];
   for (const path of priorityPaths) {
     toVisit.push(baseUrl + path);
   }
 
-  while (toVisit.length > 0 && pageCount < 20) {
+  while (toVisit.length > 0 && pageCount < MAX_PAGES) {
     const url = toVisit.shift();
     if (visited.has(url)) continue;
     visited.add(url);
 
     try {
       const { data: html } = await axios.get(url, {
-        timeout: 10000,
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; YougantBot/1.0)" },
+        timeout: 12000,
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; YougantBot/1.0; +https://yougant.com)" },
       });
 
       const $ = cheerio.load(html);
 
-      // Remove noise
-      $("script, style, nav, footer, header, iframe, .cookie-banner, #cookie-notice").remove();
+      // Remove noise elements
+      $("script, style, nav, footer, header, iframe, .cookie-banner, #cookie-notice, .popup, .modal, .newsletter").remove();
 
-      // Extract page title + content
+      // ── Extract page content ──────────────────────────────
       const title   = $("title").text().trim();
       const h1      = $("h1").first().text().trim();
-      const content = $("main, article, .content, .products, .services, body").text()
-        .replace(/\s+/g, " ").trim().slice(0, 3000);
 
-      if (content.length > 100) {
-        allText.push(`--- PAGE: ${title || url} ---\n${h1 ? "H1: " + h1 + "\n" : ""}${content}`);
+      // Try multiple content selectors
+      const contentEl = $("main").length ? $("main") :
+                        $("article").length ? $("article") :
+                        $(".products, .product-list, .shop-grid").length ? $(".products, .product-list, .shop-grid") :
+                        $(".content, #content").length ? $(".content, #content") :
+                        $("body");
+
+      const content = contentEl.text().replace(/\s+/g, " ").trim();
+
+      // ── Extract images from this page ─────────────────────
+      const images = [];
+      $("img").each((_, el) => {
+        const src = $(el).attr("src") || $(el).attr("data-src") || $(el).attr("data-lazy-src");
+        const alt = $(el).attr("alt") || "";
+        if (!src) return;
+        try {
+          const absImg = new URL(src, url).href;
+          // Only include product-like images (skip icons, logos, tiny images)
+          const isIcon = absImg.match(/logo|icon|favicon|sprite|banner|thumb-tiny|\.svg/i);
+          const hasProductHint = alt.match(/product|item|shop|buy|price|₹|\d/i) ||
+                                 absImg.match(/product|item|catalog|shop|upload|media/i);
+          if (!isIcon && absImg.startsWith("http") && (hasProductHint || images.length < 5)) {
+            images.push({ src: absImg, alt });
+          }
+        } catch { /* invalid URL */ }
+      });
+
+      // ── Identify if this is a product/service page ───────
+      const isProductPage = url.match(/product|item|shop|catalog|service|pricing|package/i) ||
+                            content.match(/₹\s*\d|price|buy now|add to cart|order now|book now/i);
+
+      if (content.length > 80) {
+        allPages.push({
+          url,
+          title: title || h1 || url,
+          content: content.slice(0, isProductPage ? 4000 : 2000),
+          images: images.slice(0, 10),
+          isProductPage: !!isProductPage,
+        });
         pageCount++;
       }
 
-      // Find more relevant links on this domain
-      if (pageCount < 15) {
+      // ── Collect more links to crawl ───────────────────────
+      if (pageCount < MAX_PAGES) {
         $("a[href]").each((_, el) => {
           const href = $(el).attr("href");
           if (!href) return;
           try {
             const abs = new URL(href, url).href;
-            if (abs.startsWith(baseUrl) && !visited.has(abs) && !abs.includes("#") && !abs.match(/\.(pdf|jpg|png|zip)/i)) {
-              toVisit.push(abs);
+            if (
+              abs.startsWith(baseUrl) &&
+              !visited.has(abs) &&
+              !abs.includes("#") &&
+              !abs.match(/\.(pdf|zip|mp4|mp3|exe)/i) &&
+              !abs.match(/login|logout|cart|checkout|account|wishlist|compare/i)
+            ) {
+              // Prioritize product-looking links
+              if (abs.match(/product|item|shop|catalog|service|pricing|package/i)) {
+                toVisit.unshift(abs); // Add to front
+              } else {
+                toVisit.push(abs);
+              }
             }
           } catch { /* invalid URL */ }
         });
       }
     } catch (err) {
       // Skip failed pages silently
+      console.log(`Crawl skip: ${url} — ${err.message}`);
     }
   }
 
-  if (!allText.length) {
+  if (!allPages.length) {
     await query(
-      "UPDATE website_crawls SET status='failed', error_message='Could not extract content from website' WHERE id=$1",
+      "UPDATE website_crawls SET status='failed', error_message='Could not extract content from website. Make sure the URL is correct and publicly accessible.' WHERE id=$1",
       [crawlId]
     );
     return;
   }
 
-  // Use Claude to extract structured knowledge
-  const prompt = `You are extracting business knowledge from a website to train a WhatsApp sales agent.
+  console.log(`🕷️ Crawled ${pageCount} pages from ${startUrl}`);
+
+  // ── Step 1: Extract structured products with Claude ──────
+  const productPages = allPages.filter(p => p.isProductPage);
+  const otherPages   = allPages.filter(p => !p.isProductPage);
+
+  const productPrompt = `You are extracting product/service catalog data from a business website.
+
+Pages crawled:
+${allPages.map(p => `
+=== ${p.title} (${p.url}) ===
+${p.content}
+${p.images.length > 0 ? `Images found: ${p.images.map(i => `${i.src} [${i.alt}]`).join(", ")}` : ""}
+`).join("\n").slice(0, 18000)}
+
+Extract ALL products or services mentioned. Return ONLY valid JSON, no explanation, no markdown:
+{
+  "products": [
+    {
+      "name": "Product Name",
+      "description": "Full description",
+      "price": 999,
+      "sale_price": null,
+      "category": "Category name",
+      "stock_status": "in_stock",
+      "variants": [{"name": "Size", "options": ["S", "M", "L"]}],
+      "image_url": "https://...",
+      "tags": ["tag1", "tag2"]
+    }
+  ]
+}
+
+Rules:
+- price must be a number (just digits, no ₹ or commas). null if not found.
+- sale_price is the discounted price if there's an offer. null if not found.
+- category: guess from context if not explicit
+- stock_status: "in_stock", "out_of_stock", or "limited"
+- variants: only if multiple sizes/colors/options exist
+- image_url: use the most relevant image URL from the Images found lines. null if none.
+- Extract every distinct product/service you can find
+- If no products found, return {"products": []}`;
+
+  let extractedProducts = [];
+  try {
+    const prodResponse = await anthropic.messages.create({
+      model:      "claude-haiku-4-5-20251001",
+      max_tokens: 4000,
+      messages:   [{ role: "user", content: productPrompt }],
+    });
+
+    const rawJson = prodResponse.content[0]?.text?.trim() || "{}";
+    const cleaned = rawJson.replace(/^```json\n?|^```\n?|\n?```$/g, "").trim();
+    const parsed  = JSON.parse(cleaned);
+    extractedProducts = parsed.products || [];
+    console.log(`📦 Extracted ${extractedProducts.length} products`);
+  } catch (err) {
+    console.error("Product extraction error:", err.message);
+  }
+
+  // ── Step 2: Save products to products table ──────────────
+  let savedCount = 0;
+  for (const p of extractedProducts) {
+    try {
+      if (!p.name) continue;
+      await query(`
+        INSERT INTO products
+          (business_id, name, description, price, sale_price, category,
+           stock_status, variants, images, tags, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'website')
+        ON CONFLICT DO NOTHING
+      `, [
+        businessId,
+        p.name,
+        p.description || null,
+        p.price        ? parseFloat(p.price)      : null,
+        p.sale_price   ? parseFloat(p.sale_price) : null,
+        p.category     || null,
+        p.stock_status || "in_stock",
+        JSON.stringify(p.variants || []),
+        JSON.stringify(p.image_url ? [p.image_url] : []),
+        JSON.stringify(p.tags     || []),
+      ]);
+      savedCount++;
+    } catch (err) {
+      console.error("Product save error:", p.name, err.message);
+    }
+  }
+
+  // ── Step 3: Extract general knowledge ────────────────────
+  const knowledgePrompt = `You are extracting business knowledge from a website to train a WhatsApp sales agent.
 
 Website content:
-${allText.join("\n\n").slice(0, 12000)}
+${allPages.map(p => `\n--- ${p.title} ---\n${p.content}`).join("\n").slice(0, 14000)}
 
-Extract and structure the following information in a clear format:
+Extract and structure clearly:
 
-1. BUSINESS OVERVIEW (what the business does, USPs)
-2. PRODUCTS/SERVICES (name, description, price if mentioned, variants if any)
-3. PRICING (any pricing info, packages, plans)
-4. POLICIES (return policy, shipping, delivery, warranty)
-5. FAQS (common questions and answers found on site)
-6. CONTACT & HOURS (address, phone, email, working hours)
+1. BUSINESS OVERVIEW (what they do, USPs, why choose them)
+2. PRODUCTS/SERVICES SUMMARY (brief overview of what they offer with prices if found)
+3. PRICING & PACKAGES (any specific plans, packages, pricing tiers)
+4. POLICIES (return, refund, shipping, warranty, delivery time)
+5. FAQS (common questions and answers from the site)
+6. CONTACT & HOURS (address, phone, email, working hours, location)
 
-Format each section clearly. If information is not found, skip that section.
-Be concise but comprehensive. Focus on information useful for a sales agent answering customer questions.`;
+Be concise. Focus on information a sales agent needs to answer customer questions accurately.
+Skip sections where no info is found.`;
 
-  const response = await anthropic.messages.create({
+  const knowledgeResponse = await anthropic.messages.create({
     model:      "claude-haiku-4-5-20251001",
-    max_tokens: 2000,
-    messages:   [{ role: "user", content: prompt }],
+    max_tokens: 3000,
+    messages:   [{ role: "user", content: knowledgePrompt }],
   });
 
-  const knowledge = response.content[0]?.text || "";
+  const knowledge = knowledgeResponse.content[0]?.text || "";
 
-  // Count products mentioned
-  const productMatches = knowledge.match(/\d+\.\s+\*\*[^*]+\*\*/g)?.length || 0;
+  // ── Step 4: Sync products to agent knowledge ─────────────
+  await syncProductKnowledge(businessId);
 
-  // Save to knowledge base
+  // Update agent_configs with general knowledge too
   await query(`
     UPDATE agent_configs
-    SET product_knowledge = $1, updated_at = NOW()
+    SET product_knowledge = COALESCE(product_knowledge, '') || $1, updated_at = NOW()
     WHERE business_id = $2
-  `, [knowledge, businessId]);
+  `, ["\n\n" + knowledge, businessId]);
 
-  // Update crawl record
+  // ── Step 5: Update crawl record ──────────────────────────
   await query(`
     UPDATE website_crawls
     SET status='done', pages_crawled=$1, products_found=$2,
         knowledge_extracted=$3, crawled_at=NOW()
     WHERE id=$4
-  `, [pageCount, productMatches, knowledge, crawlId]);
+  `, [pageCount, savedCount, knowledge, crawlId]);
 
-  console.log(`✅ Crawl done: ${pageCount} pages, business ${businessId}`);
+  console.log(`✅ Crawl complete: ${pageCount} pages, ${savedCount} products saved, business ${businessId}`);
 }
 
 // ── SYNC all products to agent knowledge ────────────────────

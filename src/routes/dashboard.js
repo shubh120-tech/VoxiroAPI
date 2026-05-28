@@ -506,4 +506,43 @@ router.patch("/followups/:id/cancel", async (req, res) => {
   }
 });
 
+router.post("/contact", async (req, res) => {
+  try {
+    const { name, email, phone, subject, message } = req.body;
+    if (!name || !email || !message) {
+      return res.status(400).json({ message: "Name, email and message required" });
+    }
+ 
+    // Send email via Resend
+    const apiKey = process.env.RESEND_API_KEY;
+    if (apiKey) {
+      const axios = (await import("axios")).default;
+      await axios.post("https://api.resend.com/emails", {
+        from:    `Yougant Contact <${process.env.FROM_EMAIL || "onboarding@resend.dev"}>`,
+        to:      ["care@yougant.in"],
+        subject: `[Contact] ${subject || "New message"} — ${name}`,
+        html: `
+          <h2>New contact form submission</h2>
+          <p><strong>Name:</strong> ${name}</p>
+          <p><strong>Email:</strong> ${email}</p>
+          <p><strong>Phone:</strong> ${phone || "—"}</p>
+          <p><strong>Subject:</strong> ${subject || "—"}</p>
+          <hr>
+          <p><strong>Message:</strong></p>
+          <p>${message.split("\n").join("<br>")}</p>
+        `,
+        reply_to: email,
+      }, {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      });
+    }
+ 
+    console.log(`📩 Contact form: ${name} <${email}> — ${subject}`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Contact form error:", err.message);
+    res.status(500).json({ message: "Failed to send message" });
+  }
+});
+
 export default router;

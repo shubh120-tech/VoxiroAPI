@@ -8,7 +8,7 @@ export async function buildSystemPrompt(businessId) {
   const cached = promptCache.get(key);
   if (cached && cached.expiry > Date.now()) return cached.prompt;
 
-  const [configResult, regularDocsResult, companyResult] = await Promise.all([
+  const [configResult, regularDocsResult, companyResult, collectedResult] = await Promise.all([
     query(`
       SELECT
         b.name            AS business_name,
@@ -48,6 +48,14 @@ export async function buildSystemPrompt(businessId) {
       FROM business_company_details
       WHERE business_id = $1
     `, [businessId]).catch(() => ({ rows: [] })),
+
+    // Product knowledge (manual catalog or website crawl)
+    query(`
+      SELECT product_knowledge FROM agent_configs WHERE business_id = $1
+    `, [businessId]).catch(() => ({ rows: [] })),
+
+    // Already collected details from this conversation (passed via businessId+conversationId)
+    Promise.resolve({ rows: [] }), // placeholder — injected per-call
   ]);
 
   if (!configResult.rows.length) throw new Error("Business not found");
@@ -80,11 +88,14 @@ export async function buildSystemPrompt(businessId) {
     ? "It is early morning (before 10 AM IST). Slightly slower, more casual tone."
     : "Normal business hours. Standard sales behavior.";
 
+  const productKnowledge = configResult?.rows?.[0]?.product_knowledge || "";
+
   const prompt = `
 You are ${biz.agent_name}, a sales representative at ${biz.business_name}.
 You are a real human — never say you are an AI or bot.
 Current date and time: ${currentTimeIST}
 ${timeInstruction}
+${productKnowledge ? `\n\nPRODUCT CATALOG:\n${productKnowledge}\n\nUse this catalog to answer product questions accurately. Always mention price, stock status, and variants when relevant.` : ""}
 
 BUSINESS:
 Name: ${biz.business_name}

@@ -246,4 +246,218 @@ router.patch("/support/:id/resolve", async (req, res) => {
   }
 });
 
+
+// ── Edit Agent Prompt ─────────────────────────────────────────
+router.get("/businesses/:id/prompt", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT system_prompt, agent_name, tone, language FROM agent_configs WHERE business_id = $1",
+      [req.params.id]
+    );
+    res.json(rows[0] || {});
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load prompt" });
+  }
+});
+
+router.put("/businesses/:id/prompt", async (req, res) => {
+  try {
+    const { system_prompt, agent_name } = req.body;
+    if (!system_prompt?.trim()) return res.status(400).json({ message: "Prompt cannot be empty" });
+
+    // Save current to history
+    const { rows: cur } = await query(
+      "SELECT system_prompt FROM agent_configs WHERE business_id = $1", [req.params.id]
+    );
+    if (cur[0]?.system_prompt) {
+      await query(
+        "INSERT INTO prompt_history (business_id, prompt, change_note, changed_by) VALUES ($1,$2,$3,'admin')",
+        [req.params.id, cur[0].system_prompt, "Admin override"]
+      ).catch(() => {});
+    }
+
+    await query(`
+      UPDATE agent_configs
+      SET system_prompt = $1, agent_name = COALESCE($2, agent_name), updated_at = NOW()
+      WHERE business_id = $3
+    `, [system_prompt, agent_name, req.params.id]);
+
+    await query(
+      "INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, details) VALUES ($1,'edit_prompt','business',$2,$3)",
+      [req.admin.id, req.params.id, JSON.stringify({ agent_name })]
+    ).catch(() => {});
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update prompt" });
+  }
+});
+
+// ── Assign Plan ───────────────────────────────────────────────
+router.get("/plans", async (req, res) => {
+  try {
+    const { rows } = await query("SELECT * FROM plans ORDER BY price_monthly ASC");
+    res.json({ plans: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load plans" });
+  }
+});
+
+router.patch("/businesses/:id/plan", async (req, res) => {
+  try {
+    const { planId, reason } = req.body;
+    if (!planId) return res.status(400).json({ message: "Plan ID required" });
+
+    // Get plan details
+    const { rows: plan } = await query("SELECT * FROM plans WHERE id = $1", [planId]);
+    if (!plan.length) return res.status(404).json({ message: "Plan not found" });
+
+    // Update business plan
+    await query(
+      "UPDATE businesses SET plan_id = $1, updated_at = NOW() WHERE id = $2",
+      [planId, req.params.id]
+    );
+
+    // Update message limit in agent_configs
+    await query(
+      "UPDATE agent_configs SET message_limit = $1 WHERE business_id = $2",
+      [plan[0].message_limit, req.params.id]
+    ).catch(() => {});
+
+    await query(
+      "INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, details) VALUES ($1,'assign_plan','business',$2,$3)",
+      [req.admin.id, req.params.id, JSON.stringify({ planId, planName: plan[0].name, reason })]
+    ).catch(() => {});
+
+    res.json({ success: true, plan: plan[0] });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to assign plan" });
+  }
+});
+
+// ── Reset Password ────────────────────────────────────────────
+router.post("/businesses/:id/reset-password", async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 8)
+      return res.status(400).json({ message: "Password must be at least 8 characters" });
+
+    // Find owner user for this business
+    const { rows: users } = await query(
+      "SELECT id FROM users WHERE business_id = $1 AND role = 'owner'",
+      [req.params.id]
+    );
+    if (!users.length) return res.status(404).json({ message: "Business owner not found" });
+
+    const hash = await bcrypt.hash(newPassword, 12);
+    await query("UPDATE users SET password_hash = $1 WHERE id = $2", [hash, users[0].id]);
+
+    await query(
+      "INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, details) VALUES ($1,'reset_password','business',$2,$3)",
+      [req.admin.id, req.params.id, JSON.stringify({ userId: users[0].id })]
+    ).catch(() => {});
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to reset password" });
+  }
+});
+
+// ── View Conversations ─────────────────────────────────────────
+router.get("/businesses/:id/conversations/full", async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status } = req.query;
+    const offset = (page - 1) * limit;
+    let sql = `
+      SELECT c.id, c.customer_name, c.customer_phone, c.status,
+             c.last_message, c.last_message_at, c.unread_count,
+             COUNT(m.id) AS message_count
+      FROM conversations c
+      LEFT JOIN messages m ON m.conversation_id = c.id
+      WHERE c.business_id = $1
+    `;
+    const params = [req.params.id];
+    if (status) { params.push(status); sql += ` AND c.status = $${params.length}`; }
+    sql += ` GROUP BY c.id ORDER BY c.last_message_at DESC NULLS LAST
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+
+    const [convRows, countRow] = await Promise.all([
+      query(sql, params),
+      query(`SELECT COUNT(*) FROM conversations WHERE business_id = $1${status ? ` AND status = '${status}'` : ""}`, [req.params.id]),
+    ]);
+
+    res.json({ conversations: convRows.rows, total: parseInt(countRow.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load conversations" });
+  }
+});
+
+// ── Suspend / Activate ─────────────────────────────────────────
+router.patch("/businesses/:id/suspend", async (req, res) => {
+  try {
+    const { suspend, reason } = req.body;
+    await query(
+      "UPDATE businesses SET is_active = $1, updated_at = NOW() WHERE id = $2",
+      [!suspend, req.params.id]
+    );
+    await query(
+      "INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, details) VALUES ($1,$2,'business',$3,$4)",
+      [req.admin.id, suspend ? "suspend_business" : "activate_business", req.params.id, JSON.stringify({ reason })]
+    ).catch(() => {});
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update business status" });
+  }
+});
+
+// ── Audit Log ──────────────────────────────────────────────────
+router.get("/businesses/:id/audit", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT al.*, a.name AS admin_name
+      FROM admin_audit_logs al
+      JOIN admins a ON a.id = al.admin_id
+      WHERE al.target_id = $1
+      ORDER BY al.created_at DESC
+      LIMIT 30
+    `, [req.params.id]);
+    res.json({ logs: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load audit log" });
+  }
+});
+
+// ── Admin stats for dashboard ──────────────────────────────────
+router.get("/analytics/overview", async (req, res) => {
+  try {
+    const [bizRows, msgRows, leadRows, revenueRows] = await Promise.all([
+      query(`SELECT
+        COUNT(*) AS total_businesses,
+        COUNT(*) FILTER (WHERE is_active = TRUE) AS active_businesses,
+        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours') AS new_today
+        FROM businesses`),
+      query(`SELECT
+        COUNT(*) AS total_messages,
+        COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW())) AS messages_this_month
+        FROM messages`),
+      query(`SELECT COUNT(*) AS total_leads FROM leads WHERE created_at >= date_trunc('month', NOW())`),
+      query(`SELECT COALESCE(SUM(p.price_monthly), 0) AS monthly_revenue
+             FROM businesses b JOIN plans p ON p.id = b.plan_id WHERE b.is_active = TRUE`),
+    ]);
+
+    res.json({
+      total_businesses:     parseInt(bizRows.rows[0].total_businesses),
+      active_businesses:    parseInt(bizRows.rows[0].active_businesses),
+      new_today:            parseInt(bizRows.rows[0].new_today),
+      total_messages:       parseInt(msgRows.rows[0].total_messages),
+      messages_this_month:  parseInt(msgRows.rows[0].messages_this_month),
+      total_leads_month:    parseInt(leadRows.rows[0].total_leads),
+      monthly_revenue:      parseFloat(revenueRows.rows[0].monthly_revenue),
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load overview" });
+  }
+});
+
 export default router;

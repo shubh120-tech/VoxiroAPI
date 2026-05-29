@@ -6,35 +6,6 @@ import { adminAuthMiddleware } from "../middleware/auth.js";
 
 const router = express.Router();
 
-// ── ONE-TIME ADMIN SETUP (remove after first use) ─────────────
-// Visit: POST /api/admin/setup  with { secret: "yougant_setup_2026", password: "yourpassword" }
-router.post("/setup", async (req, res) => {
-  try {
-    const { secret, password, email = "admin@yougant.com", name = "Super Admin" } = req.body;
-
-    // Guard — only works with correct setup secret
-    if (secret !== "yougant_setup_2026") {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-    if (!password || password.length < 8) {
-      return res.status(400).json({ message: "Password must be at least 8 characters" });
-    }
-
-    const hash = await bcrypt.hash(password, 12);
-
-    await query(`
-      INSERT INTO admins (name, email, password_hash, role, is_active)
-      VALUES ($1, $2, $3, 'super_admin', TRUE)
-      ON CONFLICT (email) DO UPDATE
-      SET password_hash = $3, is_active = TRUE, name = $1
-    `, [name, email, hash]);
-
-    console.log(`✅ Admin setup: ${email}`);
-    res.json({ success: true, email, message: "Admin created. Delete this route now." });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
 router.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;

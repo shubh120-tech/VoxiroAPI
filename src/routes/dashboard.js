@@ -65,14 +65,32 @@ router.get("/leads", async (req, res) => {
   try {
     const { page = 1, limit = 20, status, search } = req.query;
     const offset = (page - 1) * limit;
-    let sql    = `SELECT * FROM leads WHERE business_id = $1`;
+
+    let sql = `
+      SELECT
+        l.*,
+        COALESCE(l.collected_details, c.collected_details, '{}') AS collected_details,
+        c.last_message_at AS last_active
+      FROM leads l
+      LEFT JOIN conversations c ON c.id = l.conversation_id
+      WHERE l.business_id = $1
+    `;
     const params = [req.user.business_id];
-    if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
-    if (search) { params.push(`%${search}%`); sql += ` AND (customer_name ILIKE $${params.length} OR phone ILIKE $${params.length})`; }
-    const countSql = sql.replace("SELECT *", "SELECT COUNT(*)");
-    sql += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+    if (status) { params.push(status); sql += ` AND l.status = $${params.length}`; }
+    if (search) {
+      params.push(`%${search}%`);
+      sql += ` AND (l.customer_name ILIKE $${params.length} OR l.phone ILIKE $${params.length} OR l.email ILIKE $${params.length})`;
+    }
+
+    const countSql = `SELECT COUNT(*) FROM leads l WHERE l.business_id = $1${status ? ` AND l.status = '${status}'` : ""}`;
+    sql += ` ORDER BY l.updated_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
-    const [data, count] = await Promise.all([query(sql, params), query(countSql, params.slice(0, -2))]);
+
+    const [data, count] = await Promise.all([
+      query(sql, params),
+      query(countSql, [req.user.business_id]),
+    ]);
     res.json({ leads: data.rows, total: parseInt(count.rows[0].count) });
   } catch (err) {
     res.status(500).json({ message: "Failed to load leads" });

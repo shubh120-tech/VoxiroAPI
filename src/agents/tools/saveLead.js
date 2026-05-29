@@ -59,19 +59,26 @@ export async function executeSaveLead({ businessId, conversationId, customerPhon
   const interest = interestParts.join(", ") || notes || "Research writing service";
 
   try {
-    // Save to leads table
+    // Save to leads table — upsert with all collected details
     const { rows } = await query(`
       INSERT INTO leads
-        (business_id, conversation_id, customer_name, phone, email, interest, notes, status)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'new')
+        (business_id, conversation_id, customer_name, phone, email,
+         interest, notes, collected_details, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'new')
       ON CONFLICT (business_id, phone) DO UPDATE
-      SET customer_name = COALESCE($3, leads.customer_name),
-          email         = COALESCE($5, leads.email),
-          interest      = $6,
-          notes         = COALESCE($7, leads.notes),
-          updated_at    = NOW()
+      SET customer_name     = COALESCE($3, leads.customer_name),
+          email             = COALESCE($5, leads.email),
+          interest          = $6,
+          notes             = COALESCE($7, leads.notes),
+          collected_details = COALESCE(leads.collected_details, '{}') || $8::jsonb,
+          updated_at        = NOW()
       RETURNING id
-    `, [businessId, conversationId, customer_name, phone, customer_email, interest, notes]);
+    `, [
+      businessId, conversationId,
+      customer_name, phone, customer_email,
+      interest, notes,
+      JSON.stringify(newDetails),
+    ]);
 
     // Store collected details in conversation for agent memory
     if (conversationId && Object.keys(newDetails).length > 0) {

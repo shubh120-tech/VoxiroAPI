@@ -127,7 +127,7 @@ REQUIRED SECTIONS IN THE PROMPT:
 Write the prompt in plain text, no markdown headers. Make it detailed (400-600 words). Use the actual business name and details throughout. Sound like it was written by a senior sales trainer for this specific business.`;
 
   const response = await anthropic.messages.create({
-    model:      "claude-sonnet-4-20250514",
+    model:      "claude-sonnet-4-6",
     max_tokens: 3000,
     messages:   [{ role: "user", content: metaPrompt }],
   });

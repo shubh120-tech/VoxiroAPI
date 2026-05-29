@@ -86,7 +86,7 @@ app.use("/api/auth",   authRouter);
 // Public routes FIRST — must not be intercepted by dashboardRouter auth
 app.use("/api",        teamRouter);        // invite routes
 app.use("/api",        shopifyOAuthRouter); // shopify OAuth callback
-
+app.use("/api/admin",  adminRouter);
 // Protected routes — require auth
 app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
@@ -96,7 +96,7 @@ app.use("/api",        storeRouter);
 app.use("/api",        trainingRouter);
 app.use("/api",        catalogRouter);
 app.use("/api",        shopifyOAuthRouter);
-app.use("/api/admin",  adminRouter);
+
 
 // ── 404 Handler ───────────────────────────────────────────────
 app.use((req, res) => {

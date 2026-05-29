@@ -16,6 +16,7 @@ router.post("/auth/login", async (req, res) => {
     if (!rows.length) return res.status(401).json({ message: "Invalid credentials" });
 
     const valid = await bcrypt.compare(password, rows[0].password_hash);
+    console.log(valid);
     if (!valid)  return res.status(401).json({ message: "Invalid credentials" });
 
     await query("UPDATE admins SET last_login_at = NOW() WHERE id = $1", [rows[0].id]);

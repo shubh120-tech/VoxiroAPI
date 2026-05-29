@@ -2,6 +2,7 @@ import express    from "express";
 import Anthropic  from "@anthropic-ai/sdk";
 import { query }  from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
+import { generateBusinessPrompt } from "../agents/generatePrompt.js";
 
 const router   = express.Router();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -20,6 +21,17 @@ router.get("/training/prompt", async (req, res) => {
     res.json({ prompt: rows[0]?.system_prompt || "", agentName: rows[0]?.agent_name || "Agent" });
   } catch (err) {
     res.status(500).json({ message: "Failed to load prompt" });
+  }
+});
+
+// ── Generate prompt from business data ────────────────────────
+router.post("/training/generate", async (req, res) => {
+  try {
+    const prompt = await generateBusinessPrompt(bId(req));
+    res.json({ success: true, prompt });
+  } catch (err) {
+    console.error("Prompt generate error:", err.message);
+    res.status(500).json({ message: err.message });
   }
 });
 

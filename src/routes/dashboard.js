@@ -9,11 +9,16 @@ router.use(authMiddleware);
 router.get("/analytics/home", async (req, res) => {
   try {
     const bId = req.user.business_id;
-    const [stats, agent, usage] = await Promise.all([
-      query(`SELECT * FROM today_stats WHERE business_id = $1`, [bId]),
-      query(`SELECT agent_name, is_active FROM agent_configs WHERE business_id = $1`, [bId]),
-      query(`SELECT s.messages_used, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1`, [bId]),
+    const [stats, agent] = await Promise.all([
+      query(`SELECT * FROM today_stats WHERE business_id = $1`, [bId]).catch(() => ({ rows: [] })),
+      query(`SELECT agent_name, is_active FROM agent_configs WHERE business_id = $1`, [bId]).catch(() => ({ rows: [] })),
     ]);
+    let messagesUsed = 0, messageLimit = 0;
+    try {
+      const usage = await query(`SELECT messages_used, message_limit FROM agent_configs WHERE business_id = $1`, [bId]);
+      messagesUsed = usage.rows[0]?.messages_used || 0;
+      messageLimit = usage.rows[0]?.message_limit || 0;
+    } catch { /* no usage data */ }
     res.json({
       messagesToday:      stats.rows[0]?.messages_today      || 0,
       leadsToday:         stats.rows[0]?.leads_today         || 0,
@@ -21,8 +26,8 @@ router.get("/analytics/home", async (req, res) => {
       appointmentsToday:  stats.rows[0]?.appointments_today  || 0,
       agentName:          agent.rows[0]?.agent_name          || "Aria",
       agentActive:        agent.rows[0]?.is_active           || false,
-      messagesUsed:       usage.rows[0]?.messages_used       || 0,
-      messageLimit:       usage.rows[0]?.message_limit       || 0,
+      messagesUsed,
+      messageLimit,
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load stats" });
@@ -31,11 +36,10 @@ router.get("/analytics/home", async (req, res) => {
 
 router.get("/analytics/usage", async (req, res) => {
   try {
-    const { rows } = await query(`
-      SELECT s.messages_used AS used, p.message_limit AS limit, s.billing_cycle_end
-      FROM subscriptions s JOIN plans p ON p.id = s.plan_id
-      WHERE s.business_id = $1
-    `, [req.user.business_id]);
+    const { rows } = await query(
+      `SELECT messages_used AS used, message_limit AS "limit" FROM agent_configs WHERE business_id = $1`,
+      [req.user.business_id]
+    ).catch(() => ({ rows: [] }));
     res.json(rows[0] || { used: 0, limit: 0 });
   } catch (err) {
     res.status(500).json({ message: "Failed to load usage" });
@@ -156,16 +160,15 @@ router.patch("/appointments/:id/status", async (req, res) => {
 // ── Agent ─────────────────────────────────────────────────────
 router.get("/agent/status", async (req, res) => {
   try {
-    const [agent, sub, convs] = await Promise.all([
-      query("SELECT agent_name, is_active FROM agent_configs WHERE business_id = $1", [req.user.business_id]),
-      query("SELECT s.messages_used, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [req.user.business_id]),
+    const [agent, convs] = await Promise.all([
+      query("SELECT agent_name, is_active, messages_used, message_limit FROM agent_configs WHERE business_id = $1", [req.user.business_id]).catch(() => ({ rows: [] })),
       query("SELECT COUNT(*) FROM conversations WHERE business_id = $1 AND status != 'closed'", [req.user.business_id]),
     ]);
     res.json({
-      agentName:           agent.rows[0]?.agent_name || "Aria",
-      active:              agent.rows[0]?.is_active   || false,
-      used:                sub.rows[0]?.messages_used || 0,
-      limit:               sub.rows[0]?.message_limit || 0,
+      agentName:           agent.rows[0]?.agent_name    || "Aria",
+      active:              agent.rows[0]?.is_active      || false,
+      used:                agent.rows[0]?.messages_used  || 0,
+      limit:               agent.rows[0]?.message_limit  || 0,
       activeConversations: parseInt(convs.rows[0]?.count) || 0,
       unreadCount:         0,
       notifCount:          0,
@@ -251,8 +254,14 @@ router.post("/agent/conversations/:id/takeover", async (req, res) => {
 
 router.post("/agent/conversations/:id/resume", async (req, res) => {
   try {
-    await query(`UPDATE conversations SET status = 'agent', updated_at = NOW() WHERE id = $1 AND business_id = $2`,
-      [req.params.id, req.user.business_id]);
+    await query(`
+      UPDATE conversations SET status = 'agent', updated_at = NOW()
+      WHERE id = $1 AND business_id = $2
+    `, [req.params.id, req.user.business_id]);
+    await query(`
+      UPDATE pending_messages SET processed = TRUE, processed_at = NOW()
+      WHERE conversation_id = $1 AND processed = FALSE
+    `, [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to resume agent" });
@@ -268,11 +277,13 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
     );
     if (!conv.length) return res.status(404).json({ message: "Conversation not found" });
 
-    // Save owner message
-    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3)`,
-      [req.params.id, req.user.business_id, message]);
+    const { rows: msgRows } = await query(
+      `INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3) RETURNING *`,
+      [req.params.id, req.user.business_id, message]
+    );
+    await query(`UPDATE conversations SET last_message = $1, last_message_at = NOW() WHERE id = $2`,
+      [message, req.params.id]);
 
-    // Send via WhatsApp
     const { rows: wc } = await query(
       "SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id = $1",
       [req.user.business_id]
@@ -286,8 +297,7 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
         message,
       });
     }
-
-    res.json({ success: true });
+    res.json({ success: true, message: msgRows[0] });
   } catch (err) {
     res.status(500).json({ message: "Failed to send message" });
   }
@@ -300,18 +310,17 @@ router.get("/settings", async (req, res) => {
 
     const [biz, agent, wc, notif] = await Promise.all([
       query("SELECT * FROM businesses WHERE id = $1", [bId]),
-      query("SELECT agent_name, tone, language, system_prompt, messages_used, message_limit FROM agent_configs WHERE business_id = $1", [bId]),
-      query("SELECT phone_number_id, whatsapp_number, is_verified, display_name, waba_id, status FROM whatsapp_configs WHERE business_id = $1", [bId]),
+      query("SELECT agent_name, tone, language, system_prompt, messages_used, message_limit FROM agent_configs WHERE business_id = $1", [bId]).catch(() => ({ rows: [] })),
+      query("SELECT phone_number_id, whatsapp_number, is_verified FROM whatsapp_configs WHERE business_id = $1", [bId]).catch(() => ({ rows: [] })),
       query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]).catch(() => ({ rows: [] })),
     ]);
 
-    // Billing — try subscriptions, fall back to plan from businesses
+    // Billing — graceful fallback chain
     let billing = {};
     try {
       const sub = await query(`
         SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit
-        FROM subscriptions s
-        JOIN plans p ON p.id = s.plan_id
+        FROM subscriptions s JOIN plans p ON p.id = s.plan_id
         WHERE s.business_id = $1
         ORDER BY s.created_at DESC LIMIT 1
       `, [bId]);
@@ -320,14 +329,11 @@ router.get("/settings", async (req, res) => {
       try {
         const plan = await query(`
           SELECT p.name AS plan_name, p.price_monthly, p.message_limit
-          FROM businesses b
-          JOIN plans p ON p.id = b.plan_id
+          FROM businesses b JOIN plans p ON p.id = b.plan_id
           WHERE b.id = $1
         `, [bId]);
         billing = plan.rows[0] || {};
-      } catch {
-        billing = {};
-      }
+      } catch { billing = {}; }
     }
 
     res.json({
@@ -338,7 +344,7 @@ router.get("/settings", async (req, res) => {
       billing,
     });
   } catch (err) {
-    console.error("Settings load error:", err.message);
+    console.error("Settings error:", err.message);
     res.status(500).json({ message: "Failed to load settings: " + err.message });
   }
 });
@@ -429,13 +435,48 @@ router.delete("/knowledge/:id", async (req, res) => {
   }
 });
 
-// ── Follow-ups ───────────────────────────────────────────────
+// ── Media Proxy ───────────────────────────────────────────────
+router.get("/media/:messageId", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT media_url, media_type, media_filename
+      FROM messages
+      WHERE id = $1 AND business_id = $2 AND media_url IS NOT NULL
+    `, [req.params.messageId, req.user.business_id]);
+
+    if (!rows.length) return res.status(404).json({ message: "Media not found" });
+
+    const { media_url } = rows[0];
+    if (media_url.startsWith("http")) {
+      if (media_url.includes("r2.cloudflarestorage.com")) {
+        const AWS = (await import("aws-sdk")).default;
+        const r2  = new AWS.S3({
+          endpoint:         `https://${process.env.CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+          accessKeyId:      process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
+          secretAccessKey:  process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
+          region:           "auto",
+          signatureVersion: "v4",
+        });
+        const urlObj   = new URL(media_url);
+        const key      = urlObj.pathname.slice(1).split("/").slice(1).join("/");
+        const bucket   = process.env.CLOUDFLARE_R2_BUCKET || "voxiro-knowledge";
+        const freshUrl = r2.getSignedUrl("getObject", { Bucket: bucket, Key: key, Expires: 3600 });
+        return res.redirect(freshUrl);
+      }
+      return res.redirect(media_url);
+    }
+    res.status(404).json({ message: "Invalid media URL" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load media" });
+  }
+});
+
+// ── Follow-ups ────────────────────────────────────────────────
 router.get("/followups", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT
-        f.*,
-        COALESCE(c.customer_name, f.customer_name) AS customer_name,
+      SELECT f.*,
+        COALESCE(c.customer_name, f.customer_name)   AS customer_name,
         COALESCE(c.customer_phone, f.customer_phone) AS customer_phone
       FROM follow_ups f
       LEFT JOIN conversations c ON c.id = f.conversation_id
@@ -445,7 +486,6 @@ router.get("/followups", async (req, res) => {
     `, [req.user.business_id]);
     res.json({ followups: rows });
   } catch (err) {
-    console.error("Followups error:", err.message);
     res.status(500).json({ message: "Failed to load follow-ups" });
   }
 });
@@ -460,6 +500,30 @@ router.patch("/followups/:id/cancel", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to cancel" });
+  }
+});
+
+// ── Contact Form (public) ─────────────────────────────────────
+router.post("/contact", async (req, res) => {
+  try {
+    const { name, email, phone, subject, message } = req.body;
+    if (!name || !email || !message)
+      return res.status(400).json({ message: "Name, email and message required" });
+
+    const apiKey = process.env.RESEND_API_KEY;
+    if (apiKey) {
+      const axios = (await import("axios")).default;
+      await axios.post("https://api.resend.com/emails", {
+        from:     `Yougant Contact <${process.env.FROM_EMAIL || "onboarding@resend.dev"}>`,
+        to:       ["care@yougant.com"],
+        subject:  `[Contact] ${subject || "New message"} — ${name}`,
+        html:     `<h2>New contact form submission</h2><p><strong>Name:</strong> ${name}</p><p><strong>Email:</strong> ${email}</p><p><strong>Phone:</strong> ${phone || "—"}</p><p><strong>Subject:</strong> ${subject || "—"}</p><hr><p><strong>Message:</strong></p><p>${message.split("\n").join("<br>")}</p>`,
+        reply_to: email,
+      }, { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" } });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to send message" });
   }
 });
 

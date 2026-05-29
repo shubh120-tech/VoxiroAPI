@@ -251,21 +251,8 @@ router.post("/agent/conversations/:id/takeover", async (req, res) => {
 
 router.post("/agent/conversations/:id/resume", async (req, res) => {
   try {
-    // Reset conversation to agent mode
-    await query(`
-      UPDATE conversations
-      SET status = 'agent', updated_at = NOW()
-      WHERE id = $1 AND business_id = $2
-    `, [req.params.id, req.user.business_id]);
-
-    // Clear any stuck pending messages for this conversation
-    // So agent picks up fresh when customer replies next
-    await query(`
-      UPDATE pending_messages
-      SET processed = TRUE, processed_at = NOW()
-      WHERE conversation_id = $1 AND processed = FALSE
-    `, [req.params.id]);
-
+    await query(`UPDATE conversations SET status = 'agent', updated_at = NOW() WHERE id = $1 AND business_id = $2`,
+      [req.params.id, req.user.business_id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to resume agent" });
@@ -281,15 +268,9 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
     );
     if (!conv.length) return res.status(404).json({ message: "Conversation not found" });
 
-    // Save owner message and return it
-    const { rows: msgRows } = await query(
-      `INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3) RETURNING *`,
-      [req.params.id, req.user.business_id, message]
-    );
-
-    // Update conversation last message
-    await query(`UPDATE conversations SET last_message = $1, last_message_at = NOW() WHERE id = $2`,
-      [message, req.params.id]);
+    // Save owner message
+    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'owner', $3)`,
+      [req.params.id, req.user.business_id, message]);
 
     // Send via WhatsApp
     const { rows: wc } = await query(
@@ -306,7 +287,7 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
       });
     }
 
-    res.json({ success: true, message: msgRows[0] });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to send message" });
   }
@@ -316,22 +297,49 @@ router.post("/agent/conversations/:id/send", async (req, res) => {
 router.get("/settings", async (req, res) => {
   try {
     const bId = req.user.business_id;
-    const [biz, agent, wc, notif, sub] = await Promise.all([
+
+    const [biz, agent, wc, notif] = await Promise.all([
       query("SELECT * FROM businesses WHERE id = $1", [bId]),
-      query("SELECT * FROM agent_configs WHERE business_id = $1", [bId]),
+      query("SELECT agent_name, tone, language, system_prompt, messages_used, message_limit FROM agent_configs WHERE business_id = $1", [bId]),
       query("SELECT phone_number_id, whatsapp_number, is_verified, display_name, waba_id, status FROM whatsapp_configs WHERE business_id = $1", [bId]),
-      query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]),
-      query("SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.business_id = $1", [bId]),
+      query("SELECT * FROM notification_settings WHERE business_id = $1", [bId]).catch(() => ({ rows: [] })),
     ]);
+
+    // Billing — try subscriptions, fall back to plan from businesses
+    let billing = {};
+    try {
+      const sub = await query(`
+        SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit
+        FROM subscriptions s
+        JOIN plans p ON p.id = s.plan_id
+        WHERE s.business_id = $1
+        ORDER BY s.created_at DESC LIMIT 1
+      `, [bId]);
+      billing = sub.rows[0] || {};
+    } catch {
+      try {
+        const plan = await query(`
+          SELECT p.name AS plan_name, p.price_monthly, p.message_limit
+          FROM businesses b
+          JOIN plans p ON p.id = b.plan_id
+          WHERE b.id = $1
+        `, [bId]);
+        billing = plan.rows[0] || {};
+      } catch {
+        billing = {};
+      }
+    }
+
     res.json({
       profile:       { ...biz.rows[0], ownerName: req.user.owner_name, email: req.user.email },
-      agent:         agent.rows[0]  || {},
-      whatsapp:      wc.rows[0]     || {},
-      notifications: notif.rows[0]  || {},
-      billing:       sub.rows[0]    || {},
+      agent:         agent.rows[0]   || {},
+      whatsapp:      wc.rows[0]      || {},
+      notifications: notif.rows[0]   || {},
+      billing,
     });
   } catch (err) {
-    res.status(500).json({ message: "Failed to load settings" });
+    console.error("Settings load error:", err.message);
+    res.status(500).json({ message: "Failed to load settings: " + err.message });
   }
 });
 
@@ -421,57 +429,6 @@ router.delete("/knowledge/:id", async (req, res) => {
   }
 });
 
-// ── Media Proxy — generate fresh signed URL ─────────────────
-router.get("/media/:messageId", async (req, res) => {
-  try {
-    const { rows } = await query(`
-      SELECT media_url, media_type, media_filename
-      FROM messages
-      WHERE id = $1 AND business_id = $2
-        AND media_url IS NOT NULL
-    `, [req.params.messageId, req.user.business_id]);
-
-    if (!rows.length) return res.status(404).json({ message: "Media not found" });
-
-    const { media_url, media_type, media_filename } = rows[0];
-
-    // If it's already a signed URL or external URL — redirect directly
-    if (media_url.startsWith("http")) {
-      // Generate fresh signed URL from R2 key
-      if (media_url.includes("r2.cloudflarestorage.com")) {
-        const AWS = (await import("aws-sdk")).default;
-        const r2  = new AWS.S3({
-          endpoint:         `https://${process.env.CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-          accessKeyId:      process.env.CLOUDFLARE_R2_ACCESS_KEY_ID,
-          secretAccessKey:  process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY,
-          region:           "auto",
-          signatureVersion: "v4",
-        });
-
-        // Extract key from URL
-        const urlObj = new URL(media_url);
-        const key    = urlObj.pathname.slice(1).split("/").slice(1).join("/"); // remove bucket name
-        const bucket = process.env.CLOUDFLARE_R2_BUCKET || "voxiro-knowledge";
-
-        const freshUrl = r2.getSignedUrl("getObject", {
-          Bucket:  bucket,
-          Key:     key,
-          Expires: 3600, // 1 hour
-        });
-
-        return res.redirect(freshUrl);
-      }
-
-      return res.redirect(media_url);
-    }
-
-    res.status(404).json({ message: "Invalid media URL" });
-  } catch (err) {
-    console.error("Media proxy error:", err.message);
-    res.status(500).json({ message: "Failed to load media" });
-  }
-});
-
 // ── Follow-ups ───────────────────────────────────────────────
 router.get("/followups", async (req, res) => {
   try {
@@ -503,45 +460,6 @@ router.patch("/followups/:id/cancel", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to cancel" });
-  }
-});
-
-router.post("/contact", async (req, res) => {
-  try {
-    const { name, email, phone, subject, message } = req.body;
-    if (!name || !email || !message) {
-      return res.status(400).json({ message: "Name, email and message required" });
-    }
- 
-    // Send email via Resend
-    const apiKey = process.env.RESEND_API_KEY;
-    if (apiKey) {
-      const axios = (await import("axios")).default;
-      await axios.post("https://api.resend.com/emails", {
-        from:    `Yougant Contact <${process.env.FROM_EMAIL || "onboarding@resend.dev"}>`,
-        to:      ["care@yougant.in"],
-        subject: `[Contact] ${subject || "New message"} — ${name}`,
-        html: `
-          <h2>New contact form submission</h2>
-          <p><strong>Name:</strong> ${name}</p>
-          <p><strong>Email:</strong> ${email}</p>
-          <p><strong>Phone:</strong> ${phone || "—"}</p>
-          <p><strong>Subject:</strong> ${subject || "—"}</p>
-          <hr>
-          <p><strong>Message:</strong></p>
-          <p>${message.split("\n").join("<br>")}</p>
-        `,
-        reply_to: email,
-      }, {
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      });
-    }
- 
-    console.log(`📩 Contact form: ${name} <${email}> — ${subject}`);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("Contact form error:", err.message);
-    res.status(500).json({ message: "Failed to send message" });
   }
 });
 

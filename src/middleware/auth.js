@@ -48,8 +48,13 @@ export async function adminAuthMiddleware(req, res, next) {
       return res.status(401).json({ message: "No token provided" });
     }
 
+    const secret = process.env.ADMIN_JWT_SECRET;
+    if (!secret) {
+      return res.status(500).json({ message: "ADMIN_JWT_SECRET not configured" });
+    }
+
     const token   = header.split(" ")[1];
-    const decoded = jwt.verify(token, process.env.ADMIN_JWT_SECRET);
+    const decoded = jwt.verify(token, secret);
 
     const { rows } = await query(
       "SELECT id, name, email, role FROM admins WHERE id = $1 AND is_active = TRUE",

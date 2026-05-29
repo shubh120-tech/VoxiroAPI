@@ -27,6 +27,10 @@ router.get("/training/prompt", async (req, res) => {
 // ── Generate prompt from business data ────────────────────────
 router.post("/training/generate", async (req, res) => {
   try {
+    // Set longer timeout for this route
+    req.setTimeout(60000);
+    res.setTimeout(60000);
+
     const prompt = await generateBusinessPrompt(bId(req));
     res.json({ success: true, prompt });
   } catch (err) {

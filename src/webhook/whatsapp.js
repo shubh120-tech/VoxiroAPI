@@ -31,11 +31,17 @@ router.post("/", async (req, res) => {
   try {
     // Verify webhook signature
     if (!verifySignature(req)) {
-      console.warn("⚠️  Invalid webhook signature");
+      console.warn("⚠️  Invalid webhook signature — dropping message");
       return;
     }
 
-    const body = req.body;
+    // Parse body — it comes as Buffer from express.raw()
+    const body = Buffer.isBuffer(req.body)
+      ? JSON.parse(req.body.toString("utf8"))
+      : req.body;
+
+    console.log("📨 Webhook received:", JSON.stringify(body).slice(0, 200));
+
     if (body.object !== "whatsapp_business_account") return;
 
     for (const entry of body.entry || []) {
@@ -75,7 +81,10 @@ router.post("/", async (req, res) => {
           ORDER BY wc.updated_at DESC LIMIT 1
         `, [phoneNumberId]);
 
-        if (!bizRows.length) continue;
+        if (!bizRows.length) {
+          console.warn(`⚠️  No business found for phone_number_id: ${phoneNumberId}`);
+          continue;
+        }
         const { business_id, access_token } = bizRows[0];
 
         for (const msg of messages) {
@@ -251,7 +260,40 @@ async function checkMessageLimit(businessId) {
  * Verify Meta webhook signature.
  */
 function verifySignature(req) {
-  return true;
+  const signature = req.headers["x-hub-signature-256"];
+
+  // If no secret configured — skip verification (dev mode)
+  if (!process.env.META_APP_SECRET) {
+    console.warn("⚠️  META_APP_SECRET not set — skipping signature verification");
+    return true;
+  }
+
+  if (!signature) {
+    console.warn("⚠️  No x-hub-signature-256 header");
+    return false;
+  }
+
+  try {
+    // req.body is a Buffer when express.raw() is used
+    const rawBody = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(JSON.stringify(req.body));
+
+    const expected = "sha256=" + crypto
+      .createHmac("sha256", process.env.META_APP_SECRET)
+      .update(rawBody)
+      .digest("hex");
+
+    const sigBuffer      = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+
+    if (sigBuffer.length !== expectedBuffer.length) return false;
+
+    return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
+  } catch (err) {
+    console.error("Signature verification error:", err.message);
+    return false;
+  }
 }
 
 // ── Process Media / Document Message ────────────────────────

@@ -664,30 +664,70 @@ router.delete("/account", async (req, res) => {
     const businessId = req.user.business_id;
     const userId     = req.user.id;
 
-    // Soft delete — mark as deleted, hard delete after 30 days via cron
+    console.log(`🗑️ Account deletion started: business ${businessId}`);
+
+    // ── Delete all business data ──────────────────────────
+    const tables = [
+      "messages",
+      "conversations",
+      "leads",
+      "orders",
+      "appointments",
+      "follow_ups",
+      "pending_messages",
+      "knowledge_docs",
+      "agent_configs",
+      "whatsapp_configs",
+      "notification_settings",
+      "activity_logs",
+      "business_services",
+      "business_faqs",
+      "business_payment_methods",
+      "business_company_details",
+      "broadcast_contacts",
+      "broadcast_lists",
+      "broadcast_campaigns",
+      "broadcast_templates",
+      "products",
+      "website_crawls",
+      "prompt_history",
+      "oauth_states",
+    ];
+
+    for (const table of tables) {
+      await query(
+        `DELETE FROM ${table} WHERE business_id = $1`,
+        [businessId]
+      ).catch(err => {
+        // Skip if table doesn't exist or no business_id column
+        console.warn(`Skip delete from ${table}: ${err.message}`);
+      });
+    }
+
+    // ── Delete team members ───────────────────────────────
     await query(
-      "UPDATE businesses SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
-      [businessId]
-    );
+      "DELETE FROM users WHERE business_id = $1 AND id != $2",
+      [businessId, userId]
+    ).catch(() => {});
+
+    // ── Deactivate the owner user ─────────────────────────
     await query(
       "UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
       [userId]
-    );
-
-    // Immediately revoke WhatsApp token
-    await query(
-      "UPDATE whatsapp_configs SET access_token = NULL, is_verified = FALSE WHERE business_id = $1",
-      [businessId]
     ).catch(() => {});
 
-    // Deactivate agent
-    await query(
-      "UPDATE agent_configs SET is_active = FALSE WHERE business_id = $1",
-      [businessId]
-    ).catch(() => {});
+    // ── Mark business as deleted (keep row per your requirement) ─
+    await query(`
+      UPDATE businesses
+      SET is_active    = FALSE,
+          name         = CONCAT('[DELETED] ', name),
+          updated_at   = NOW()
+      WHERE id = $1
+    `, [businessId]);
 
-    console.log(`🗑️ Account deletion requested: business ${businessId}`);
-    res.json({ success: true, message: "Account scheduled for deletion within 30 days" });
+    console.log(`✅ Account deleted: business ${businessId}`);
+    res.json({ success: true });
+
   } catch (err) {
     console.error("Account deletion error:", err.message);
     res.status(500).json({ message: "Failed to delete account: " + err.message });

@@ -503,18 +503,38 @@ router.put("/settings/profile", async (req, res) => {
 router.put("/settings/whatsapp", async (req, res) => {
   try {
     const { phoneNumberId, accessToken, webhookSecret } = req.body;
-    await query(`
-      INSERT INTO whatsapp_configs (business_id, phone_number_id, access_token, webhook_secret)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (business_id) DO UPDATE
-      SET phone_number_id = $2,
-          access_token    = CASE WHEN $3 != '' THEN $3 ELSE access_token END,
-          webhook_secret  = CASE WHEN $4 != '' THEN $4 ELSE webhook_secret END,
-          updated_at      = NOW()
-    `, [req.user.business_id, phoneNumberId, accessToken, webhookSecret]);
+
+    if (!phoneNumberId?.trim()) {
+      return res.status(400).json({ message: "Phone Number ID is required" });
+    }
+
+    // Check if row exists first
+    const { rows: existing } = await query(
+      "SELECT id FROM whatsapp_configs WHERE business_id = $1",
+      [req.user.business_id]
+    );
+
+    if (existing.length > 0) {
+      await query(`
+        UPDATE whatsapp_configs
+        SET phone_number_id = $1,
+            access_token    = CASE WHEN $2::text IS NOT NULL AND $2::text != '' THEN $2 ELSE access_token END,
+            webhook_secret  = CASE WHEN $3::text IS NOT NULL AND $3::text != '' THEN $3 ELSE webhook_secret END,
+            updated_at      = NOW()
+        WHERE business_id = $4
+      `, [phoneNumberId.trim(), accessToken || null, webhookSecret || null, req.user.business_id]);
+    } else {
+      await query(`
+        INSERT INTO whatsapp_configs
+          (business_id, phone_number_id, access_token, webhook_secret, is_verified)
+        VALUES ($1, $2, $3, $4, FALSE)
+      `, [req.user.business_id, phoneNumberId.trim(), accessToken || null, webhookSecret || null]);
+    }
+
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ message: "Failed to update WhatsApp config" });
+    console.error("WhatsApp config error:", err.message, err.stack);
+    res.status(500).json({ message: "Failed to update WhatsApp config: " + err.message });
   }
 });
 

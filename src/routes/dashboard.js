@@ -476,15 +476,27 @@ router.get("/settings", async (req, res) => {
 router.put("/settings/profile", async (req, res) => {
   try {
     const { businessName, ownerName, phone, address, website } = req.body;
+
+    if (!businessName?.trim()) {
+      return res.status(400).json({ message: "Business name is required" });
+    }
+
     await Promise.all([
-      query("UPDATE businesses SET name = $1, phone = $2, address = $3, website = $4 WHERE id = $5",
-        [businessName, phone, address, website, req.user.business_id]),
-      query("UPDATE users SET owner_name = $1 WHERE id = $2",
-        [ownerName, req.user.id]),
+      query(`UPDATE businesses
+             SET name = $1, phone = $2, address = $3, website = $4, updated_at = NOW()
+             WHERE id = $5`,
+        [businessName.trim(), phone || null, address || null, website || null, req.user.business_id]),
+
+      ownerName
+        ? query("UPDATE users SET owner_name = $1, updated_at = NOW() WHERE id = $2",
+            [ownerName.trim(), req.user.id])
+        : Promise.resolve(),
     ]);
+
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ message: "Failed to update profile" });
+    console.error("Profile update error:", err.message, err.stack);
+    res.status(500).json({ message: "Failed to update profile: " + err.message });
   }
 });
 

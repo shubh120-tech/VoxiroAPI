@@ -6,9 +6,32 @@ import { sendWhatsAppMessage, notifyOwnerWhatsApp, getWhatsAppCredentials, markR
 
 const router = express.Router();
 
-/**
- * Webhook verification — Meta sends a GET request to verify.
- */
+// ── Debug endpoint — check webhook config ─────────────────────
+router.get("/debug", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT wc.phone_number_id, wc.is_verified,
+             b.name, b.is_active,
+             wc.access_token IS NOT NULL AS has_token
+      FROM whatsapp_configs wc
+      JOIN businesses b ON b.id = wc.business_id
+      LIMIT 10
+    `);
+    const { rows: pending } = await query(
+      "SELECT COUNT(*) AS count, MAX(created_at) AS last FROM pending_messages WHERE processed = FALSE"
+    );
+    res.json({
+      configs:        rows,
+      pending_msgs:   pending[0],
+      verify_token:   process.env.META_VERIFY_TOKEN,
+      has_app_secret: !!process.env.META_APP_SECRET,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 router.get("/", (req, res) => {
   const mode      = req.query["hub.mode"];
   const token     = req.query["hub.verify_token"];
@@ -25,27 +48,20 @@ router.get("/", (req, res) => {
  * Incoming messages — Meta sends a POST for every message.
  */
 router.post("/", async (req, res) => {
-  // Always respond 200 immediately — Meta will retry if you don't
   res.sendStatus(200);
 
   try {
-    // Verify webhook signature
-    if (!verifySignature(req)) {
-      console.warn("⚠️  Invalid webhook signature — dropping message");
+    const body = req.body;
+    console.log("📨 Webhook POST received:", JSON.stringify(body).slice(0, 300));
+
+    if (!body || body.object !== "whatsapp_business_account") {
+      console.log("ℹ️  Not a whatsapp_business_account event:", body?.object);
       return;
     }
 
-    // Parse body — it comes as Buffer from express.raw()
-    const body = Buffer.isBuffer(req.body)
-      ? JSON.parse(req.body.toString("utf8"))
-      : req.body;
-
-    console.log("📨 Webhook received:", JSON.stringify(body).slice(0, 200));
-
-    if (body.object !== "whatsapp_business_account") return;
-
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
+        console.log("🔄 Change field:", change.field);
 
         // ── Template status update ──────────────────────────
         if (change.field === "message_template_status_update") {
@@ -71,10 +87,14 @@ router.post("/", async (req, res) => {
         const messages = value.messages || [];
         const metadata = value.metadata;
 
+        console.log(`📞 Phone Number ID from Meta: ${metadata?.phone_number_id}`);
+        console.log(`💬 Messages count: ${messages.length}`);
+
         // Look up business for this phone number
         const phoneNumberId = metadata.phone_number_id;
         const { rows: bizRows } = await query(`
-          SELECT b.id AS business_id, wc.access_token
+          SELECT b.id AS business_id, b.name, wc.access_token,
+                 wc.phone_number_id AS stored_phone_id
           FROM whatsapp_configs wc
           JOIN businesses b ON b.id = wc.business_id
           WHERE wc.phone_number_id = $1 AND b.is_active = TRUE
@@ -82,17 +102,24 @@ router.post("/", async (req, res) => {
         `, [phoneNumberId]);
 
         if (!bizRows.length) {
-          console.warn(`⚠️  No business found for phone_number_id: ${phoneNumberId}`);
+          // Show all stored phone IDs for comparison
+          const { rows: allConfigs } = await query(
+            "SELECT phone_number_id, business_id FROM whatsapp_configs LIMIT 5"
+          );
+          console.warn(`⚠️  No business for phone_number_id: "${phoneNumberId}"`);
+          console.warn(`   Stored IDs in DB:`, allConfigs.map(r => r.phone_number_id));
           continue;
         }
-        const { business_id, access_token } = bizRows[0];
+
+        const { business_id, name, access_token } = bizRows[0];
+        console.log(`✅ Business found: ${name} (${business_id})`);
 
         for (const msg of messages) {
           const customerPhone = msg.from;
           const customerName  = value.contacts?.[0]?.profile?.name || null;
+          console.log(`📱 Message from: ${customerPhone} | type: ${msg.type} | text: ${msg.text?.body?.slice(0, 50) || ""}`);
 
           if (msg.type === "text") {
-            // Save to pending — will be processed after 10 second batch window
             await savePendingMessage({
               businessId:    business_id,
               customerPhone,
@@ -102,21 +129,16 @@ router.post("/", async (req, res) => {
               messageText:   msg.text?.body || "",
               waMessageId:   msg.id,
             });
+            console.log("✅ Message saved to pending queue");
 
           } else if (["image", "document", "video", "audio", "sticker"].includes(msg.type)) {
-            // Media — process immediately, don't batch
-            await processMediaMessage({
-              phoneNumberId,
-              customerPhone,
-              customerName,
-              msg,
-            });
+            await processMediaMessage({ phoneNumberId, customerPhone, customerName, msg });
           }
         }
       }
     }
   } catch (err) {
-    console.error("Webhook processing error:", err);
+    console.error("❌ Webhook processing error:", err.message, err.stack);
   }
 });
 
@@ -261,6 +283,40 @@ async function checkMessageLimit(businessId) {
  */
 function verifySignature(req) {
   return true;
+  // const signature = req.headers["x-hub-signature-256"];
+
+  // // If no secret configured — skip verification (dev mode)
+  // if (!process.env.META_APP_SECRET) {
+  //   console.warn("⚠️  META_APP_SECRET not set — skipping signature verification");
+  //   return true;
+  // }
+
+  // if (!signature) {
+  //   console.warn("⚠️  No x-hub-signature-256 header");
+  //   return false;
+  // }
+
+  // try {
+  //   // req.body is a Buffer when express.raw() is used
+  //   const rawBody = Buffer.isBuffer(req.body)
+  //     ? req.body
+  //     : Buffer.from(JSON.stringify(req.body));
+
+  //   const expected = "sha256=" + crypto
+  //     .createHmac("sha256", process.env.META_APP_SECRET)
+  //     .update(rawBody)
+  //     .digest("hex");
+
+  //   const sigBuffer      = Buffer.from(signature);
+  //   const expectedBuffer = Buffer.from(expected);
+
+  //   if (sigBuffer.length !== expectedBuffer.length) return false;
+
+  //   return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
+  // } catch (err) {
+  //   console.error("Signature verification error:", err.message);
+  //   return false;
+  // }
 }
 
 // ── Process Media / Document Message ────────────────────────

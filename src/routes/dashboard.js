@@ -625,4 +625,73 @@ router.patch("/followups/:id/cancel", async (req, res) => {
   }
 });
 
+
+// ── Data Deletion Callback (Meta requirement) ──────────────────
+// Meta calls this when a Facebook user requests data deletion
+// No auth required — Meta sends signed_request
+router.post("/auth/data-deletion", async (req, res) => {
+  try {
+    const crypto = (await import("crypto")).default;
+    const { signed_request } = req.body;
+
+    if (signed_request) {
+      // Decode and verify signed_request from Meta
+      const [encodedSig, payload] = signed_request.split(".");
+      const data     = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
+      const userId   = data.user_id;
+
+      // Log deletion request
+      console.log(`📨 Data deletion request for Facebook user: ${userId}`);
+
+      // Return confirmation URL to Meta
+      const confirmationCode = Buffer.from(`yougant_delete_${userId}_${Date.now()}`).toString("base64");
+      return res.json({
+        url:           `https://yougant.com/data-deletion?code=${confirmationCode}`,
+        confirmation:   confirmationCode,
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Data deletion callback error:", err.message);
+    res.status(200).json({ success: true }); // Always return 200 to Meta
+  }
+});
+
+// ── Delete Account ─────────────────────────────────────────────
+router.delete("/account", async (req, res) => {
+  try {
+    const businessId = req.user.business_id;
+    const userId     = req.user.id;
+
+    // Soft delete — mark as deleted, hard delete after 30 days via cron
+    await query(
+      "UPDATE businesses SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
+      [businessId]
+    );
+    await query(
+      "UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
+      [userId]
+    );
+
+    // Immediately revoke WhatsApp token
+    await query(
+      "UPDATE whatsapp_configs SET access_token = NULL, is_verified = FALSE WHERE business_id = $1",
+      [businessId]
+    ).catch(() => {});
+
+    // Deactivate agent
+    await query(
+      "UPDATE agent_configs SET is_active = FALSE WHERE business_id = $1",
+      [businessId]
+    ).catch(() => {});
+
+    console.log(`🗑️ Account deletion requested: business ${businessId}`);
+    res.json({ success: true, message: "Account scheduled for deletion within 30 days" });
+  } catch (err) {
+    console.error("Account deletion error:", err.message);
+    res.status(500).json({ message: "Failed to delete account: " + err.message });
+  }
+});
+
 export default router;

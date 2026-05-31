@@ -145,8 +145,13 @@ router.get("/store/shopify/callback", async (req, res) => {
         }
       );
     } catch (tokenErr) {
-      console.error("Token exchange failed:", tokenErr.response?.status, tokenErr.response?.data);
-      return res.redirect(`${FRONTEND_URL}/integrations?error=token_failed&detail=${tokenErr.response?.status}`);
+      console.error("❌ Token exchange failed:");
+      console.error("   Status:", tokenErr.response?.status);
+      console.error("   Body:", JSON.stringify(tokenErr.response?.data));
+      console.error("   Client ID used:", SHOPIFY_CLIENT_ID);
+      console.error("   Shop:", shop);
+      console.error("   Code:", code?.slice(0, 10) + "...");
+      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=token_failed`);
     }
 
     const accessToken = tokenRes.data?.access_token;

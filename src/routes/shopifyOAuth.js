@@ -11,7 +11,7 @@ const SHOPIFY_CLIENT_ID     = process.env.SHOPIFY_CLIENT_ID     || "";
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || "";
 const API_URL               = process.env.API_URL               || "https://voxiroapi-production.up.railway.app";
 const FRONTEND_URL          = (process.env.FRONTEND_URL         || "").replace(/\/$/, "");
-const SCOPES                = "read_products,write_products,read_orders,write_orders,read_customers,write_customers,read_inventory";
+const SCOPES                = "read_products,write_products,read_orders,write_orders,read_inventory";
 
 // ── State management ──────────────────────────────────────────
 const stateMap = new Map();

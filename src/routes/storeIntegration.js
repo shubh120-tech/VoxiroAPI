@@ -211,7 +211,7 @@ router.put("/store/products/:id", async (req, res) => {
 
 export async function syncShopifyProducts(integrationId, businessId, storeUrl, apiKey, apiSecret, accessToken) {
   let totalSynced = 0;
-  const API_VERSION = "2025-01";
+  const API_VERSION = "2026-04";
 
   console.log(`🔄 Syncing Shopify products for ${storeUrl}...`);
 

@@ -89,7 +89,7 @@ router.post("/store/shopify/install", authMiddleware, async (req, res) => {
       console.log("🔗 Direct token connect:", shopDomain);
       try {
         const { data } = await axios.get(
-          `https://${shopDomain}/admin/api/2025-01/shop.json`,
+          `https://${shopDomain}/admin/api/2026-04/shop.json`,
           { headers: { "X-Shopify-Access-Token": accessToken.trim() } }
         );
         const s = data?.shop;
@@ -212,7 +212,7 @@ router.get("/store/shopify/callback", async (req, res) => {
     let currency  = "INR";
     try {
       const { data: shopData } = await axios.get(
-        `https://${shop}/admin/api/2025-01/shop.json`,
+        `https://${shop}/admin/api/2026-04/shop.json`,
         { headers: { "X-Shopify-Access-Token": accessToken }, timeout: 8000 }
       );
       const s   = shopData?.shop;
@@ -313,7 +313,7 @@ async function registerWebhooks(shop, accessToken, integrationId, businessId) {
   for (const topic of topics) {
     try {
       await axios.post(
-        `https://${shop}/admin/api/2025-01/webhooks.json`,
+        `https://${shop}/admin/api/2026-04/webhooks.json`,
         { webhook: { topic, address: webhookUrl, format: "json" } },
         { headers: { "X-Shopify-Access-Token": accessToken } }
       );
@@ -321,5 +321,43 @@ async function registerWebhooks(shop, accessToken, integrationId, businessId) {
   }
   console.log(`✅ Webhooks registered for ${shop}`);
 }
+
+
+// ── Check token scopes ────────────────────────────────────────
+router.get("/store/shopify/check-scopes", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT store_url, access_token, status, error_message FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "No Shopify integration found" });
+
+    const { store_url, access_token, status, error_message } = rows[0];
+
+    const scopeRes = await axios.get(
+      `https://${store_url}/admin/oauth/access_scopes.json`,
+      { headers: { "X-Shopify-Access-Token": access_token } }
+    );
+    const scopes = scopeRes.data?.access_scopes?.map(s => s.handle) || [];
+
+    res.json({
+      store_url,
+      status,
+      error_message,
+      token_preview:      access_token?.slice(0, 12) + "...",
+      token_length:       access_token?.length,
+      scopes,
+      has_read_products:  scopes.includes("read_products"),
+      has_read_orders:    scopes.includes("read_orders"),
+      has_read_customers: scopes.includes("read_customers"),
+    });
+  } catch (err) {
+    res.status(500).json({
+      error:   err.response?.data || err.message,
+      status:  err.response?.status,
+      message: "Could not check scopes — token may be invalid",
+    });
+  }
+});
 
 export default router;

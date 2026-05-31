@@ -48,9 +48,19 @@ async function deleteOAuthState(state) {
 
 const oauthStatesMemory = new Map(); // fallback
 
-// ══════════════════════════════════════════════════════════════
-//  STEP 1 — Start OAuth (protected — owner must be logged in)
-// ══════════════════════════════════════════════════════════════
+// ── Debug credentials (remove after fixing) ──────────────────
+router.get("/store/shopify/debug-creds", async (req, res) => {
+  res.json({
+    client_id:           SHOPIFY_CLIENT_ID,
+    client_secret_first6: SHOPIFY_CLIENT_SECRET?.slice(0, 6) + "...",
+    client_secret_last4:  "..." + SHOPIFY_CLIENT_SECRET?.slice(-4),
+    client_secret_length: SHOPIFY_CLIENT_SECRET?.length,
+    api_url:              API_URL,
+    frontend_url:         FRONTEND_URL,
+  });
+});
+
+
 
 router.post("/store/shopify/install", authMiddleware, async (req, res) => {
   try {

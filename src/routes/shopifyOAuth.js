@@ -523,4 +523,58 @@ router.post("/store/shopify/gdpr/shop-redact", async (req, res) => {
   }
 });
 
+
+// ── Register GDPR compliance webhooks ────────────────────────
+router.post("/store/shopify/register-gdpr", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT store_url, access_token FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "No Shopify store connected" });
+
+    const { store_url, access_token } = rows[0];
+    const BASE = `${API_URL}/api/store/shopify/gdpr`;
+    
+    const webhooks = [
+      { topic: "CUSTOMERS_DATA_REQUEST", callbackUrl: `${BASE}/customers-data-request` },
+      { topic: "CUSTOMERS_REDACT",       callbackUrl: `${BASE}/customers-redact`        },
+      { topic: "SHOP_REDACT",            callbackUrl: `${BASE}/shop-redact`             },
+    ];
+
+    const results = [];
+    for (const wh of webhooks) {
+      try {
+        const r = await axios.post(
+          `https://${store_url}/admin/api/2026-04/graphql.json`,
+          {
+            query: `mutation {
+              webhookSubscriptionCreate(
+                topic: ${wh.topic}
+                webhookSubscription: {
+                  callbackUrl: "${wh.callbackUrl}"
+                  format: JSON
+                }
+              ) {
+                webhookSubscription { id }
+                userErrors { field message }
+              }
+            }`
+          },
+          { headers: { "X-Shopify-Access-Token": access_token, "Content-Type": "application/json" } }
+        );
+        results.push({ topic: wh.topic, result: r.data });
+        console.log(`✅ GDPR webhook registered: ${wh.topic}`);
+      } catch (err) {
+        results.push({ topic: wh.topic, error: err.response?.data || err.message });
+        console.error(`❌ GDPR webhook failed: ${wh.topic}`, err.response?.data);
+      }
+    }
+
+    res.json({ success: true, results });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 export default router;

@@ -89,7 +89,7 @@ router.post("/store/shopify/install", authMiddleware, async (req, res) => {
       console.log("🔗 Direct token connect:", shopDomain);
       try {
         const { data } = await axios.get(
-          `https://${shopDomain}/admin/api/2024-01/shop.json`,
+          `https://${shopDomain}/admin/api/2025-01/shop.json`,
           { headers: { "X-Shopify-Access-Token": accessToken.trim() } }
         );
         const s = data?.shop;
@@ -204,13 +204,25 @@ router.get("/store/shopify/callback", async (req, res) => {
     if (!accessToken) {
       return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=no_token`);
     }
+    console.log("✅ Got access token — saving integration...");
 
-    // Get shop info
-    const { data: shopData } = await axios.get(
-      `https://${shop}/admin/api/2024-01/shop.json`,
-      { headers: { "X-Shopify-Access-Token": accessToken } }
-    );
-    const s = shopData?.shop;
+    // Get shop info — optional, don't fail if 403
+    let shopName  = shop.replace(".myshopify.com", "");
+    let shopEmail = "";
+    let currency  = "INR";
+    try {
+      const { data: shopData } = await axios.get(
+        `https://${shop}/admin/api/2025-01/shop.json`,
+        { headers: { "X-Shopify-Access-Token": accessToken }, timeout: 8000 }
+      );
+      const s   = shopData?.shop;
+      shopName  = s?.name  || shopName;
+      shopEmail = s?.email || "";
+      currency  = s?.currency || "INR";
+      console.log("✅ Shop info fetched:", shopName);
+    } catch (err) {
+      console.warn("⚠️  Could not fetch shop info (non-fatal):", err.response?.status, "— using defaults");
+    }
 
     // Save integration
     const { rows } = await query(`
@@ -222,9 +234,9 @@ router.get("/store/shopify/callback", async (req, res) => {
           store_name=$4, store_email=$5, currency=$6,
           error_message=NULL, updated_at=NOW()
       RETURNING id
-    `, [businessId, shop, accessToken, s?.name || shop, s?.email || "", s?.currency || "INR"]);
+    `, [businessId, shop, accessToken, shopName, shopEmail, currency]);
 
-    console.log("✅ Shopify connected:", s?.name, "→ syncing products...");
+    console.log("✅ Shopify connected:", shopName, "→ syncing products...");
 
     // Sync products async
     syncShopifyProducts(rows[0].id, businessId, shop, null, null, accessToken)
@@ -234,7 +246,7 @@ router.get("/store/shopify/callback", async (req, res) => {
     registerWebhooks(shop, accessToken, rows[0].id, businessId)
       .catch(e => console.error("Webhook reg error:", e.message));
 
-    res.redirect(`${FRONTEND_URL}/dashboard/integrations?success=shopify_connected&shop=${encodeURIComponent(s?.name || shop)}`);
+    res.redirect(`${FRONTEND_URL}/dashboard/integrations?success=shopify_connected&shop=${encodeURIComponent(shopName)}`);
 
   } catch (err) {
     console.error("❌ Shopify callback error:", err.message);
@@ -301,7 +313,7 @@ async function registerWebhooks(shop, accessToken, integrationId, businessId) {
   for (const topic of topics) {
     try {
       await axios.post(
-        `https://${shop}/admin/api/2024-01/webhooks.json`,
+        `https://${shop}/admin/api/2025-01/webhooks.json`,
         { webhook: { topic, address: webhookUrl, format: "json" } },
         { headers: { "X-Shopify-Access-Token": accessToken } }
       );

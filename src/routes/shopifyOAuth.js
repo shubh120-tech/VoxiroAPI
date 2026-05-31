@@ -401,4 +401,126 @@ router.get("/store/shopify/test-token", authMiddleware, async (req, res) => {
   }
 });
 
+
+// ══════════════════════════════════════════════════════════════
+// GDPR MANDATORY WEBHOOKS (required for Shopify App Store)
+// ══════════════════════════════════════════════════════════════
+
+// Verify Shopify HMAC for GDPR webhooks
+function verifyShopifyWebhook(req) {
+  const hmac    = req.headers["x-shopify-hmac-sha256"];
+  const body    = req.rawBody || JSON.stringify(req.body);
+  if (!hmac || !SHOPIFY_CLIENT_SECRET) return false;
+  const digest  = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+    .update(body).digest("base64");
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac));
+}
+
+// ── 1. Customer data request ───────────────────────────────────
+// Shopify calls this when a customer requests their data
+router.post("/store/shopify/gdpr/customers-data-request", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const { shop_domain, customer } = req.body;
+    console.log(`📋 GDPR data request: customer ${customer?.id} from ${shop_domain}`);
+
+    // Find business by shop domain
+    const { rows } = await query(
+      "SELECT business_id FROM store_integrations WHERE store_url = $1 AND platform = 'shopify'",
+      [shop_domain]
+    );
+    if (!rows.length) return;
+
+    const businessId = rows[0].business_id;
+
+    // Log the request — in production you'd email this to the customer
+    await query(`
+      INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, details)
+      SELECT id, 'gdpr_data_request', 'customer', $1, $2
+      FROM admins LIMIT 1
+    `, [
+      customer?.id?.toString() || "unknown",
+      JSON.stringify({ shop_domain, customer_email: customer?.email, requested_at: new Date() })
+    ]).catch(() => {});
+
+    console.log(`✅ GDPR data request logged for customer ${customer?.email}`);
+  } catch (err) {
+    console.error("GDPR data request error:", err.message);
+  }
+});
+
+// ── 2. Customer redact ─────────────────────────────────────────
+// Shopify calls this 10 days after a customer requests deletion
+router.post("/store/shopify/gdpr/customers-redact", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const { shop_domain, customer } = req.body;
+    console.log(`🗑️ GDPR customer redact: ${customer?.email} from ${shop_domain}`);
+
+    const { rows } = await query(
+      "SELECT business_id FROM store_integrations WHERE store_url = $1 AND platform = 'shopify'",
+      [shop_domain]
+    );
+    if (!rows.length) return;
+
+    const businessId = rows[0].business_id;
+    const phone      = customer?.phone;
+    const email      = customer?.email;
+
+    // Remove customer data from leads
+    if (phone || email) {
+      await query(`
+        UPDATE leads
+        SET customer_name = '[Deleted]',
+            phone         = '[Deleted]',
+            email         = '[Deleted]',
+            collected_details = '{}',
+            updated_at    = NOW()
+        WHERE business_id = $1
+          AND (phone = $2 OR email = $3)
+      `, [businessId, phone || "", email || ""]).catch(() => {});
+
+      // Anonymise conversation data
+      await query(`
+        UPDATE conversations
+        SET customer_name  = '[Deleted]',
+            customer_phone = '[Deleted]',
+            updated_at     = NOW()
+        WHERE business_id = $1
+          AND (customer_phone = $2)
+      `, [businessId, phone || ""]).catch(() => {});
+    }
+
+    console.log(`✅ GDPR customer redact complete: ${email}`);
+  } catch (err) {
+    console.error("GDPR customer redact error:", err.message);
+  }
+});
+
+// ── 3. Shop redact ─────────────────────────────────────────────
+// Shopify calls this 48 hours after a shop uninstalls your app
+router.post("/store/shopify/gdpr/shop-redact", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const { shop_domain } = req.body;
+    console.log(`🗑️ GDPR shop redact: ${shop_domain}`);
+
+    const { rows } = await query(
+      "SELECT id, business_id FROM store_integrations WHERE store_url = $1 AND platform = 'shopify'",
+      [shop_domain]
+    );
+    if (!rows.length) return;
+
+    const { id: integrationId } = rows[0];
+
+    // Delete all store data
+    await query("DELETE FROM store_products WHERE integration_id = $1", [integrationId]).catch(() => {});
+    await query("DELETE FROM store_integrations WHERE id = $1",         [integrationId]).catch(() => {});
+
+    console.log(`✅ GDPR shop redact complete: ${shop_domain}`);
+  } catch (err) {
+    console.error("GDPR shop redact error:", err.message);
+  }
+});
+
 export default router;

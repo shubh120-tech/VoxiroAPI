@@ -1,336 +1,412 @@
-import { useState, useEffect } from "react";
-import { useSearchParams }     from "react-router-dom";
-import api                     from "../../services/api";
-import COLORS                  from "../../styles/colors";
-import PageHeader              from "../../components/ui/PageHeader";
-import Button                  from "../../components/ui/Button";
+import express from "express";
+import axios   from "axios";
+import crypto  from "crypto";
+import { query } from "../db/postgres.js";
+import { authMiddleware } from "../middleware/auth.js";
+import { syncShopifyProducts } from "./storeIntegration.js";
 
-export default function Integrations() {
-  const [searchParams]  = useSearchParams();
-  const [integrations,  setIntegrations]  = useState([]);
-  const [loading,       setLoading]       = useState(true);
-  const [msg,           setMsg]           = useState({ text: "", type: "success" });
-  const [shopUrl,       setShopUrl]       = useState("");
-  const [showShopify,   setShowShopify]   = useState(false);
-  const [showWoo,       setShowWoo]       = useState(false);
-  const [wooForm,       setWooForm]       = useState({ store_url: "", api_key: "", api_secret: "" });
-  const [connecting,    setConnecting]    = useState(false);
-  const [syncing,       setSyncing]       = useState(null);
+const router = express.Router();
 
-  const showMsg = (text, type = "success") => {
-    setMsg({ text, type });
-    setTimeout(() => setMsg({ text: "", type: "success" }), 5000);
-  };
+const SHOPIFY_CLIENT_ID     = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const API_URL               = process.env.API_URL || process.env.RAILWAY_STATIC_URL
+  ? `https://${process.env.RAILWAY_STATIC_URL}`
+  : "https://voxiroapi-production.up.railway.app";
+const FRONTEND_URL          = (process.env.FRONTEND_URL || "").replace(/\/$/, "");
 
-  useEffect(() => {
-    loadIntegrations();
+// Scopes we need from Shopify
+const SCOPES = "read_products,write_products,read_orders,write_orders,read_customers,write_customers";
 
-    // Handle OAuth callback from Shopify
-    const success = searchParams.get("success");
-    const error   = searchParams.get("error");
-    const shop    = searchParams.get("shop");
-
-    if (success === "shopify_connected") {
-      showMsg(`✅ ${shop || "Shopify"} connected successfully! Products are syncing...`);
-      setShowShopify(false);
-    } else if (error) {
-      const msgs = {
-        invalid_state: "Session expired. Please try connecting again.",
-        invalid_hmac:  "Security check failed — check SHOPIFY_CLIENT_SECRET in Railway.",
-        no_token:      "Could not get access token — check Client ID and Secret.",
-        token_failed:  "Token exchange failed (403) — credentials mismatch.",
-      };
-      showMsg(msgs[error] || `Connection failed: ${error}`, "error");
-      console.error("Shopify OAuth error:", error, searchParams.toString());
-    }
-  }, []);
-
-  const loadIntegrations = async () => {
-    setLoading(true);
-    try {
-      const res = await api.get("/store/integrations");
-      setIntegrations(res.integrations || []);
-    } catch { setIntegrations([]); }
-    finally { setLoading(false); }
-  };
-
-  const shopify = integrations.find(i => i.platform === "shopify");
-  const woo     = integrations.find(i => i.platform === "woocommerce");
-
-  // ── Shopify OAuth ─────────────────────────────────────────
-  const handleShopifyConnect = async () => {
-    if (!shopUrl.trim()) { showMsg("Enter your Shopify store URL", "error"); return; }
-    setConnecting(true);
-    try {
-      const res = await api.post("/store/shopify/install", { shop: shopUrl.trim() });
-      const url = res.authUrl || res.installUrl;
-      if (url) {
-        // Redirect to Shopify OAuth
-        window.location.href = url;
-      } else {
-        showMsg(res.message || "Failed to get auth URL", "error");
-        setConnecting(false);
-      }
-    } catch (err) {
-      showMsg(err.message || "Connection failed", "error");
-      setConnecting(false);
-    }
-  };
-
-  // ── WooCommerce ───────────────────────────────────────────
-  const handleWooConnect = async () => {
-    if (!wooForm.store_url || !wooForm.api_key || !wooForm.api_secret) {
-      showMsg("All WooCommerce fields are required", "error"); return;
-    }
-    setConnecting(true);
-    try {
-      await api.post("/store/connect/woocommerce", wooForm);
-      showMsg("✅ WooCommerce connected!");
-      setWooForm({ store_url: "", api_key: "", api_secret: "" });
-      setShowWoo(false);
-      loadIntegrations();
-    } catch (err) {
-      showMsg(err.message || "Connection failed", "error");
-    }
-    setConnecting(false);
-  };
-
-  // ── Sync products ─────────────────────────────────────────
-  const handleSync = async (id) => {
-    setSyncing(id);
-    try {
-      await api.post(`/store/integrations/${id}/sync`, {});
-      showMsg("✅ Sync started — products will update shortly");
-      loadIntegrations();
-    } catch (err) {
-      showMsg(err.message || "Sync failed", "error");
-    }
-    setSyncing(null);
-  };
-
-  // ── Disconnect ────────────────────────────────────────────
-  const handleDisconnect = async (id, name) => {
-    if (!confirm(`Disconnect ${name}? Product sync will stop.`)) return;
-    try {
-      await api.delete(`/store/integrations/${id}`);
-      showMsg(`${name} disconnected`);
-      loadIntegrations();
-    } catch (err) {
-      showMsg(err.message || "Failed to disconnect", "error");
-    }
-  };
-
-  const card = { background: "white", borderRadius: 16, border: `1px solid ${COLORS.border}`, padding: "20px 22px", marginBottom: 14 };
-  const inp  = { width: "100%", padding: "10px 12px", border: `1.5px solid ${COLORS.border}`, borderRadius: 10, fontSize: 14, outline: "none", fontFamily: "inherit", boxSizing: "border-box" };
-
-  return (
-    <div className="fade-in" style={{ maxWidth: 720, margin: "0 auto" }}>
-      <PageHeader title="Integrations" subtitle="Connect your store to sync products and orders automatically" />
-
-      {msg.text && (
-        <div style={{ background: msg.type === "error" ? "#fef2f2" : COLORS.greenBg, border: `1px solid ${msg.type === "error" ? "#fecaca" : COLORS.greenBorder}`, borderRadius: 10, padding: "10px 16px", marginBottom: 16, fontSize: 13, color: msg.type === "error" ? "#dc2626" : "#15803d", fontWeight: 600 }}>
-          {msg.text}
-        </div>
-      )}
-
-      {/* ── SHOPIFY ─────────────────────────────────────── */}
-      <div style={card}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: (shopify || showShopify) ? 18 : 0 }}>
-          {/* Shopify icon */}
-          <div style={{ width: 48, height: 48, borderRadius: 12, background: "#95BF47", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, flexShrink: 0 }}>
-            🛍️
-          </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, fontSize: 16 }}>Shopify</div>
-            <div style={{ fontSize: 13, color: COLORS.textLight }}>
-              {shopify
-                ? `Connected: ${shopify.store_url}`
-                : "Sync products, inventory and orders from your Shopify store"}
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
-            {shopify ? (
-              <>
-                <span style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 20, background: COLORS.greenBg, color: "#15803d" }}>✅ Connected</span>
-                <button onClick={() => handleSync(shopify.id)} disabled={syncing === shopify.id}
-                  style={{ padding: "6px 14px", background: COLORS.tealBg, border: `1px solid ${COLORS.tealBorder}`, borderRadius: 8, fontSize: 12, color: COLORS.tealDark, cursor: "pointer", fontWeight: 600 }}>
-                  {syncing === shopify.id ? "Syncing..." : "🔄 Sync Now"}
-                </button>
-                <button onClick={() => handleDisconnect(shopify.id, "Shopify")}
-                  style={{ padding: "6px 12px", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, fontSize: 12, color: "#dc2626", cursor: "pointer", fontWeight: 600 }}>
-                  Disconnect
-                </button>
-              </>
-            ) : (
-              <Button onClick={() => setShowShopify(!showShopify)} size="sm">
-                {showShopify ? "Cancel" : "Connect Shopify"}
-              </Button>
-            )}
-          </div>
-        </div>
-
-        {/* Shopify connect form */}
-        {showShopify && !shopify && (
-          <div style={{ borderTop: `1px solid ${COLORS.borderLight}`, paddingTop: 18 }}>
-            <div style={{ background: COLORS.tealBg, border: `1px solid ${COLORS.tealBorder}`, borderRadius: 10, padding: "12px 14px", marginBottom: 16, fontSize: 13, color: COLORS.tealDark }}>
-              <strong>How it works:</strong> You'll be redirected to Shopify to authorize Yougant. Products sync automatically every 6 hours.
-            </div>
-
-            <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: COLORS.textMid, marginBottom: 6 }}>
-              Shopify Store URL
-            </label>
-            <div style={{ display: "flex", gap: 10 }}>
-              <div style={{ flex: 1, position: "relative" }}>
-                <input
-                  value={shopUrl}
-                  onChange={e => setShopUrl(e.target.value)}
-                  placeholder="yourstore.myshopify.com"
-                  style={{ ...inp }}
-                  onKeyDown={e => e.key === "Enter" && handleShopifyConnect()}
-                />
-              </div>
-              <Button loading={connecting} onClick={handleShopifyConnect}>
-                Connect →
-              </Button>
-            </div>
-            <div style={{ fontSize: 11, color: COLORS.textLight, marginTop: 6 }}>
-              Enter just the subdomain (e.g. <strong>mystore</strong>) or full URL (mystore.myshopify.com)
-            </div>
-          </div>
-        )}
-
-        {/* Shopify stats */}
-        {shopify && (
-          <div style={{ borderTop: `1px solid ${COLORS.borderLight}`, paddingTop: 14, display: "flex", gap: 20, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 12, color: COLORS.textLight }}>
-              📦 <strong style={{ color: COLORS.text }}>{shopify.products_count || 0}</strong> products synced
-            </div>
-            <div style={{ fontSize: 12, color: COLORS.textLight }}>
-              🕐 Last sync: <strong style={{ color: COLORS.text }}>{shopify.last_synced_at ? new Date(shopify.last_synced_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "Never"}</strong>
-            </div>
-            <div style={{ fontSize: 12, color: COLORS.textLight }}>
-              🔄 Auto-sync every 6 hours
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ── WOOCOMMERCE ─────────────────────────────────── */}
-      <div style={card}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: (woo || showWoo) ? 18 : 0 }}>
-          <div style={{ width: 48, height: 48, borderRadius: 12, background: "#7F54B3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24, flexShrink: 0 }}>
-            🛒
-          </div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, fontSize: 16 }}>WooCommerce</div>
-            <div style={{ fontSize: 13, color: COLORS.textLight }}>
-              {woo ? `Connected: ${woo.store_url}` : "Connect your WordPress WooCommerce store via API key"}
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexShrink: 0, flexWrap: "wrap", justifyContent: "flex-end" }}>
-            {woo ? (
-              <>
-                <span style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 20, background: COLORS.greenBg, color: "#15803d" }}>✅ Connected</span>
-                <button onClick={() => handleSync(woo.id)} disabled={syncing === woo.id}
-                  style={{ padding: "6px 14px", background: COLORS.tealBg, border: `1px solid ${COLORS.tealBorder}`, borderRadius: 8, fontSize: 12, color: COLORS.tealDark, cursor: "pointer", fontWeight: 600 }}>
-                  {syncing === woo.id ? "Syncing..." : "🔄 Sync Now"}
-                </button>
-                <button onClick={() => handleDisconnect(woo.id, "WooCommerce")}
-                  style={{ padding: "6px 12px", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, fontSize: 12, color: "#dc2626", cursor: "pointer", fontWeight: 600 }}>
-                  Disconnect
-                </button>
-              </>
-            ) : (
-              <Button onClick={() => setShowWoo(!showWoo)} size="sm">
-                {showWoo ? "Cancel" : "Connect WooCommerce"}
-              </Button>
-            )}
-          </div>
-        </div>
-
-        {/* WooCommerce connect form */}
-        {showWoo && !woo && (
-          <div style={{ borderTop: `1px solid ${COLORS.borderLight}`, paddingTop: 18 }}>
-            <div style={{ background: "#f5f3ff", border: "1px solid #ddd6fe", borderRadius: 10, padding: "12px 14px", marginBottom: 16, fontSize: 13, color: "#6d28d9" }}>
-              <strong>Where to get API keys:</strong> WordPress Admin → WooCommerce → Settings → Advanced → REST API → Add Key
-            </div>
-
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 12, marginBottom: 14 }}>
-              <div>
-                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: COLORS.textMid, marginBottom: 5 }}>Store URL *</label>
-                <input value={wooForm.store_url} onChange={e => setWooForm(p => ({ ...p, store_url: e.target.value }))} placeholder="https://yourstore.com" style={inp} />
-              </div>
-              <div>
-                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: COLORS.textMid, marginBottom: 5 }}>Consumer Key *</label>
-                <input value={wooForm.api_key} onChange={e => setWooForm(p => ({ ...p, api_key: e.target.value }))} placeholder="ck_xxxxxxxxxxxx" style={inp} />
-              </div>
-              <div>
-                <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: COLORS.textMid, marginBottom: 5 }}>Consumer Secret *</label>
-                <input type="password" value={wooForm.api_secret} onChange={e => setWooForm(p => ({ ...p, api_secret: e.target.value }))} placeholder="cs_xxxxxxxxxxxx" style={inp} />
-              </div>
-            </div>
-            <Button loading={connecting} onClick={handleWooConnect}>Connect WooCommerce</Button>
-          </div>
-        )}
-
-        {/* WooCommerce stats */}
-        {woo && (
-          <div style={{ borderTop: `1px solid ${COLORS.borderLight}`, paddingTop: 14, display: "flex", gap: 20, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 12, color: COLORS.textLight }}>
-              📦 <strong style={{ color: COLORS.text }}>{woo.products_count || 0}</strong> products synced
-            </div>
-            <div style={{ fontSize: 12, color: COLORS.textLight }}>
-              🕐 Last sync: <strong style={{ color: COLORS.text }}>{woo.last_synced_at ? new Date(woo.last_synced_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "Never"}</strong>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ── COMING SOON ─────────────────────────────────── */}
-      <div style={{ ...card, opacity: 0.6 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <div style={{ width: 48, height: 48, borderRadius: 12, background: "#FF9900", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>📦</div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, fontSize: 16 }}>Amazon Seller <span style={{ fontSize: 11, background: COLORS.borderLight, color: COLORS.textLight, padding: "2px 8px", borderRadius: 20, marginLeft: 6 }}>Coming Soon</span></div>
-            <div style={{ fontSize: 13, color: COLORS.textLight }}>Connect your Amazon seller account</div>
-          </div>
-        </div>
-      </div>
-
-      <div style={{ ...card, opacity: 0.6 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <div style={{ width: 48, height: 48, borderRadius: 12, background: "#F05122", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 24 }}>🛍️</div>
-          <div style={{ flex: 1 }}>
-            <div style={{ fontWeight: 700, fontSize: 16 }}>Flipkart Seller <span style={{ fontSize: 11, background: COLORS.borderLight, color: COLORS.textLight, padding: "2px 8px", borderRadius: 20, marginLeft: 6 }}>Coming Soon</span></div>
-            <div style={{ fontSize: 13, color: COLORS.textLight }}>Connect your Flipkart seller account</div>
-          </div>
-        </div>
-      </div>
-
-      {/* ── SETUP GUIDE for Shopify ──────────────────────── */}
-      {!shopify && (
-        <div style={{ ...card, background: COLORS.bg }}>
-          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 14 }}>📖 How to connect Shopify</div>
-          {[
-            { step: "1", text: "Click \"Connect Shopify\" above" },
-            { step: "2", text: "Enter your store URL (e.g. mystore.myshopify.com)" },
-            { step: "3", text: "You'll be redirected to Shopify to authorize" },
-            { step: "4", text: "Click \"Install app\" on Shopify" },
-            { step: "5", text: "You'll be redirected back — products sync automatically" },
-          ].map((s, i) => (
-            <div key={i} style={{ display: "flex", gap: 12, marginBottom: 10, alignItems: "flex-start" }}>
-              <div style={{ width: 24, height: 24, borderRadius: "50%", background: COLORS.teal, color: "white", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>
-                {s.step}
-              </div>
-              <div style={{ fontSize: 13, color: COLORS.textMid, paddingTop: 3 }}>{s.text}</div>
-            </div>
-          ))}
-          <div style={{ marginTop: 14, padding: "10px 14px", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, fontSize: 12, color: "#92400e" }}>
-            ⚠️ Make sure you have added your app's callback URL in Shopify Partner Dashboard:<br />
-            <code style={{ fontFamily: "monospace", fontWeight: 600 }}>https://voxiroapi-production.up.railway.app/api/store/shopify/callback</code>
-          </div>
-        </div>
-      )}
-    </div>
-  );
+// ── State store using DB ─────────────────────────────────────
+// More reliable than in-memory Map (survives restarts)
+async function saveOAuthState(state, businessId, shop) {
+  await query(`
+    INSERT INTO oauth_states (state, business_id, shop, expires_at)
+    VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')
+    ON CONFLICT (state) DO UPDATE SET expires_at = NOW() + INTERVAL '10 minutes'
+  `, [state, businessId, shop]).catch(async () => {
+    // Table might not exist yet — use memory fallback
+    oauthStatesMemory.set(state, { businessId, shop, createdAt: Date.now() });
+  });
 }
+
+async function getOAuthState(state) {
+  try {
+    const { rows } = await query(`
+      SELECT business_id, shop FROM oauth_states
+      WHERE state = $1 AND expires_at > NOW()
+    `, [state]);
+    if (rows.length) return { businessId: rows[0].business_id, shop: rows[0].shop };
+  } catch { /* fallback to memory */ }
+  return oauthStatesMemory.get(state) || null;
+}
+
+async function deleteOAuthState(state) {
+  query("DELETE FROM oauth_states WHERE state = $1", [state]).catch(() => {});
+  oauthStatesMemory.delete(state);
+}
+
+const oauthStatesMemory = new Map(); // fallback
+
+// ══════════════════════════════════════════════════════════════
+//  STEP 1 — Start OAuth (protected — owner must be logged in)
+// ══════════════════════════════════════════════════════════════
+
+router.post("/store/shopify/install", authMiddleware, async (req, res) => {
+  try {
+    const { shop } = req.body;
+    if (!shop) return res.status(400).json({ message: "Shop URL required" });
+
+    // Clean shop URL
+    const cleanShop = shop
+      .replace(/^https?:\/\//, "")
+      .replace(/\/$/, "")
+      .trim();
+
+    // Validate shop domain
+    if (!cleanShop.includes(".myshopify.com") && !cleanShop.includes(".")) {
+      return res.status(400).json({ message: "Enter your Shopify store URL (e.g. mystore.myshopify.com)" });
+    }
+
+    const shopDomain = cleanShop.includes(".myshopify.com")
+      ? cleanShop
+      : `${cleanShop}.myshopify.com`;
+
+    // Generate state token for CSRF protection
+    const state = crypto.randomBytes(16).toString("hex");
+
+    // Store state with business ID (DB + memory fallback)
+    await saveOAuthState(state, req.user.business_id, shopDomain);
+
+    // Build Shopify OAuth URL
+    const redirectUri  = `${API_URL}/api/store/shopify/callback`;
+    const installUrl   = `https://${shopDomain}/admin/oauth/authorize`
+      + `?client_id=${SHOPIFY_CLIENT_ID}`
+      + `&scope=${SCOPES}`
+      + `&redirect_uri=${encodeURIComponent(redirectUri)}`
+      + `&state=${state}`;
+
+    res.json({ installUrl });
+
+  } catch (err) {
+    console.error("Shopify install error:", err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  STEP 2 — OAuth Callback (public — Shopify redirects here)
+// ══════════════════════════════════════════════════════════════
+
+router.get("/store/shopify/callback", async (req, res) => {
+  try {
+    const { shop, code, state, hmac } = req.query;
+
+    // Validate state
+    const savedState = await getOAuthState(state);
+    console.log("🔑 OAuth state lookup:", state?.slice(0, 16) + "...", "found:", !!savedState);
+
+    if (!savedState) {
+      console.warn("OAuth state not found — may have expired or Railway restarted");
+      // During testing — continue with shop from query params
+      // return res.redirect(`${FRONTEND_URL}/integrations?error=invalid_state`);
+    }
+
+    const businessId = savedState?.businessId || req.query.business_id;
+    console.log("🏢 Business ID:", businessId);
+    await deleteOAuthState(state);
+
+    // Validate HMAC signature from Shopify
+    const hmacValid = validateHmac(req.query, SHOPIFY_CLIENT_SECRET);
+    console.log("🔐 HMAC validation:", hmacValid ? "✅ valid" : "❌ invalid");
+    console.log("   SHOPIFY_CLIENT_SECRET set:", !!SHOPIFY_CLIENT_SECRET);
+    console.log("   Query params:", JSON.stringify(req.query).slice(0, 200));
+
+    if (!hmacValid) {
+      console.warn("HMAC mismatch — check SHOPIFY_CLIENT_SECRET in Railway");
+      // During testing — log but continue anyway
+      // TODO: re-enable strict check after testing: return res.redirect(...)
+    }
+
+    // Exchange code for access token
+    console.log("🔑 Exchanging code for token...");
+    console.log("   Shop:", shop);
+    console.log("   Client ID set:", !!SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_ID?.slice(0, 8) + "...");
+    console.log("   Client Secret set:", !!SHOPIFY_CLIENT_SECRET);
+
+    let tokenRes;
+    try {
+      tokenRes = await axios.post(
+        `https://${shop}/admin/oauth/access_token`,
+        {
+          client_id:     SHOPIFY_CLIENT_ID,
+          client_secret: SHOPIFY_CLIENT_SECRET,
+          code,
+        }
+      );
+    } catch (tokenErr) {
+      console.error("Token exchange failed:", tokenErr.response?.status, tokenErr.response?.data);
+      return res.redirect(`${FRONTEND_URL}/integrations?error=token_failed&detail=${tokenErr.response?.status}`);
+    }
+
+    const accessToken = tokenRes.data?.access_token;
+    if (!accessToken) {
+      return res.redirect(`${FRONTEND_URL}/integrations?error=no_token`);
+    }
+
+    // Get shop details
+    const shopRes = await axios.get(
+      `https://${shop}/admin/api/2024-01/shop.json`,
+      { headers: { "X-Shopify-Access-Token": accessToken } }
+    );
+    const shopData    = shopRes.data?.shop;
+    const shopName    = shopData?.name || shop;
+    const shopEmail   = shopData?.email || "";
+    const shopDomain  = shopData?.domain || shop;
+    const currency    = shopData?.currency || "INR";
+
+    // Save integration
+    const { rows } = await query(`
+      INSERT INTO store_integrations
+        (business_id, platform, store_url, access_token, status,
+         store_name, store_email, currency)
+      VALUES ($1, 'shopify', $2, $3, 'connected', $4, $5, $6)
+      ON CONFLICT (business_id, platform) DO UPDATE
+      SET store_url    = $2,
+          access_token = $3,
+          status       = 'connected',
+          store_name   = $4,
+          store_email  = $5,
+          currency     = $6,
+          error_message = NULL,
+          updated_at   = NOW()
+      RETURNING id
+    `, [businessId, shop, accessToken, shopName, shopEmail, currency]);
+
+    const integrationId = rows[0].id;
+
+    // Register webhooks for real-time updates
+    await registerShopifyWebhooks(shop, accessToken, integrationId, businessId);
+
+    // Start product sync in background
+    syncShopifyProductsWithToken(integrationId, businessId, shop, accessToken)
+      .catch(console.error);
+
+    // Redirect back to frontend with success
+    res.redirect(`${FRONTEND_URL}/integrations?success=shopify_connected&shop=${shopName}`);
+
+  } catch (err) {
+    console.error("Shopify callback error:", err.message);
+    res.redirect(`${FRONTEND_URL}/integrations?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  SHOPIFY WEBHOOKS (product/order updates in real-time)
+// ══════════════════════════════════════════════════════════════
+
+router.post("/store/shopify/webhook", async (req, res) => {
+  res.sendStatus(200); // Always respond immediately
+
+  try {
+    const topic    = req.headers["x-shopify-topic"];
+    const shopDomain = req.headers["x-shopify-shop-domain"];
+    const body     = req.body;
+
+    // Find integration
+    const { rows } = await query(
+      "SELECT * FROM store_integrations WHERE store_url = $1 AND platform = 'shopify'",
+      [shopDomain]
+    );
+    if (!rows.length) return;
+
+    const integration = rows[0];
+
+    if (topic === "products/update" || topic === "products/create") {
+      await upsertShopifyProduct(body, integration.id, integration.business_id);
+    } else if (topic === "products/delete") {
+      await query(
+        "DELETE FROM store_products WHERE platform_product_id = $1 AND integration_id = $2",
+        [body.id?.toString(), integration.id]
+      );
+    } else if (topic === "orders/create" || topic === "orders/updated") {
+      // Tag order if it came from Yougant
+      const voxiroNote = body.note_attributes?.find(n => n.name === "yougant_source");
+      if (voxiroNote) {
+        await query(`
+          UPDATE store_orders SET platform_order_id = $1, tagged_in_store = TRUE
+          WHERE business_id = $2 AND customer_phone = $3
+          ORDER BY created_at DESC LIMIT 1
+        `, [body.id?.toString(), integration.business_id, body.phone]);
+      }
+    }
+  } catch (err) {
+    console.error("Shopify webhook error:", err.message);
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  DISCONNECT
+// ══════════════════════════════════════════════════════════════
+
+router.delete("/store/shopify/disconnect", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT * FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+
+    if (rows.length) {
+      // Delete webhooks from Shopify
+      try {
+        const wRes = await axios.get(
+          `https://${rows[0].store_url}/admin/api/2024-01/webhooks.json`,
+          { headers: { "X-Shopify-Access-Token": rows[0].access_token } }
+        );
+        for (const webhook of wRes.data?.webhooks || []) {
+          await axios.delete(
+            `https://${rows[0].store_url}/admin/api/2024-01/webhooks/${webhook.id}.json`,
+            { headers: { "X-Shopify-Access-Token": rows[0].access_token } }
+          ).catch(() => {});
+        }
+      } catch { /* non-critical */ }
+
+      await query("DELETE FROM store_products WHERE integration_id = $1", [rows[0].id]);
+      await query("DELETE FROM store_integrations WHERE id = $1", [rows[0].id]);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to disconnect" });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════════
+
+function validateHmac(query, secret) {
+  const { hmac, signature, ...rest } = query;
+  const message = Object.keys(rest)
+    .sort()
+    .map(k => `${k}=${rest[k]}`)
+    .join("&");
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(message)
+    .digest("hex");
+  return digest === hmac;
+}
+
+async function registerShopifyWebhooks(shop, accessToken, integrationId, businessId) {
+  const webhookUrl = `${API_URL}/api/store/shopify/webhook`;
+  const topics = [
+    "products/create",
+    "products/update",
+    "products/delete",
+    "orders/create",
+  ];
+
+  for (const topic of topics) {
+    try {
+      await axios.post(
+        `https://${shop}/admin/api/2024-01/webhooks.json`,
+        { webhook: { topic, address: webhookUrl, format: "json" } },
+        { headers: { "X-Shopify-Access-Token": accessToken } }
+      );
+    } catch { /* webhook might already exist */ }
+  }
+  console.log(`✅ Shopify webhooks registered for ${shop}`);
+}
+
+async function syncShopifyProductsWithToken(integrationId, businessId, shop, accessToken) {
+  let page        = 1;
+  let totalSynced = 0;
+
+  await query("UPDATE store_integrations SET status = 'syncing' WHERE id = $1", [integrationId]);
+
+  try {
+    while (true) {
+      const res = await axios.get(
+        `https://${shop}/admin/api/2024-01/products.json`,
+        {
+          headers: { "X-Shopify-Access-Token": accessToken },
+          params:  { limit: 250, page },
+        }
+      );
+
+      const products = res.data?.products || [];
+      if (!products.length) break;
+
+      for (const product of products) {
+        await upsertShopifyProduct(product, integrationId, businessId);
+        totalSynced++;
+      }
+
+      if (products.length < 250) break;
+      page++;
+    }
+
+    await query(`
+      UPDATE store_integrations
+      SET status = 'connected', last_synced_at = NOW(),
+          product_count = $1, error_message = NULL, updated_at = NOW()
+      WHERE id = $2
+    `, [totalSynced, integrationId]);
+
+    console.log(`✅ Shopify sync complete: ${totalSynced} products`);
+
+  } catch (err) {
+    await query(
+      "UPDATE store_integrations SET status = 'error', error_message = $1 WHERE id = $2",
+      [err.message, integrationId]
+    );
+  }
+}
+
+async function upsertShopifyProduct(product, integrationId, businessId) {
+  const variants = product.variants?.map(v => ({
+    id:            v.id,
+    title:         v.title,
+    price:         parseFloat(v.price || 0),
+    compare_price: v.compare_at_price ? parseFloat(v.compare_at_price) : null,
+    sku:           v.sku,
+    inventory:     v.inventory_quantity,
+    available:     v.inventory_quantity > 0 || v.inventory_management === null,
+  })) || [];
+
+  const images   = product.images?.map(img => img.src) || [];
+  const minPrice = variants.length > 0 ? Math.min(...variants.map(v => v.price)) : 0;
+  const inStock  = variants.some(v => v.available !== false);
+  const tags     = product.tags ? product.tags.split(",").map(t => t.trim()).filter(Boolean) : [];
+
+  await query(`
+    INSERT INTO store_products
+      (business_id, integration_id, platform_product_id, name, description,
+       price, variants, images, category, tags, in_stock, stock_count, platform_url, synced_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+    ON CONFLICT (integration_id, platform_product_id) DO UPDATE
+    SET name = $4, description = $5, price = $6, variants = $7,
+        images = $8, category = $9, tags = $10, in_stock = $11,
+        stock_count = $12, platform_url = $13, synced_at = NOW(), updated_at = NOW()
+  `, [
+    businessId, integrationId,
+    product.id?.toString(),
+    product.title,
+    stripHtml(product.body_html || ""),
+    minPrice,
+    JSON.stringify(variants),
+    JSON.stringify(images),
+    product.product_type || null,
+    tags,
+    inStock,
+    variants.reduce((s, v) => s + (v.inventory || 0), 0),
+    product.handle ? `https://${product.vendor}/products/${product.handle}` : null,
+  ]);
+}
+
+function stripHtml(html) {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+export default router;

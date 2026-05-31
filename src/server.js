@@ -71,6 +71,21 @@ app.use("/webhook", express.raw({ type: "*/*" }), (req, res, next) => {
 });
 app.use("/webhook", whatsappWebhook);
 
+app.use("/api/store/shopify/webhook", express.raw({ type: "application/json" }), (req, res, next) => {
+  if (req.body && Buffer.isBuffer(req.body)) {
+    req.rawBody = req.body;
+    req.body    = JSON.parse(req.body.toString());
+  }
+  next();
+});
+app.use("/api/store/shopify/gdpr", express.raw({ type: "application/json" }), (req, res, next) => {
+  if (req.body && Buffer.isBuffer(req.body)) {
+    req.rawBody = req.body;
+    req.body    = JSON.parse(req.body.toString());
+  }
+  next();
+});
+
 // ── Body Parsing ──────────────────────────────────────────────
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));

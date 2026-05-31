@@ -15,8 +15,8 @@ const META_VERSION = process.env.META_API_VERSION || "v19.0";
 
 // IST helpers
 const IST_OFFSET      = 5.5 * 60 * 60 * 1000;
-const SEND_HOUR_START = 10;
-const SEND_HOUR_END   = 22;
+const SEND_HOUR_START = 6;   // 6 AM IST
+const SEND_HOUR_END   = 23;  // 11 PM IST
 
 function nowIST()       { return new Date(Date.now() + IST_OFFSET); }
 function getISTHour(d)  { return new Date(d.getTime() + IST_OFFSET).getUTCHours(); }
@@ -271,6 +271,105 @@ router.get("/broadcast/templates", async (req, res) => {
     res.json({ templates: rows });
   } catch (err) {
     res.status(500).json({ message: "Failed to load templates" });
+  }
+});
+
+
+// ── Sync template status from Meta ────────────────────────────
+router.post("/broadcast/templates/sync", async (req, res) => {
+  try {
+    const bId = req.user.business_id;
+
+    // Get WhatsApp config
+    const { rows: wRows } = await query(
+      "SELECT access_token, waba_id FROM whatsapp_configs WHERE business_id = $1",
+      [bId]
+    );
+    if (!wRows.length || !wRows[0].access_token) {
+      return res.status(400).json({ message: "WhatsApp not connected" });
+    }
+
+    const { access_token, waba_id } = wRows[0];
+    if (!waba_id) {
+      return res.status(400).json({ message: "WABA ID not set. Please update WhatsApp settings." });
+    }
+
+    // Fetch templates from Meta
+    const metaRes = await axios.get(
+      `https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
+      {
+        params:  { limit: 100, fields: "name,status,category,language,components" },
+        headers: { Authorization: `Bearer ${access_token}` },
+      }
+    );
+
+    const metaTemplates = metaRes.data?.data || [];
+    let synced = 0;
+
+    for (const mt of metaTemplates) {
+      await query(`
+        UPDATE whatsapp_templates
+        SET status = $1, updated_at = NOW()
+        WHERE business_id = $2 AND name = $3
+      `, [mt.status?.toLowerCase() || "pending", bId, mt.name]);
+      synced++;
+    }
+
+    // Return updated templates
+    const { rows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE business_id = $1 ORDER BY created_at DESC",
+      [bId]
+    );
+
+    console.log(`✅ Synced ${synced} templates for business ${bId}`);
+    res.json({ success: true, synced, templates: rows });
+  } catch (err) {
+    console.error("Template sync error:", err.response?.data || err.message);
+    res.status(500).json({ message: "Failed to sync templates: " + err.message });
+  }
+});
+
+// ── Get single template status from Meta ─────────────────────
+router.get("/broadcast/templates/:id/status", async (req, res) => {
+  try {
+    const bId = req.user.business_id;
+    const { rows: tRows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId]
+    );
+    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+
+    const template = tRows[0];
+
+    const { rows: wRows } = await query(
+      "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
+      [bId]
+    );
+    if (!wRows[0]?.access_token) {
+      return res.json({ template });
+    }
+
+    // Check status from Meta using template name
+    const metaRes = await axios.get(
+      `https://graph.facebook.com/${META_VERSION}/${template.meta_template_id || template.name}`,
+      {
+        params:  { fields: "name,status,quality_score" },
+        headers: { Authorization: `Bearer ${wRows[0].access_token}` },
+      }
+    ).catch(() => null);
+
+    if (metaRes?.data?.status) {
+      const newStatus = metaRes.data.status.toLowerCase();
+      await query(
+        "UPDATE whatsapp_templates SET status = $1, updated_at = NOW() WHERE id = $2",
+        [newStatus, template.id]
+      );
+      template.status = newStatus;
+    }
+
+    res.json({ template });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 });
 

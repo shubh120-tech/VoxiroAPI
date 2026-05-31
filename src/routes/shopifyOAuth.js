@@ -116,14 +116,25 @@ router.get("/store/shopify/callback", async (req, res) => {
     }
 
     // Exchange code for access token
-    const tokenRes = await axios.post(
-      `https://${shop}/admin/oauth/access_token`,
-      {
-        client_id:     SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-        code,
-      }
-    );
+    console.log("🔑 Exchanging code for token...");
+    console.log("   Shop:", shop);
+    console.log("   Client ID set:", !!SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_ID?.slice(0, 8) + "...");
+    console.log("   Client Secret set:", !!SHOPIFY_CLIENT_SECRET);
+
+    let tokenRes;
+    try {
+      tokenRes = await axios.post(
+        `https://${shop}/admin/oauth/access_token`,
+        {
+          client_id:     SHOPIFY_CLIENT_ID,
+          client_secret: SHOPIFY_CLIENT_SECRET,
+          code,
+        }
+      );
+    } catch (tokenErr) {
+      console.error("Token exchange failed:", tokenErr.response?.status, tokenErr.response?.data);
+      return res.redirect(`${FRONTEND_URL}/integrations?error=token_failed&detail=${tokenErr.response?.status}`);
+    }
 
     const accessToken = tokenRes.data?.access_token;
     if (!accessToken) {
@@ -206,8 +217,8 @@ router.post("/store/shopify/webhook", async (req, res) => {
         [body.id?.toString(), integration.id]
       );
     } else if (topic === "orders/create" || topic === "orders/updated") {
-      // Tag order if it came from Voxiro
-      const voxiroNote = body.note_attributes?.find(n => n.name === "voxiro_source");
+      // Tag order if it came from Yougant
+      const voxiroNote = body.note_attributes?.find(n => n.name === "yougant_source");
       if (voxiroNote) {
         await query(`
           UPDATE store_orders SET platform_order_id = $1, tagged_in_store = TRUE

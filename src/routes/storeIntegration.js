@@ -204,19 +204,37 @@ router.put("/store/products/:id", async (req, res) => {
 //  SYNC FUNCTIONS
 // ══════════════════════════════════════════════════════════════
 
-export async function syncShopifyProducts(integrationId, businessId, storeUrl, apiKey, apiSecret) {
-  let page = 1;
+export async function syncShopifyProducts(integrationId, businessId, storeUrl, apiKey, apiSecret, accessToken) {
   let totalSynced = 0;
+  const API_VERSION = "2025-01";
 
   console.log(`🔄 Syncing Shopify products for ${storeUrl}...`);
 
   try {
-    await query("UPDATE store_integrations SET status = 'syncing' WHERE id = $1", [integrationId]);
+    await query("UPDATE store_integrations SET status = 'syncing', error_message = NULL WHERE id = $1", [integrationId]);
 
-    while (true) {
+    // Get access token from DB if not provided
+    if (!accessToken) {
+      const { rows } = await query(
+        "SELECT access_token FROM store_integrations WHERE id = $1",
+        [integrationId]
+      );
+      accessToken = rows[0]?.access_token;
+    }
+
+    if (!accessToken) throw new Error("No access token available for Shopify sync");
+
+    const headers = { "X-Shopify-Access-Token": accessToken };
+    let pageInfo   = null;
+    let hasMore    = true;
+
+    while (hasMore) {
+      const params = { limit: 250 };
+      if (pageInfo) params.page_info = pageInfo;
+
       const res = await axios.get(
-        `https://${apiKey}:${apiSecret}@${storeUrl}/admin/api/2024-01/products.json`,
-        { params: { limit: 250, page } }
+        `https://${storeUrl}/admin/api/${API_VERSION}/products.json`,
+        { headers, params }
       );
 
       const products = res.data?.products || [];
@@ -224,20 +242,18 @@ export async function syncShopifyProducts(integrationId, businessId, storeUrl, a
 
       for (const product of products) {
         const variants = product.variants?.map(v => ({
-          id:           v.id,
-          title:        v.title,
-          price:        parseFloat(v.price),
+          id:            v.id,
+          title:         v.title,
+          price:         parseFloat(v.price),
           compare_price: v.compare_at_price ? parseFloat(v.compare_at_price) : null,
-          sku:          v.sku,
-          inventory:    v.inventory_quantity,
-          available:    v.inventory_quantity > 0 || v.inventory_management === null,
+          sku:           v.sku,
+          inventory:     v.inventory_quantity,
+          available:     v.inventory_quantity > 0 || v.inventory_management === null,
         })) || [];
 
-        const images = product.images?.map(img => img.src) || [];
-        const minPrice = variants.length > 0
-          ? Math.min(...variants.map(v => v.price))
-          : 0;
-        const inStock = variants.some(v => v.available);
+        const images   = product.images?.map(img => img.src) || [];
+        const minPrice = variants.length > 0 ? Math.min(...variants.map(v => v.price || 0)) : 0;
+        const inStock  = variants.some(v => v.available);
         const totalStock = variants.reduce((sum, v) => sum + (v.inventory || 0), 0);
 
         await query(`
@@ -245,11 +261,11 @@ export async function syncShopifyProducts(integrationId, businessId, storeUrl, a
             (business_id, integration_id, platform_product_id, name, description,
              price, variants, images, category, tags, in_stock, stock_count,
              platform_url, synced_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
           ON CONFLICT (integration_id, platform_product_id) DO UPDATE
-          SET name = $4, description = $5, price = $6, variants = $7,
-              images = $8, category = $9, tags = $10, in_stock = $11,
-              stock_count = $12, platform_url = $13, synced_at = NOW(), updated_at = NOW()
+          SET name=$4, description=$5, price=$6, variants=$7,
+              images=$8, category=$9, tags=$10, in_stock=$11,
+              stock_count=$12, platform_url=$13, synced_at=NOW(), updated_at=NOW()
         `, [
           businessId, integrationId,
           product.id.toString(),
@@ -267,8 +283,14 @@ export async function syncShopifyProducts(integrationId, businessId, storeUrl, a
         totalSynced++;
       }
 
-      if (products.length < 250) break;
-      page++;
+      // Shopify cursor-based pagination
+      const linkHeader = res.headers?.link || "";
+      const nextMatch  = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>;\s*rel="next"/);
+      if (nextMatch) {
+        pageInfo = nextMatch[1];
+      } else {
+        hasMore = false;
+      }
     }
 
     await query(`

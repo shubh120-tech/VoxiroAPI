@@ -311,7 +311,14 @@ router.post("/broadcast/templates/sync", async (req, res) => {
         UPDATE whatsapp_templates
         SET status = $1, updated_at = NOW()
         WHERE business_id = $2 AND name = $3
-      `, [mt.status?.toLowerCase() || "pending", bId, mt.name]);
+      `, [mt.status?.toLowerCase() || "pending", bId, mt.name]).catch(async (err) => {
+        // Column might not exist yet — add it
+        if (err.message.includes('column "status"')) {
+          await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending'`);
+          await query(`UPDATE whatsapp_templates SET status = $1 WHERE business_id = $2 AND name = $3`,
+            [mt.status?.toLowerCase() || "pending", bId, mt.name]);
+        }
+      });
       synced++;
     }
 

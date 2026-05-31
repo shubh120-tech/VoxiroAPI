@@ -1,0 +1,20 @@
+name = "Yougant"
+client_id = "1142663afeec8a96618af4488b5211ca"
+application_url = "https://yougant.com/"
+embedded = false
+
+[webhooks]
+  api_version = "2026-04"
+
+[webhooks.privacy_compliance]
+  customer_data_request_url = "https://voxiroapi-production.up.railway.app/api/store/shopify/gdpr/customers-data-request"
+  customer_deletion_url     = "https://voxiroapi-production.up.railway.app/api/store/shopify/gdpr/customers-redact"
+  shop_deletion_url         = "https://voxiroapi-production.up.railway.app/api/store/shopify/gdpr/shop-redact"
+
+[auth]
+  redirect_urls = [
+    "https://voxiroapi-production.up.railway.app/api/store/shopify/callback"
+  ]
+
+[access_scopes]
+  scopes = "read_products,write_products,read_orders,write_orders,read_inventory"

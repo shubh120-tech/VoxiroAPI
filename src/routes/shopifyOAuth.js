@@ -133,7 +133,7 @@ router.get("/store/shopify/callback", async (req, res) => {
     if (!savedState) {
       console.warn("OAuth state not found — may have expired or Railway restarted");
       // During testing — continue with shop from query params
-      // return res.redirect(`${FRONTEND_URL}/integrations?error=invalid_state`);
+      // return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=invalid_state`);
     }
 
     const businessId = savedState?.businessId || req.query.business_id;
@@ -181,12 +181,10 @@ router.get("/store/shopify/callback", async (req, res) => {
       console.error("   Shopify error:", JSON.stringify(tokenErr.response?.data));
       return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=token_403`);
     }
-      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=token_failed`);
-    }
 
     const accessToken = tokenRes.data?.access_token;
     if (!accessToken) {
-      return res.redirect(`${FRONTEND_URL}/integrations?error=no_token`);
+      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=no_token`);
     }
 
     // Get shop details
@@ -228,11 +226,11 @@ router.get("/store/shopify/callback", async (req, res) => {
       .catch(console.error);
 
     // Redirect back to frontend with success
-    res.redirect(`${FRONTEND_URL}/integrations?success=shopify_connected&shop=${shopName}`);
+    res.redirect(`${FRONTEND_URL}/dashboard/integrations?success=shopify_connected&shop=${shopName}`);
 
   } catch (err) {
     console.error("Shopify callback error:", err.message);
-    res.redirect(`${FRONTEND_URL}/integrations?error=${encodeURIComponent(err.message)}`);
+    res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=${encodeURIComponent(err.message)}`);
   }
 });
 

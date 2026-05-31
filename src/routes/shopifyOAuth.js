@@ -360,4 +360,41 @@ router.get("/store/shopify/check-scopes", authMiddleware, async (req, res) => {
   }
 });
 
+
+// ── Test token directly ────────────────────────────────────────
+router.get("/store/shopify/test-token", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT store_url, access_token FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "No integration" });
+
+    const { store_url, access_token } = rows[0];
+    const headers = { "X-Shopify-Access-Token": access_token };
+
+    // Test 1: scopes
+    const scopeRes = await axios.get(
+      `https://${store_url}/admin/oauth/access_scopes.json`,
+      { headers }
+    ).catch(e => ({ data: null, error: e.response?.status }));
+
+    // Test 2: products
+    const prodRes = await axios.get(
+      `https://${store_url}/admin/api/2026-04/products.json?limit=1`,
+      { headers }
+    ).catch(e => ({ data: null, error: e.response?.status }));
+
+    res.json({
+      store_url,
+      token_preview:    access_token?.slice(0, 12) + "...",
+      scopes:           scopeRes.data?.access_scopes?.map(s => s.handle) || `scope_error_${scopeRes.error}`,
+      products_test:    prodRes.data?.products ? `✅ ${prodRes.data.products.length} products` : `❌ error_${prodRes.error}`,
+      has_read_products: scopeRes.data?.access_scopes?.some(s => s.handle === "read_products") || false,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;

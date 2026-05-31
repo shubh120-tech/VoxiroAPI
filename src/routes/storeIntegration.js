@@ -128,11 +128,16 @@ router.post("/store/integrations/:id/sync", async (req, res) => {
     await query("UPDATE store_integrations SET status = 'syncing' WHERE id = $1", [req.params.id]);
 
     if (integration.platform === "shopify") {
-      syncShopifyProducts(integration.id, bId(req), integration.store_url, integration.api_key, integration.api_secret)
-        .catch(console.error);
+      syncShopifyProducts(
+        integration.id, bId(req), integration.store_url,
+        integration.api_key, integration.api_secret,
+        integration.access_token  // ← pass OAuth token
+      ).catch(console.error);
     } else {
-      syncWooCommerceProducts(integration.id, bId(req), integration.store_url, integration.api_key, integration.api_secret)
-        .catch(console.error);
+      syncWooCommerceProducts(
+        integration.id, bId(req), integration.store_url,
+        integration.api_key, integration.api_secret
+      ).catch(console.error);
     }
 
     res.json({ success: true, message: "Sync started..." });

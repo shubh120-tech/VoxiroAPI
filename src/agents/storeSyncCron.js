@@ -24,7 +24,8 @@ export async function processStoreSyncs() {
       if (integration.platform === "shopify") {
         await syncShopifyProducts(
           integration.id, integration.business_id,
-          integration.store_url, integration.api_key, integration.api_secret
+          integration.store_url, integration.api_key, integration.api_secret,
+          integration.access_token  // OAuth token
         );
       } else if (integration.platform === "woocommerce") {
         await syncWooCommerceProducts(

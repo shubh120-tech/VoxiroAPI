@@ -124,6 +124,7 @@ router.post("/store/shopify/install", authMiddleware, async (req, res) => {
 
     const state       = crypto.randomBytes(16).toString("hex");
     const redirectUri = `${API_URL}/api/store/shopify/callback`;
+    console.log("🔑 Requesting scopes:", SCOPES);
 
     await saveState(state, req.user.business_id, shopDomain);
 
@@ -181,6 +182,8 @@ router.get("/store/shopify/callback", async (req, res) => {
       }, { headers: { "Content-Type": "application/json" } });
       accessToken = r.data?.access_token;
       console.log("✅ Token exchange success (JSON)");
+      console.log("   Granted scopes:", r.data?.scope);
+      console.log("   Full response:", JSON.stringify(r.data));
     } catch (e1) {
       console.warn("JSON failed:", e1.response?.status, "— trying form-encoded...");
       try {
@@ -190,6 +193,7 @@ router.get("/store/shopify/callback", async (req, res) => {
         });
         accessToken = r.data?.access_token;
         console.log("✅ Token exchange success (form-encoded)");
+        console.log("   Granted scopes:", r.data?.scope);
       } catch (e2) {
         console.error("❌ Both token methods failed");
         console.error("   Status:", e2.response?.status);

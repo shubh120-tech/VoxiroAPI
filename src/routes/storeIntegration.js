@@ -229,6 +229,7 @@ export async function syncShopifyProducts(integrationId, businessId, storeUrl, a
 
     if (!accessToken) throw new Error("No access token available for Shopify sync");
 
+    console.log("🔑 Sync using token:", accessToken?.slice(0, 10) + "...", "length:", accessToken?.length);
     const headers = { "X-Shopify-Access-Token": accessToken };
     let pageInfo   = null;
     let hasMore    = true;
@@ -237,10 +238,12 @@ export async function syncShopifyProducts(integrationId, businessId, storeUrl, a
       const params = { limit: 250 };
       if (pageInfo) params.page_info = pageInfo;
 
+      console.log(`📦 Fetching products from ${storeUrl} (API ${API_VERSION})...`);
       const res = await axios.get(
         `https://${storeUrl}/admin/api/${API_VERSION}/products.json`,
         { headers, params }
       );
+      console.log(`✅ Got ${res.data?.products?.length || 0} products`);
 
       const products = res.data?.products || [];
       if (!products.length) break;

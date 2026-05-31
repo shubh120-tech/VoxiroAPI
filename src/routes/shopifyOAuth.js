@@ -54,33 +54,57 @@ const oauthStatesMemory = new Map(); // fallback
 
 router.post("/store/shopify/install", authMiddleware, async (req, res) => {
   try {
-    const { shop } = req.body;
+    const { shop, accessToken } = req.body;
     if (!shop) return res.status(400).json({ message: "Shop URL required" });
 
     // Clean shop URL
-    const cleanShop = shop
-      .replace(/^https?:\/\//, "")
-      .replace(/\/$/, "")
-      .trim();
+    const cleanShop   = shop.replace(/^https?:\/\//, "").replace(/\/$/, "").trim();
+    const shopDomain  = cleanShop.includes(".myshopify.com")
+      ? cleanShop : `${cleanShop}.myshopify.com`;
 
-    // Validate shop domain
+    // ── Direct token connection (Custom App) ──────────────
+    if (accessToken?.trim()) {
+      console.log("🔑 Direct token connection:", shopDomain);
+      try {
+        const shopRes  = await axios.get(
+          `https://${shopDomain}/admin/api/2024-01/shop.json`,
+          { headers: { "X-Shopify-Access-Token": accessToken.trim() } }
+        );
+        const shopData = shopRes.data?.shop;
+
+        const { rows } = await query(`
+          INSERT INTO store_integrations
+            (business_id, platform, store_url, access_token, status, store_name, store_email, currency)
+          VALUES ($1, 'shopify', $2, $3, 'connected', $4, $5, $6)
+          ON CONFLICT (business_id, platform) DO UPDATE
+          SET store_url = $2, access_token = $3, status = 'connected',
+              store_name = $4, updated_at = NOW()
+          RETURNING id
+        `, [req.user.business_id, shopDomain, accessToken.trim(),
+            shopData?.name || shopDomain, shopData?.email || "",
+            shopData?.currency || "INR"]);
+
+        // Sync products in background
+        syncShopifyProducts(rows[0].id, req.user.business_id, shopDomain, null, null, accessToken.trim())
+          .catch(e => console.error("Sync error:", e.message));
+
+        return res.json({ success: true, shop: shopData?.name || shopDomain });
+      } catch (err) {
+        console.error("Direct token error:", err.response?.status, err.response?.data);
+        return res.status(400).json({ message: "Invalid token or store URL — check and try again" });
+      }
+    }
+
+    // ── OAuth flow (Partners App) ──────────────────────────
     if (!cleanShop.includes(".myshopify.com") && !cleanShop.includes(".")) {
       return res.status(400).json({ message: "Enter your Shopify store URL (e.g. mystore.myshopify.com)" });
     }
 
-    const shopDomain = cleanShop.includes(".myshopify.com")
-      ? cleanShop
-      : `${cleanShop}.myshopify.com`;
-
-    // Generate state token for CSRF protection
-    const state = crypto.randomBytes(16).toString("hex");
-
-    // Store state with business ID (DB + memory fallback)
+    const state       = crypto.randomBytes(16).toString("hex");
     await saveOAuthState(state, req.user.business_id, shopDomain);
 
-    // Build Shopify OAuth URL
-    const redirectUri  = `${API_URL}/api/store/shopify/callback`;
-    const installUrl   = `https://${shopDomain}/admin/oauth/authorize`
+    const redirectUri = `${API_URL}/api/store/shopify/callback`;
+    const installUrl  = `https://${shopDomain}/admin/oauth/authorize`
       + `?client_id=${SHOPIFY_CLIENT_ID}`
       + `&scope=${SCOPES}`
       + `&redirect_uri=${encodeURIComponent(redirectUri)}`
@@ -131,26 +155,32 @@ router.get("/store/shopify/callback", async (req, res) => {
     // Exchange code for access token
     console.log("🔑 Exchanging code for token...");
     console.log("   Shop:", shop);
-    console.log("   Client ID set:", !!SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_ID?.slice(0, 8) + "...");
-    console.log("   Client Secret set:", !!SHOPIFY_CLIENT_SECRET);
+    console.log("   Client ID:", SHOPIFY_CLIENT_ID);
+    console.log("   Client Secret (first 6):", SHOPIFY_CLIENT_SECRET?.slice(0, 6) + "...");
+    console.log("   Code:", code?.slice(0, 10) + "...");
 
     let tokenRes;
     try {
+      // Shopify requires form-encoded body for token exchange
+      const params = new URLSearchParams();
+      params.append("client_id",     SHOPIFY_CLIENT_ID);
+      params.append("client_secret", SHOPIFY_CLIENT_SECRET);
+      params.append("code",          code);
+
       tokenRes = await axios.post(
         `https://${shop}/admin/oauth/access_token`,
-        {
-          client_id:     SHOPIFY_CLIENT_ID,
-          client_secret: SHOPIFY_CLIENT_SECRET,
-          code,
-        }
+        params.toString(),
+        { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
       );
+      console.log("✅ Token exchange success");
     } catch (tokenErr) {
-      console.error("❌ Token exchange failed:");
+      console.error("❌ Token exchange 403 — VERIFY THESE MATCH:");
+      console.error("   Client ID in Railway:", SHOPIFY_CLIENT_ID);
+      console.error("   Get correct values from: partners.shopify.com → Apps → Yougant → API credentials");
       console.error("   Status:", tokenErr.response?.status);
-      console.error("   Body:", JSON.stringify(tokenErr.response?.data));
-      console.error("   Client ID used:", SHOPIFY_CLIENT_ID);
-      console.error("   Shop:", shop);
-      console.error("   Code:", code?.slice(0, 10) + "...");
+      console.error("   Shopify error:", JSON.stringify(tokenErr.response?.data));
+      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=token_403`);
+    }
       return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=token_failed`);
     }
 

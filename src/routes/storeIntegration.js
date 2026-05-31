@@ -42,7 +42,7 @@ router.post("/store/connect/shopify", async (req, res) => {
     // Test connection
     try {
       const testRes = await axios.get(
-        `https://${api_key}:${api_secret}@${cleanUrl}/admin/api/2024-01/shop.json`
+        `https://${api_key}:${api_secret}@${cleanUrl}/admin/api/2026-04/shop.json`
       );
       if (!testRes.data?.shop) throw new Error("Invalid response");
     } catch (err) {
@@ -447,7 +447,7 @@ export async function tagOrderInStore(businessId, platformOrderId, platform) {
 
     if (platform === "shopify") {
       await axios.put(
-        `https://${integration.api_key}:${integration.api_secret}@${integration.store_url}/admin/api/2024-01/orders/${platformOrderId}.json`,
+        `https://${integration.api_key}:${integration.api_secret}@${integration.store_url}/admin/api/2026-04/orders/${platformOrderId}.json`,
         { order: { tags: tag, note } }
       );
     } else if (platform === "woocommerce") {

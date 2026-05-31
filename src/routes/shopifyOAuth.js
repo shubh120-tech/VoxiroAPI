@@ -262,11 +262,26 @@ router.get("/store/shopify/callback", async (req, res) => {
 // SHOPIFY WEBHOOKS
 // ══════════════════════════════════════════════════════════════
 router.post("/store/shopify/webhook", async (req, res) => {
+  // Verify HMAC signature from Shopify
+  const hmac    = req.headers["x-shopify-hmac-sha256"];
+  const rawBody = req.rawBody || (Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body)));
+
+  if (hmac && SHOPIFY_CLIENT_SECRET) {
+    const digest = crypto
+      .createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+      .update(rawBody)
+      .digest("base64");
+    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) {
+      console.warn("⚠️  Invalid Shopify webhook HMAC");
+      return res.sendStatus(401);
+    }
+  }
+
   res.sendStatus(200);
   try {
     const topic = req.headers["x-shopify-topic"];
     const shop  = req.headers["x-shopify-shop-domain"];
-    const data  = req.body;
+    const data  = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
 
     const { rows } = await query(
       `SELECT id, business_id, access_token FROM store_integrations
@@ -419,6 +434,16 @@ function verifyShopifyWebhook(req) {
 // ── 1. Customer data request ───────────────────────────────────
 // Shopify calls this when a customer requests their data
 router.post("/store/shopify/gdpr/customers-data-request", async (req, res) => {
+  // Verify Shopify HMAC
+  const hmac    = req.headers["x-shopify-hmac-sha256"];
+  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  if (hmac && SHOPIFY_CLIENT_SECRET) {
+    const digest = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+      .update(rawBody).digest("base64");
+    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) {
+      return res.sendStatus(401);
+    }
+  }
   res.sendStatus(200);
   try {
     const { shop_domain, customer } = req.body;
@@ -452,6 +477,16 @@ router.post("/store/shopify/gdpr/customers-data-request", async (req, res) => {
 // ── 2. Customer redact ─────────────────────────────────────────
 // Shopify calls this 10 days after a customer requests deletion
 router.post("/store/shopify/gdpr/customers-redact", async (req, res) => {
+  // Verify Shopify HMAC
+  const hmac    = req.headers["x-shopify-hmac-sha256"];
+  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  if (hmac && SHOPIFY_CLIENT_SECRET) {
+    const digest = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+      .update(rawBody).digest("base64");
+    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) {
+      return res.sendStatus(401);
+    }
+  }
   res.sendStatus(200);
   try {
     const { shop_domain, customer } = req.body;
@@ -500,6 +535,16 @@ router.post("/store/shopify/gdpr/customers-redact", async (req, res) => {
 // ── 3. Shop redact ─────────────────────────────────────────────
 // Shopify calls this 48 hours after a shop uninstalls your app
 router.post("/store/shopify/gdpr/shop-redact", async (req, res) => {
+  // Verify Shopify HMAC
+  const hmac    = req.headers["x-shopify-hmac-sha256"];
+  const rawBody = req.rawBody || Buffer.from(JSON.stringify(req.body));
+  if (hmac && SHOPIFY_CLIENT_SECRET) {
+    const digest = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET)
+      .update(rawBody).digest("base64");
+    if (!crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac))) {
+      return res.sendStatus(401);
+    }
+  }
   res.sendStatus(200);
   try {
     const { shop_domain } = req.body;

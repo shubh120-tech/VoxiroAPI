@@ -33,10 +33,15 @@ const USD_TO_INR = 84;
 router.get("/plans/public", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT id, name, display_name, price_monthly,
-             message_limit, doc_limit,
-             COALESCE(trial_days, 0) AS trial_days,
-             features, is_active
+      SELECT
+        id::text,
+        name::text,
+        display_name,
+        price_monthly,
+        message_limit,
+        doc_limit,
+        COALESCE(trial_days, 0) AS trial_days,
+        is_active
       FROM plans
       WHERE is_active = TRUE
       ORDER BY price_monthly ASC
@@ -44,7 +49,7 @@ router.get("/plans/public", async (req, res) => {
     res.json({ plans: rows });
   } catch (err) {
     console.error("Plans fetch error:", err.message);
-    res.status(500).json({ message: "Failed to load plans" });
+    res.status(500).json({ message: "Failed to load plans: " + err.message });
   }
 });
 
@@ -70,7 +75,7 @@ router.get("/billing/current", async (req, res) => {
         u.owner_name,
         u.email
       FROM subscriptions s
-      JOIN plans p ON p.id = s.plan_id
+      JOIN plans p ON p.id::text = s.plan_id::text
       JOIN businesses b ON b.id = s.business_id
       JOIN users u ON u.business_id = s.business_id AND u.role = 'owner'
       WHERE s.business_id = $1
@@ -121,7 +126,7 @@ router.get("/billing/payments", async (req, res) => {
         p.display_name AS plan_display_name,
         p.message_limit
       FROM payment_history ph
-      LEFT JOIN plans p ON p.id = ph.plan_id
+      LEFT JOIN plans p ON p.id::text = ph.plan_id::text
       WHERE ph.business_id = $1
       ORDER BY ph.created_at DESC
       LIMIT 50
@@ -144,7 +149,7 @@ router.post("/billing/create-order", async (req, res) => {
 
     // Validate plan
     const { rows: planRows } = await query(
-      "SELECT * FROM plans WHERE id = $1 AND is_active = TRUE",
+      "SELECT id::text, name::text, display_name, price_monthly, message_limit, doc_limit, COALESCE(trial_days,0) AS trial_days FROM plans WHERE id = $1::uuid AND is_active = TRUE",
       [plan_id]
     );
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
@@ -235,7 +240,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     }
 
     // Get plan
-    const { rows: planRows } = await query("SELECT * FROM plans WHERE id = $1", [plan_id]);
+    const { rows: planRows } = await query("SELECT id::text, name::text, display_name, price_monthly, message_limit FROM plans WHERE id = $1::uuid", [plan_id]);
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
     const plan = planRows[0];
 

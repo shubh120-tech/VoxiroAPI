@@ -189,7 +189,7 @@ router.post("/billing/create-order", async (req, res) => {
       INSERT INTO payment_history
         (business_id, plan_id, amount, currency, status,
          razorpay_order_id, description, created_at)
-      VALUES ($1, $2, $3, 'INR', 'pending', $4, $5, NOW())
+      VALUES ($1::uuid, $2::uuid, $3, 'INR', 'pending', $4, $5, NOW())
     `, [
       bId, plan_id, amountINR,
       order.id,
@@ -206,8 +206,10 @@ router.post("/billing/create-order", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Create order error:", err.message);
-    res.status(500).json({ message: err.message || "Failed to create payment order" });
+    console.error("Create order error FULL:", err);
+    console.error("Create order error MSG:", err?.message);
+    console.error("Create order error STR:", String(err));
+    res.status(500).json({ message: err?.message || String(err) || "Failed to create payment order" });
   }
 });
 
@@ -260,7 +262,7 @@ router.post("/billing/verify-payment", async (req, res) => {
           period_start        = NOW(),
           period_end          = $4,
           updated_at          = NOW()
-      WHERE razorpay_order_id = $5 AND business_id = $6
+      WHERE razorpay_order_id = $5 AND business_id = $6::uuid
     `, [
       razorpay_payment_id,
       razorpay_signature,
@@ -274,10 +276,10 @@ router.post("/billing/verify-payment", async (req, res) => {
     await query(`
       INSERT INTO subscriptions
         (business_id, plan_id, status, billing_cycle_end, messages_used, created_at, updated_at)
-      VALUES ($1, $2, 'active', $3, 0, NOW(), NOW())
+      VALUES ($1::uuid, $2::uuid, 'active', $3, 0, NOW(), NOW())
       ON CONFLICT (business_id)
       DO UPDATE SET
-        plan_id           = $2,
+        plan_id           = $2::uuid,
         status            = 'active',
         trial_ends_at     = NULL,
         billing_cycle_end = $3,
@@ -288,7 +290,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     // Update message_limit in agent_configs for sidebar
     await query(`
       UPDATE agent_configs SET message_limit = $1, updated_at = NOW()
-      WHERE business_id = $2
+      WHERE business_id = $2::uuid
     `, [plan.message_limit, bId]);
 
     console.log(`✅ Payment verified & plan activated: business ${bId} → ${plan.name} (${razorpay_payment_id})`);

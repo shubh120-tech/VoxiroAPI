@@ -726,12 +726,17 @@ router.post("/broadcast/campaigns", async (req, res) => {
     // Validate scheduled time is in business hours
     let finalScheduledAt = scheduled_at;
     if (scheduled_at) {
-      const schedDate = new Date(scheduled_at);
-      if (!isValidSendTime(schedDate)) {
+      // Normalize datetime — handle both "2026-06-01T17:36" and "01-06-2026 17:36" formats
+      const normalized = scheduled_at.includes("T")
+        ? scheduled_at
+        : scheduled_at.replace(" ", "T");
+      const schedDate = new Date(normalized);
+      if (!isNaN(schedDate.getTime()) && !isValidSendTime(schedDate)) {
         return res.status(400).json({
           message: "Scheduled time must be between 6 AM and 11 PM IST",
         });
       }
+      finalScheduledAt = isNaN(schedDate.getTime()) ? scheduled_at : schedDate.toISOString();
     }
 
     // Create campaign

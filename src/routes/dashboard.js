@@ -57,7 +57,7 @@ router.get("/analytics/activity", async (req, res) => {
 });
 
 
-// ── Analytics — detailed home ──────────────────────────────────
+// ── Analytics — detailed dashboard ────────────────────────────
 router.get("/analytics/dashboard", async (req, res) => {
   try {
     const bId   = req.user.business_id;
@@ -69,23 +69,57 @@ router.get("/analytics/dashboard", async (req, res) => {
       peakHours, agentStats, planUsage, tokenUsage,
     ] = await Promise.all([
 
-      // Today snapshot
+      // ── TODAY SNAPSHOT ──────────────────────────────────────
+      // FIX: use independent subqueries instead of FULL JOINs
+      // FIX: use AT TIME ZONE 'Asia/Kolkata' so "today" is IST, not UTC
       query(`
         SELECT
-          COUNT(DISTINCT CASE WHEN m.created_at::date = CURRENT_DATE THEN m.conversation_id END) AS conversations_today,
-          COUNT(CASE WHEN m.created_at::date = CURRENT_DATE AND m.role = 'customer' THEN 1 END) AS messages_today,
-          COUNT(CASE WHEN l.created_at::date = CURRENT_DATE THEN 1 END) AS leads_today,
-          COUNT(CASE WHEN o.created_at::date = CURRENT_DATE THEN 1 END) AS orders_today,
-          COALESCE(SUM(CASE WHEN o.created_at::date = CURRENT_DATE AND o.status = 'confirmed' THEN o.amount END), 0) AS revenue_today,
-          COUNT(CASE WHEN a.created_at::date = CURRENT_DATE THEN 1 END) AS appointments_today
-        FROM messages m
-        FULL JOIN leads l ON l.business_id = m.business_id AND l.created_at::date = CURRENT_DATE
-        FULL JOIN orders o ON o.business_id = m.business_id AND o.created_at::date = CURRENT_DATE
-        FULL JOIN appointments a ON a.business_id = m.business_id AND a.created_at::date = CURRENT_DATE
-        WHERE COALESCE(m.business_id, l.business_id, o.business_id, a.business_id) = $1
+          (
+            SELECT COUNT(*)
+            FROM messages
+            WHERE business_id = $1
+              AND role = 'customer'
+              AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS messages_today,
+
+          (
+            SELECT COUNT(DISTINCT conversation_id)
+            FROM messages
+            WHERE business_id = $1
+              AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS conversations_today,
+
+          (
+            SELECT COUNT(*)
+            FROM leads
+            WHERE business_id = $1
+              AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS leads_today,
+
+          (
+            SELECT COUNT(*)
+            FROM orders
+            WHERE business_id = $1
+              AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS orders_today,
+
+          (
+            SELECT COALESCE(SUM(amount), 0)
+            FROM orders
+            WHERE business_id = $1
+              AND status = 'confirmed'
+              AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS revenue_today,
+
+          (
+            SELECT COUNT(*)
+            FROM appointments
+            WHERE business_id = $1
+              AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+          ) AS appointments_today
       `, [bId]),
 
-      // Daily trend
+      // ── DAILY TREND ─────────────────────────────────────────
       query(`
         SELECT
           d::date                                                                AS date,
@@ -94,16 +128,20 @@ router.get("/analytics/dashboard", async (req, res) => {
           COUNT(DISTINCT o.id)                                                  AS orders,
           COALESCE(SUM(CASE WHEN o.status='confirmed' THEN o.amount END), 0)   AS revenue
         FROM generate_series(
-          CURRENT_DATE - ($2 - 1) * INTERVAL '1 day',
-          CURRENT_DATE, INTERVAL '1 day'
+          (NOW() AT TIME ZONE 'Asia/Kolkata')::date - ($2 - 1) * INTERVAL '1 day',
+          (NOW() AT TIME ZONE 'Asia/Kolkata')::date,
+          INTERVAL '1 day'
         ) d
-        LEFT JOIN conversations c ON c.business_id = $1 AND c.created_at::date = d::date
-        LEFT JOIN leads         l ON l.business_id = $1 AND l.created_at::date = d::date
-        LEFT JOIN orders        o ON o.business_id = $1 AND o.created_at::date = d::date
+        LEFT JOIN conversations c ON c.business_id = $1
+          AND (c.created_at AT TIME ZONE 'Asia/Kolkata')::date = d::date
+        LEFT JOIN leads         l ON l.business_id = $1
+          AND (l.created_at AT TIME ZONE 'Asia/Kolkata')::date = d::date
+        LEFT JOIN orders        o ON o.business_id = $1
+          AND (o.created_at AT TIME ZONE 'Asia/Kolkata')::date = d::date
         GROUP BY d::date ORDER BY d::date ASC
       `, [bId, days]),
 
-      // Conversion funnel
+      // ── CONVERSION FUNNEL ───────────────────────────────────
       query(`
         SELECT
           COUNT(DISTINCT c.id)                                                   AS total_conversations,
@@ -114,12 +152,12 @@ router.get("/analytics/dashboard", async (req, res) => {
         FROM conversations c
         LEFT JOIN leads  l ON l.conversation_id = c.id
         LEFT JOIN orders o ON o.business_id = c.business_id
-          AND o.created_at >= CURRENT_DATE - $2 * INTERVAL '1 day'
+          AND o.created_at >= NOW() - $2 * INTERVAL '1 day'
         WHERE c.business_id = $1
-          AND c.created_at  >= CURRENT_DATE - $2 * INTERVAL '1 day'
+          AND c.created_at  >= NOW() - $2 * INTERVAL '1 day'
       `, [bId, days]),
 
-      // Peak hours (last 30 days)
+      // ── PEAK HOURS (last 30 days, in IST) ───────────────────
       query(`
         SELECT
           EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Kolkata')::int AS hour,
@@ -130,25 +168,25 @@ router.get("/analytics/dashboard", async (req, res) => {
         GROUP BY 1 ORDER BY 1
       `, [bId]),
 
-      // Agent performance
+      // ── AGENT PERFORMANCE ───────────────────────────────────
       query(`
         SELECT
-          COUNT(*) FILTER (WHERE status = 'agent')   AS agent_handled,
-          COUNT(*) FILTER (WHERE status = 'manual')  AS manual_handled,
+          COUNT(*) FILTER (WHERE status = 'agent')      AS agent_handled,
+          COUNT(*) FILTER (WHERE status = 'manual')     AS manual_handled,
           COUNT(*) FILTER (WHERE status = 'needs-help') AS needs_help,
           COUNT(*) AS total_convs
         FROM conversations
         WHERE business_id = $1
-          AND created_at >= CURRENT_DATE - $2 * INTERVAL '1 day'
+          AND created_at >= NOW() - $2 * INTERVAL '1 day'
       `, [bId, days]),
 
-      // Plan usage
+      // ── PLAN USAGE ──────────────────────────────────────────
       query(`
         SELECT messages_used, message_limit
         FROM agent_configs WHERE business_id = $1
       `, [bId]),
 
-      // Token usage (AI cost estimation)
+      // ── TOKEN USAGE (AI cost estimation) ────────────────────
       query(`
         SELECT
           COUNT(*) AS total_messages,
@@ -156,7 +194,7 @@ router.get("/analytics/dashboard", async (req, res) => {
           SUM(CHAR_LENGTH(content)) FILTER (WHERE role = 'agent') AS agent_chars
         FROM messages
         WHERE business_id = $1
-          AND created_at >= CURRENT_DATE - $2 * INTERVAL '1 day'
+          AND created_at >= NOW() - $2 * INTERVAL '1 day'
       `, [bId, days]),
     ]);
 
@@ -627,23 +665,18 @@ router.patch("/followups/:id/cancel", async (req, res) => {
 
 
 // ── Data Deletion Callback (Meta requirement) ──────────────────
-// Meta calls this when a Facebook user requests data deletion
-// No auth required — Meta sends signed_request
 router.post("/auth/data-deletion", async (req, res) => {
   try {
     const crypto = (await import("crypto")).default;
     const { signed_request } = req.body;
 
     if (signed_request) {
-      // Decode and verify signed_request from Meta
       const [encodedSig, payload] = signed_request.split(".");
       const data     = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
       const userId   = data.user_id;
 
-      // Log deletion request
       console.log(`📨 Data deletion request for Facebook user: ${userId}`);
 
-      // Return confirmation URL to Meta
       const confirmationCode = Buffer.from(`yougant_delete_${userId}_${Date.now()}`).toString("base64");
       return res.json({
         url:           `https://yougant.com/data-deletion?code=${confirmationCode}`,
@@ -654,7 +687,7 @@ router.post("/auth/data-deletion", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("Data deletion callback error:", err.message);
-    res.status(200).json({ success: true }); // Always return 200 to Meta
+    res.status(200).json({ success: true });
   }
 });
 
@@ -666,64 +699,24 @@ router.delete("/account", async (req, res) => {
 
     console.log(`🗑️ Account deletion started: business ${businessId}`);
 
-    // ── Delete all business data ──────────────────────────
     const tables = [
-      "messages",
-      "conversations",
-      "leads",
-      "orders",
-      "appointments",
-      "follow_ups",
-      "pending_messages",
-      "knowledge_docs",
-      "agent_configs",
-      "whatsapp_configs",
-      "notification_settings",
-      "activity_logs",
-      "business_services",
-      "business_faqs",
-      "business_payment_methods",
-      "business_company_details",
-      "broadcast_contacts",
-      "broadcast_lists",
-      "broadcast_campaigns",
-      "broadcast_templates",
-      "products",
-      "website_crawls",
-      "prompt_history",
-      "oauth_states",
+      "messages", "conversations", "leads", "orders", "appointments",
+      "follow_ups", "pending_messages", "knowledge_docs", "agent_configs",
+      "whatsapp_configs", "notification_settings", "activity_logs",
+      "business_services", "business_faqs", "business_payment_methods",
+      "business_company_details", "broadcast_contacts", "broadcast_lists",
+      "broadcast_campaigns", "broadcast_templates", "products",
+      "website_crawls", "prompt_history", "oauth_states",
     ];
 
     for (const table of tables) {
-      await query(
-        `DELETE FROM ${table} WHERE business_id = $1`,
-        [businessId]
-      ).catch(err => {
-        // Skip if table doesn't exist or no business_id column
-        console.warn(`Skip delete from ${table}: ${err.message}`);
-      });
+      await query(`DELETE FROM ${table} WHERE business_id = $1`, [businessId])
+        .catch(err => console.warn(`Skip delete from ${table}: ${err.message}`));
     }
 
-    // ── Delete team members ───────────────────────────────
-    await query(
-      "DELETE FROM users WHERE business_id = $1 AND id != $2",
-      [businessId, userId]
-    ).catch(() => {});
-
-    // ── Deactivate the owner user ─────────────────────────
-    await query(
-      "UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE id = $1",
-      [userId]
-    ).catch(() => {});
-
-    // ── Mark business as deleted (keep row per your requirement) ─
-    await query(`
-      UPDATE businesses
-      SET is_active    = FALSE,
-          name         = CONCAT('[DELETED] ', name),
-          updated_at   = NOW()
-      WHERE id = $1
-    `, [businessId]);
+    await query("DELETE FROM users WHERE business_id = $1 AND id != $2", [businessId, userId]).catch(() => {});
+    await query("UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE id = $1", [userId]).catch(() => {});
+    await query(`UPDATE businesses SET is_active = FALSE, name = CONCAT('[DELETED] ', name), updated_at = NOW() WHERE id = $1`, [businessId]);
 
     console.log(`✅ Account deleted: business ${businessId}`);
     res.json({ success: true });

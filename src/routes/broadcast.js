@@ -338,14 +338,14 @@ router.post("/broadcast/templates/sync", async (req, res) => {
 
       await query(`
         UPDATE whatsapp_templates
-        SET status           = $1,
+        SET meta_status      = $1,
             rejection_reason = $2,
             updated_at       = NOW()
         WHERE id = $3
       `, [newStatus, rejReason, lt.id]).catch(async () => {
-        await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending'`);
+        // meta_status column already exists;
         await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
-        await query(`UPDATE whatsapp_templates SET status = $1 WHERE id = $2`, [newStatus, lt.id]);
+        await query(`UPDATE whatsapp_templates SET meta_status = $1 WHERE id = $2`, [newStatus, lt.id]);
       });
       synced++;
       console.log(`📋 Template "${lt.name}": ${lt.status} → ${newStatus}`);
@@ -408,7 +408,7 @@ router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) =>
 
     await query(`
       UPDATE whatsapp_templates
-      SET status = $1, rejection_reason = $2, updated_at = NOW()
+      SET meta_status = $1, rejection_reason = $2, updated_at = NOW()
       WHERE id = $3
     `, [newStatus, rejReason, template.id]);
 
@@ -453,7 +453,7 @@ router.get("/broadcast/templates/:id/status", async (req, res) => {
     if (metaRes?.data?.status) {
       const newStatus = metaRes.data.status.toLowerCase();
       await query(
-        "UPDATE whatsapp_templates SET status = $1, updated_at = NOW() WHERE id = $2",
+        "UPDATE whatsapp_templates SET meta_status = $1, updated_at = NOW() WHERE id = $2",
         [newStatus, template.id]
       );
       template.status = newStatus;

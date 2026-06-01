@@ -176,7 +176,7 @@ router.post("/billing/create-order", async (req, res) => {
     const order    = await razorpay.orders.create({
       amount:   amountINR * 100, // paise
       currency: "INR",
-      receipt:  `order_${bId}_${Date.now()}`,
+      receipt:  `rcpt_${Date.now().toString().slice(-10)}`,
       notes: {
         business_id: bId,
         plan_id,

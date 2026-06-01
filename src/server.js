@@ -24,6 +24,7 @@ import catalogRouter     from "./routes/productCatalog.js";
 import shopifyOAuthRouter from "./routes/shopifyOAuth.js";
 import whatsappWebhook   from "./webhook/whatsapp.js";
 import bizKnowledgeRouter from "./routes/businessKnowledge.js"
+import billingRouter from "./routes/billing.js";
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -113,6 +114,7 @@ app.use("/api",        trainingRouter);
 app.use("/api",        bizKnowledgeRouter);
 app.use("/api",        catalogRouter);
 app.use("/api",        shopifyOAuthRouter);
+app.use("/api", billingRouter);
 
 
 // ── 404 Handler ───────────────────────────────────────────────

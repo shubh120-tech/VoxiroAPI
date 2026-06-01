@@ -278,7 +278,8 @@ router.get("/broadcast/templates", async (req, res) => {
 // ── Sync template status from Meta ────────────────────────────
 router.post("/broadcast/templates/sync", async (req, res) => {
   try {
-    const bId = req.user.business_id;
+    const bId       = req.user.business_id;
+    const recentOnly = req.query.recent === "true"; // only sync last 2 days
 
     // Get WhatsApp config
     const { rows: wRows } = await query(
@@ -294,35 +295,62 @@ router.post("/broadcast/templates/sync", async (req, res) => {
       return res.status(400).json({ message: "WABA ID not set. Please update WhatsApp settings." });
     }
 
-    // Fetch templates from Meta
+    // Get templates to sync
+    let templateQuery = "SELECT * FROM whatsapp_templates WHERE business_id = $1";
+    if (recentOnly) {
+      templateQuery += " AND created_at >= NOW() - INTERVAL '2 days'";
+    }
+    const { rows: localTemplates } = await query(templateQuery, [bId]);
+
+    if (!localTemplates.length) {
+      return res.json({ success: true, synced: 0, templates: [] });
+    }
+
+    // Fetch all templates from Meta
     const metaRes = await axios.get(
       `https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
       {
-        params:  { limit: 100, fields: "name,status,category,language,components" },
+        params:  { limit: 250, fields: "name,status,category,language,quality_score,rejected_reason" },
         headers: { Authorization: `Bearer ${access_token}` },
       }
     );
 
     const metaTemplates = metaRes.data?.data || [];
-    let synced = 0;
 
-    for (const mt of metaTemplates) {
+    // Map Meta status to our status
+    const STATUS_MAP = {
+      "APPROVED":  "approved",
+      "PENDING":   "pending",
+      "REJECTED":  "rejected",
+      "DISABLED":  "rejected",
+      "PAUSED":    "paused",
+      "IN_APPEAL": "pending",
+      "PENDING_DELETION": "pending",
+    };
+
+    let synced = 0;
+    for (const lt of localTemplates) {
+      const mt = metaTemplates.find(t => t.name === lt.name);
+      if (!mt) continue;
+
+      const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
+      const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
+
       await query(`
         UPDATE whatsapp_templates
-        SET status = $1, updated_at = NOW()
-        WHERE business_id = $2 AND name = $3
-      `, [mt.status?.toLowerCase() || "pending", bId, mt.name]).catch(async (err) => {
-        // Column might not exist yet — add it
-        if (err.message.includes('column "status"')) {
-          await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending'`);
-          await query(`UPDATE whatsapp_templates SET status = $1 WHERE business_id = $2 AND name = $3`,
-            [mt.status?.toLowerCase() || "pending", bId, mt.name]);
-        }
+        SET status           = $1,
+            rejection_reason = $2,
+            updated_at       = NOW()
+        WHERE id = $3
+      `, [newStatus, rejReason, lt.id]).catch(async () => {
+        await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'pending'`);
+        await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
+        await query(`UPDATE whatsapp_templates SET status = $1 WHERE id = $2`, [newStatus, lt.id]);
       });
       synced++;
+      console.log(`📋 Template "${lt.name}": ${lt.status} → ${newStatus}`);
     }
 
-    // Return updated templates
     const { rows } = await query(
       "SELECT * FROM whatsapp_templates WHERE business_id = $1 ORDER BY created_at DESC",
       [bId]
@@ -336,7 +364,64 @@ router.post("/broadcast/templates/sync", async (req, res) => {
   }
 });
 
-// ── Get single template status from Meta ─────────────────────
+// ── Sync single template status ───────────────────────────────
+router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) => {
+  try {
+    const bId = req.user.business_id;
+
+    const { rows: tRows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId]
+    );
+    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+    const template = tRows[0];
+
+    const { rows: wRows } = await query(
+      "SELECT access_token, waba_id FROM whatsapp_configs WHERE business_id = $1",
+      [bId]
+    );
+    if (!wRows[0]?.access_token || !wRows[0]?.waba_id) {
+      return res.status(400).json({ message: "WhatsApp not connected" });
+    }
+
+    const { access_token, waba_id } = wRows[0];
+
+    // Fetch this specific template from Meta by name
+    const metaRes = await axios.get(
+      `https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
+      {
+        params:  { name: template.name, fields: "name,status,rejected_reason,quality_score" },
+        headers: { Authorization: `Bearer ${access_token}` },
+      }
+    );
+
+    const mt = metaRes.data?.data?.[0];
+    if (!mt) return res.json({ template, message: "Template not found on Meta yet" });
+
+    const STATUS_MAP = {
+      "APPROVED": "approved", "PENDING": "pending", "REJECTED": "rejected",
+      "DISABLED": "rejected", "PAUSED": "paused", "IN_APPEAL": "pending",
+    };
+
+    const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
+    const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
+
+    await query(`
+      UPDATE whatsapp_templates
+      SET status = $1, rejection_reason = $2, updated_at = NOW()
+      WHERE id = $3
+    `, [newStatus, rejReason, template.id]);
+
+    console.log(`📋 Template "${template.name}" synced: ${template.status} → ${newStatus}`);
+    res.json({ success: true, status: newStatus, rejection_reason: rejReason });
+
+  } catch (err) {
+    console.error("Single template sync error:", err.response?.data || err.message);
+    res.status(500).json({ message: "Sync failed: " + err.message });
+  }
+});
+
+
 router.get("/broadcast/templates/:id/status", async (req, res) => {
   try {
     const bId = req.user.business_id;

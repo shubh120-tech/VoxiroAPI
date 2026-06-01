@@ -104,6 +104,7 @@ app.use("/api/auth",   authRouter);
 app.use("/api",        teamRouter);        // invite routes
 app.use("/api",        shopifyOAuthRouter); // shopify OAuth callback
 app.use("/api/admin",  adminRouter);
+app.use("/api", billingRouter);
 // Protected routes — require auth
 app.use("/api",        dashboardRouter);
 app.use("/api",        knowledgeRouter);
@@ -114,7 +115,6 @@ app.use("/api",        trainingRouter);
 app.use("/api",        bizKnowledgeRouter);
 app.use("/api",        catalogRouter);
 app.use("/api",        shopifyOAuthRouter);
-app.use("/api", billingRouter);
 
 
 // ── 404 Handler ───────────────────────────────────────────────

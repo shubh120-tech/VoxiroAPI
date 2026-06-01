@@ -276,20 +276,30 @@ router.post("/billing/verify-payment", async (req, res) => {
       bId,
     ]);
 
-    // Activate / upgrade subscription
-    await query(`
-      INSERT INTO subscriptions
-        (business_id, plan_id, status, billing_cycle_end, messages_used, created_at, updated_at)
-      VALUES ($1::uuid, $2::uuid, 'active', $3, 0, NOW(), NOW())
-      ON CONFLICT (business_id)
-      DO UPDATE SET
-        plan_id           = $2::uuid,
-        status            = 'active',
-        trial_ends_at     = NULL,
-        billing_cycle_end = $3,
-        messages_used     = 0,
-        updated_at        = NOW()
-    `, [bId, plan_id, billingCycleEnd]);
+    // Activate / upgrade subscription — upsert safely
+    const { rows: existingSub } = await query(
+      "SELECT id FROM subscriptions WHERE business_id = $1::uuid",
+      [bId]
+    );
+
+    if (existingSub.length > 0) {
+      await query(`
+        UPDATE subscriptions
+        SET plan_id           = $1::uuid,
+            status            = 'active',
+            trial_ends_at     = NULL,
+            billing_cycle_end = $2,
+            messages_used     = 0,
+            updated_at        = NOW()
+        WHERE business_id = $3::uuid
+      `, [plan_id, billingCycleEnd, bId]);
+    } else {
+      await query(`
+        INSERT INTO subscriptions
+          (business_id, plan_id, status, billing_cycle_end, messages_used, created_at, updated_at)
+        VALUES ($1::uuid, $2::uuid, 'active', $3, 0, NOW(), NOW())
+      `, [bId, plan_id, billingCycleEnd]);
+    }
 
     // Update message_limit in agent_configs for sidebar
     await query(`
@@ -307,8 +317,9 @@ router.post("/billing/verify-payment", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Verify payment error:", err.message);
-    res.status(500).json({ message: "Payment verified but activation failed: " + err.message });
+    const errMsg = err?.message || JSON.stringify(err) || "Unknown error";
+    console.error("Verify payment error FULL:", errMsg, JSON.stringify(err));
+    res.status(500).json({ message: "Activation failed: " + errMsg });
   }
 });
 

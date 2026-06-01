@@ -206,10 +206,14 @@ router.post("/billing/create-order", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("Create order error FULL:", err);
-    console.error("Create order error MSG:", err?.message);
-    console.error("Create order error STR:", String(err));
-    res.status(500).json({ message: err?.message || String(err) || "Failed to create payment order" });
+    // Razorpay errors come as objects with error.description
+    const errMsg = err?.error?.description
+      || err?.message
+      || err?.description
+      || JSON.stringify(err)
+      || "Failed to create payment order";
+    console.error("Create order error:", errMsg, JSON.stringify(err));
+    res.status(500).json({ message: errMsg });
   }
 });
 

@@ -331,7 +331,7 @@ router.get("/agent/status", async (req, res) => {
       query(`
         SELECT COUNT(*) AS cnt FROM messages
         WHERE business_id = $1 AND role = 'agent'
-          AND created_at >= date_trunc('month', NOW())
+          AND created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'
       `, [bId]).catch(() => ({ rows: [{ cnt: 0 }] })),
     ]);
 
@@ -349,10 +349,12 @@ router.get("/agent/status", async (req, res) => {
       }
     } catch {}
 
-    // Resolve used: subscriptions > agent_configs > actual message count
-    const used  = subUsed  ?? parseInt(agent.rows[0]?.messages_used)  ?? parseInt(msgCount.rows[0]?.cnt) ?? 0;
-    // Resolve limit: subscriptions > agent_configs > default 1000
-    const limit = subLimit ?? parseInt(agent.rows[0]?.message_limit) ?? 1000;
+    // Always use actual message count from DB as the source of truth for used
+    // (agent_configs.messages_used is never updated, subscriptions may not exist)
+    const actualUsed  = parseInt(msgCount.rows[0]?.cnt) || 0;
+    const used  = (subUsed  !== null && subUsed  > 0) ? subUsed  : actualUsed;
+    const limit = (subLimit !== null && subLimit > 0) ? subLimit
+                : (parseInt(agent.rows[0]?.message_limit) || 1000);
 
     res.json({
       agentName:           agent.rows[0]?.agent_name || "Aria",

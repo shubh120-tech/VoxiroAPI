@@ -25,6 +25,11 @@ function isValidSendTime(date) {
   return h >= SEND_HOUR_START && h < SEND_HOUR_END;
 }
 
+// ── Helper: sanitize template name same way Meta expects ──────
+function sanitizeTemplateName(name) {
+  return name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+}
+
 // ══════════════════════════════════════════════════════════════
 //  CONTACT LISTS
 // ══════════════════════════════════════════════════════════════
@@ -275,16 +280,16 @@ router.get("/broadcast/templates", async (req, res) => {
 });
 
 
-// ── Sync template status from Meta ────────────────────────────
+// ── Sync ALL template statuses from Meta ──────────────────────
 router.post("/broadcast/templates/sync", async (req, res) => {
   try {
-    const bId       = req.user.business_id;
-    const recentOnly = req.query.recent === "true"; // only sync last 2 days
+    const businessId  = req.user.business_id;
+    const recentOnly  = req.query.recent === "true";
 
     // Get WhatsApp config
     const { rows: wRows } = await query(
       "SELECT access_token, waba_id FROM whatsapp_configs WHERE business_id = $1",
-      [bId]
+      [businessId]
     );
     if (!wRows.length || !wRows[0].access_token) {
       return res.status(400).json({ message: "WhatsApp not connected" });
@@ -295,12 +300,12 @@ router.post("/broadcast/templates/sync", async (req, res) => {
       return res.status(400).json({ message: "WABA ID not set. Please update WhatsApp settings." });
     }
 
-    // Get templates to sync
+    // Get local templates to sync
     let templateQuery = "SELECT * FROM whatsapp_templates WHERE business_id = $1";
     if (recentOnly) {
       templateQuery += " AND created_at >= NOW() - INTERVAL '2 days'";
     }
-    const { rows: localTemplates } = await query(templateQuery, [bId]);
+    const { rows: localTemplates } = await query(templateQuery, [businessId]);
 
     if (!localTemplates.length) {
       return res.json({ success: true, synced: 0, templates: [] });
@@ -319,19 +324,25 @@ router.post("/broadcast/templates/sync", async (req, res) => {
 
     // Map Meta status to our status
     const STATUS_MAP = {
-      "APPROVED":  "approved",
-      "PENDING":   "pending",
-      "REJECTED":  "rejected",
-      "DISABLED":  "rejected",
-      "PAUSED":    "paused",
-      "IN_APPEAL": "pending",
+      "APPROVED":         "approved",
+      "PENDING":          "pending",
+      "REJECTED":         "rejected",
+      "DISABLED":         "rejected",
+      "PAUSED":           "paused",
+      "IN_APPEAL":        "pending",
       "PENDING_DELETION": "pending",
     };
 
     let synced = 0;
     for (const lt of localTemplates) {
-      const mt = metaTemplates.find(t => t.name === lt.name);
-      if (!mt) continue;
+      // FIX: match by sanitized name (what Meta actually stores) OR exact name
+      const sanitized = sanitizeTemplateName(lt.name);
+      const mt = metaTemplates.find(t => t.name === sanitized || t.name === lt.name);
+
+      if (!mt) {
+        console.log(`⚠️  Template "${lt.name}" (sanitized: "${sanitized}") not found on Meta — skipping`);
+        continue;
+      }
 
       const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
       const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
@@ -343,20 +354,22 @@ router.post("/broadcast/templates/sync", async (req, res) => {
             updated_at       = NOW()
         WHERE id = $3
       `, [newStatus, rejReason, lt.id]).catch(async () => {
-        // meta_status column already exists;
+        // Fallback: add missing columns if needed
+        await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS meta_status VARCHAR(50) DEFAULT 'pending'`);
         await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
         await query(`UPDATE whatsapp_templates SET meta_status = $1 WHERE id = $2`, [newStatus, lt.id]);
       });
+
       synced++;
-      console.log(`📋 Template "${lt.name}": ${lt.status} → ${newStatus}`);
+      console.log(`📋 Template "${lt.name}" (Meta: "${mt.name}"): → ${newStatus}`);
     }
 
     const { rows } = await query(
       "SELECT * FROM whatsapp_templates WHERE business_id = $1 ORDER BY created_at DESC",
-      [bId]
+      [businessId]
     );
 
-    console.log(`✅ Synced ${synced} templates for business ${bId}`);
+    console.log(`✅ Synced ${synced} templates for business ${businessId}`);
     res.json({ success: true, synced, templates: rows });
   } catch (err) {
     console.error("Template sync error:", err.response?.data || err.message);
@@ -367,18 +380,18 @@ router.post("/broadcast/templates/sync", async (req, res) => {
 // ── Sync single template status ───────────────────────────────
 router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) => {
   try {
-    const bId = req.user.business_id;
+    const businessId = req.user.business_id;
 
     const { rows: tRows } = await query(
       "SELECT * FROM whatsapp_templates WHERE id = $1 AND business_id = $2",
-      [req.params.id, bId]
+      [req.params.id, businessId]
     );
     if (!tRows.length) return res.status(404).json({ message: "Template not found" });
     const template = tRows[0];
 
     const { rows: wRows } = await query(
       "SELECT access_token, waba_id FROM whatsapp_configs WHERE business_id = $1",
-      [bId]
+      [businessId]
     );
     if (!wRows[0]?.access_token || !wRows[0]?.waba_id) {
       return res.status(400).json({ message: "WhatsApp not connected" });
@@ -386,21 +399,35 @@ router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) =>
 
     const { access_token, waba_id } = wRows[0];
 
-    // Fetch this specific template from Meta by name
+    // FIX: search by sanitized name (what Meta stores) OR exact name
+    const sanitized = sanitizeTemplateName(template.name);
+
     const metaRes = await axios.get(
       `https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
       {
-        params:  { name: template.name, fields: "name,status,rejected_reason,quality_score" },
+        params:  { name: sanitized, fields: "name,status,rejected_reason,quality_score" },
         headers: { Authorization: `Bearer ${access_token}` },
       }
     );
 
-    const mt = metaRes.data?.data?.[0];
+    // Also try exact name if sanitized returns nothing
+    let mt = metaRes.data?.data?.[0];
+    if (!mt && sanitized !== template.name) {
+      const fallbackRes = await axios.get(
+        `https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
+        {
+          params:  { name: template.name, fields: "name,status,rejected_reason,quality_score" },
+          headers: { Authorization: `Bearer ${access_token}` },
+        }
+      ).catch(() => null);
+      mt = fallbackRes?.data?.data?.[0];
+    }
+
     if (!mt) return res.json({ template, message: "Template not found on Meta yet" });
 
     const STATUS_MAP = {
       "APPROVED": "approved", "PENDING": "pending", "REJECTED": "rejected",
-      "DISABLED": "rejected", "PAUSED": "paused", "IN_APPEAL": "pending",
+      "DISABLED": "rejected", "PAUSED": "paused",   "IN_APPEAL": "pending",
     };
 
     const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
@@ -412,7 +439,7 @@ router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) =>
       WHERE id = $3
     `, [newStatus, rejReason, template.id]);
 
-    console.log(`📋 Template "${template.name}" synced: ${template.status} → ${newStatus}`);
+    console.log(`📋 Template "${template.name}" synced: → ${newStatus}`);
     res.json({ success: true, status: newStatus, rejection_reason: rejReason });
 
   } catch (err) {
@@ -424,10 +451,10 @@ router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) =>
 
 router.get("/broadcast/templates/:id/status", async (req, res) => {
   try {
-    const bId = req.user.business_id;
+    const businessId = req.user.business_id;
     const { rows: tRows } = await query(
       "SELECT * FROM whatsapp_templates WHERE id = $1 AND business_id = $2",
-      [req.params.id, bId]
+      [req.params.id, businessId]
     );
     if (!tRows.length) return res.status(404).json({ message: "Template not found" });
 
@@ -435,15 +462,16 @@ router.get("/broadcast/templates/:id/status", async (req, res) => {
 
     const { rows: wRows } = await query(
       "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
-      [bId]
+      [businessId]
     );
     if (!wRows[0]?.access_token) {
       return res.json({ template });
     }
 
-    // Check status from Meta using template name
+    // FIX: use sanitized name for lookup
+    const sanitized = sanitizeTemplateName(template.name);
     const metaRes = await axios.get(
-      `https://graph.facebook.com/${META_VERSION}/${template.meta_template_id || template.name}`,
+      `https://graph.facebook.com/${META_VERSION}/${template.meta_template_id || sanitized}`,
       {
         params:  { fields: "name,status,quality_score" },
         headers: { Authorization: `Bearer ${wRows[0].access_token}` },
@@ -456,7 +484,7 @@ router.get("/broadcast/templates/:id/status", async (req, res) => {
         "UPDATE whatsapp_templates SET meta_status = $1, updated_at = NOW() WHERE id = $2",
         [newStatus, template.id]
       );
-      template.status = newStatus;
+      template.meta_status = newStatus;
     }
 
     res.json({ template });
@@ -559,6 +587,9 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       });
     }
 
+    // FIX: sanitize template name and store it back to DB so future syncs match
+    const metaName = sanitizeTemplateName(template.name);
+
     // Build Meta template components
     const components = [];
     if (template.header_text) {
@@ -568,9 +599,6 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
     if (template.footer_text) {
       components.push({ type: "FOOTER", text: template.footer_text });
     }
-
-    // Clean template name — Meta requires lowercase, underscores only
-    const metaName = template.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
 
     console.log(`📝 Submitting template "${metaName}" to Meta WABA: ${finalWabaId}`);
 
@@ -591,12 +619,15 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       }
     );
 
-    // Update template status
+    // FIX: store the sanitized name back to DB so sync can match by name later
     await query(`
       UPDATE whatsapp_templates
-      SET meta_status = 'pending', meta_template_id = $1, updated_at = NOW()
-      WHERE id = $2
-    `, [metaRes.data?.id?.toString(), req.params.id]);
+      SET meta_status      = 'pending',
+          meta_template_id = $1,
+          name             = $2,
+          updated_at       = NOW()
+      WHERE id = $3
+    `, [metaRes.data?.id?.toString(), metaName, req.params.id]);
 
     console.log(`✅ Template submitted: ${metaName} → ID: ${metaRes.data?.id}`);
     res.json({ success: true, metaTemplateId: metaRes.data?.id });
@@ -643,7 +674,7 @@ export async function handleTemplateStatusUpdate(value) {
       message_template_id.toString(),
     ]);
 
-    console.log(`✅ Template ${message_template_id} status updated: ${status}`);
+    console.log(`✅ Template ${message_template_id} status updated via webhook: ${status}`);
   } catch (err) {
     console.error("Template status update error:", err.message);
   }
@@ -698,7 +729,7 @@ router.post("/broadcast/campaigns", async (req, res) => {
       const schedDate = new Date(scheduled_at);
       if (!isValidSendTime(schedDate)) {
         return res.status(400).json({
-          message: "Scheduled time must be between 10 AM and 10 PM IST",
+          message: "Scheduled time must be between 6 AM and 11 PM IST",
         });
       }
     }
@@ -871,7 +902,7 @@ export async function executeCampaign(campaign, businessId) {
 
         console.log(`✅ Sent to ${recipient.phone}`);
 
-        // Delay between messages — avoid Meta rate limits (avoid spam)
+        // Delay between messages — avoid Meta rate limits
         await sleep(1500 + Math.random() * 1000);
 
       } catch (err) {

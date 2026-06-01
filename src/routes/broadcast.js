@@ -717,7 +717,7 @@ router.post("/broadcast/campaigns", async (req, res) => {
       name, message_type, template_id, message_body,
       variables_map, scheduled_at, recurring_rule,
       recurring_time, recurring_days,
-      recipient_source, contact_ids, lead_filter,
+      recipient_source, contact_list_id, contact_ids, lead_filter,
     } = req.body;
 
     if (!name) return res.status(400).json({ message: "Campaign name required" });
@@ -763,7 +763,7 @@ router.post("/broadcast/campaigns", async (req, res) => {
     const campaign = campRows[0];
 
     // Add recipients
-    const phones = await resolveRecipients(bId(req), { recipient_source, contact_ids, lead_filter });
+    const phones = await resolveRecipients(bId(req), { recipient_source, contact_list_id, contact_ids, lead_filter });
 
     for (const r of phones) {
       await query(`
@@ -1014,8 +1014,19 @@ async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, r
 }
 
 // ── Resolve recipients from source ───────────────────────────
-async function resolveRecipients(businessId, { recipient_source, contact_ids, lead_filter }) {
+async function resolveRecipients(businessId, { recipient_source, contact_list_id, contact_ids, lead_filter }) {
   const recipients = [];
+
+  // FIX: handle "list" source — fetch contacts from a specific contact list
+  if (recipient_source === "list" && contact_list_id) {
+    const { rows } = await query(`
+      SELECT bc.id AS contact_id, bc.phone, bc.name
+      FROM business_contacts bc
+      JOIN contact_list_members clm ON clm.contact_id = bc.id
+      WHERE clm.list_id = $1 AND bc.business_id = $2 AND bc.opted_out = FALSE
+    `, [contact_list_id, businessId]);
+    recipients.push(...rows);
+  }
 
   if (recipient_source === "contacts" || recipient_source === "all") {
     const { rows } = await query(`

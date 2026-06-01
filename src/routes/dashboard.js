@@ -5,6 +5,97 @@ import { authMiddleware } from "../middleware/auth.js";
 const router = express.Router();
 router.use(authMiddleware);
 
+router.get("/plans/public", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT id, name, display_name, price_monthly,
+             message_limit, doc_limit,
+             COALESCE(trial_days, 0) AS trial_days,
+             features
+      FROM plans
+      WHERE is_active = TRUE
+      ORDER BY price_monthly ASC
+    `);
+    res.json({ plans: rows });
+  } catch (err) {
+    console.error("Plans fetch error:", err.message);
+    res.status(500).json({ message: "Failed to load plans" });
+  }
+});
+ 
+// ── Select plan during onboarding (auth required) ─────────────
+router.post("/onboarding/select-plan", async (req, res) => {
+  try {
+    const bId    = req.user.business_id;
+    const { plan_id } = req.body;
+ 
+    if (!plan_id) return res.status(400).json({ message: "plan_id is required" });
+ 
+    // Validate plan exists
+    const { rows: planRows } = await query(
+      "SELECT * FROM plans WHERE id = $1 AND is_active = TRUE",
+      [plan_id]
+    );
+    if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
+ 
+    const plan = planRows[0];
+    const trialDays = parseInt(plan.trial_days) || 0;
+ 
+    const now             = new Date();
+    const trialEndsAt     = trialDays > 0 ? new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000) : null;
+    const billingCycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days
+ 
+    // Upsert subscription
+    await query(`
+      INSERT INTO subscriptions
+        (business_id, plan_id, status, trial_ends_at, billing_cycle_end,
+         messages_used, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW())
+      ON CONFLICT (business_id)
+      DO UPDATE SET
+        plan_id           = $2,
+        status            = $3,
+        trial_ends_at     = $4,
+        billing_cycle_end = $5,
+        messages_used     = 0,
+        updated_at        = NOW()
+    `, [
+      bId,
+      plan_id,
+      trialDays > 0 ? "trialing" : "active",
+      trialEndsAt,
+      billingCycleEnd,
+    ]);
+ 
+    // Also update agent_configs message_limit for sidebar display
+    await query(`
+      UPDATE agent_configs
+      SET message_limit = $1, updated_at = NOW()
+      WHERE business_id = $2
+    `, [plan.message_limit, bId]);
+ 
+    // Mark onboarding as complete
+    await query(`
+      UPDATE businesses
+      SET onboarding_completed = TRUE, updated_at = NOW()
+      WHERE id = $1
+    `, [bId]);
+ 
+    console.log(`✅ Plan selected: business ${bId} → plan ${plan.name} (trial: ${trialDays} days)`);
+ 
+    res.json({
+      success:    true,
+      plan:       plan.name,
+      status:     trialDays > 0 ? "trialing" : "active",
+      trial_days: trialDays,
+      trial_ends_at: trialEndsAt,
+    });
+  } catch (err) {
+    console.error("Select plan error:", err.message);
+    res.status(500).json({ message: "Failed to select plan: " + err.message });
+  }
+}); 
+
 // ── Analytics / Home ──────────────────────────────────────────
 router.get("/analytics/home", async (req, res) => {
   try {

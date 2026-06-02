@@ -17,7 +17,8 @@ router.get("/store/integrations", async (req, res) => {
   try {
     const { rows } = await query(`
       SELECT id, platform, store_url, status, last_synced_at,
-             product_count, error_message, created_at
+             product_count, error_message, created_at,
+             subscription_status, subscription_id
       FROM store_integrations
       WHERE business_id = $1
       ORDER BY created_at DESC

@@ -622,4 +622,115 @@ router.post("/store/shopify/register-gdpr", authMiddleware, async (req, res) => 
   }
 });
 
+
+// ══════════════════════════════════════════════════════════════
+// SHOPIFY BILLING API — Free plan subscription
+// ══════════════════════════════════════════════════════════════
+
+// ── Step 1: Create subscription (redirect to Shopify) ─────────
+router.get("/store/shopify/billing/subscribe", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT store_url, access_token FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "No Shopify store connected" });
+
+    const { store_url, access_token } = rows[0];
+    const returnUrl = `${API_URL}/api/store/shopify/billing/callback?business_id=${req.user.business_id}`;
+
+    // Create recurring application charge via GraphQL
+    const mutation = `
+      mutation {
+        appSubscriptionCreate(
+          name: "Yougant Free Plan"
+          returnUrl: "${returnUrl}"
+          test: ${process.env.NODE_ENV !== "production"}
+          lineItems: [{
+            plan: {
+              appRecurringPricingDetails: {
+                price: { amount: 0.00, currencyCode: USD }
+                interval: EVERY_30_DAYS
+              }
+            }
+          }]
+        ) {
+          appSubscription { id status }
+          confirmationUrl
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const gqlRes = await axios.post(
+      `https://${store_url}/admin/api/2026-04/graphql.json`,
+      { query: mutation },
+      { headers: { "X-Shopify-Access-Token": access_token, "Content-Type": "application/json" } }
+    );
+
+    const result = gqlRes.data?.data?.appSubscriptionCreate;
+    const errors = result?.userErrors;
+
+    if (errors?.length) {
+      console.error("Billing errors:", errors);
+      return res.status(400).json({ message: errors[0].message });
+    }
+
+    const confirmationUrl = result?.confirmationUrl;
+    if (!confirmationUrl) {
+      return res.status(500).json({ message: "Could not create subscription" });
+    }
+
+    // Save pending subscription
+    await query(`
+      UPDATE store_integrations
+      SET subscription_status = 'pending',
+          subscription_id     = $1,
+          updated_at          = NOW()
+      WHERE business_id = $2 AND platform = 'shopify'
+    `, [result?.appSubscription?.id, req.user.business_id]).catch(() => {});
+
+    res.json({ confirmationUrl });
+  } catch (err) {
+    console.error("Billing subscribe error:", err.response?.data || err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ── Step 2: Billing callback after merchant approves ──────────
+router.get("/store/shopify/billing/callback", async (req, res) => {
+  try {
+    const { charge_id, business_id } = req.query;
+
+    if (charge_id && business_id) {
+      await query(`
+        UPDATE store_integrations
+        SET subscription_status = 'active',
+            subscription_id     = $1,
+            updated_at          = NOW()
+        WHERE business_id = $2 AND platform = 'shopify'
+      `, [charge_id, business_id]).catch(() => {});
+      console.log(`✅ Shopify billing activated for business ${business_id}`);
+    }
+
+    res.redirect(`${FRONTEND_URL}/dashboard/integrations?billing=success`);
+  } catch (err) {
+    console.error("Billing callback error:", err.message);
+    res.redirect(`${FRONTEND_URL}/dashboard/integrations?billing=error`);
+  }
+});
+
+// ── Get billing status ────────────────────────────────────────
+router.get("/store/shopify/billing/status", authMiddleware, async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT subscription_status, subscription_id FROM store_integrations WHERE business_id = $1 AND platform = 'shopify'",
+      [req.user.business_id]
+    );
+    res.json({ status: rows[0]?.subscription_status || "none" });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
 export default router;

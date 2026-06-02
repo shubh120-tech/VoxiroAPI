@@ -590,15 +590,39 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
     // FIX: sanitize template name and store it back to DB so future syncs match
     const metaName = sanitizeTemplateName(template.name);
 
-    // Build Meta template components
+    // FIX: Convert named vars {{name}}, {{service}} → numbered {{1}}, {{2}} for Meta
+    // Store the var name → number mapping back to DB so send-time can resolve correctly
+    const namedVarRegex = /\{\{(\w+)\}\}/g;
+    const varNames = [];
+    const metaBody = (template.body || "").replace(namedVarRegex, (match, name) => {
+      // Skip if already a number
+      if (/^\d+$/.test(name)) {
+        if (!varNames.includes(name)) varNames.push(name);
+        return match;
+      }
+      if (!varNames.includes(name)) varNames.push(name);
+      return `{{${varNames.indexOf(name) + 1}}}`;
+    });
+
+    const metaHeaderText = template.header_text
+      ? template.header_text.replace(namedVarRegex, (match, name) => {
+          if (/^\d+$/.test(name)) return match;
+          if (!varNames.includes(name)) varNames.push(name);
+          return `{{${varNames.indexOf(name) + 1}}}`;
+        })
+      : null;
+
+    // Build Meta template components with numbered vars
     const components = [];
-    if (template.header_text) {
-      components.push({ type: "HEADER", format: "TEXT", text: template.header_text });
+    if (metaHeaderText) {
+      components.push({ type: "HEADER", format: "TEXT", text: metaHeaderText });
     }
-    components.push({ type: "BODY", text: template.body });
+    components.push({ type: "BODY", text: metaBody });
     if (template.footer_text) {
       components.push({ type: "FOOTER", text: template.footer_text });
     }
+
+    console.log(`📝 Variables mapped: ${JSON.stringify(varNames)} for template "${metaName}"`);
 
     console.log(`📝 Submitting template "${metaName}" to Meta WABA: ${finalWabaId}`);
 
@@ -619,15 +643,16 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       }
     );
 
-    // FIX: store the sanitized name back to DB so sync can match by name later
+    // FIX: store sanitized name + variable order mapping back to DB
     await query(`
       UPDATE whatsapp_templates
       SET meta_status      = 'pending',
           meta_template_id = $1,
           name             = $2,
+          variables        = $3,
           updated_at       = NOW()
-      WHERE id = $3
-    `, [metaRes.data?.id?.toString(), metaName, req.params.id]);
+      WHERE id = $4
+    `, [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]);
 
     console.log(`✅ Template submitted: ${metaName} → ID: ${metaRes.data?.id}`);
     res.json({ success: true, metaTemplateId: metaRes.data?.id });
@@ -986,13 +1011,20 @@ async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, r
   const template = tRows[0];
 
   // Build variable components
+  // variables = ["name","service"] — ordered list matching {{1}},{{2}} positions
+  // variables_map = { "name": "static value" } — static values set at campaign level
+  // AUTO values: "name"→contact name, "phone"→contact phone, "notes"→contact notes
   const components = [];
   const variables  = template.variables || [];
   if (variables.length > 0) {
-    const bodyParams = variables.map(varName => ({
-      type: "text",
-      text: recipient.variables?.[varName] || campaign.variables_map?.[varName] || "",
-    }));
+    const bodyParams = variables.map(varName => {
+      // Auto-resolve common field names from contact record
+      if (varName === "name"  || varName === "1") return { type: "text", text: recipient.name  || recipient.variables?.name  || campaign.variables_map?.[varName] || "" };
+      if (varName === "phone" || varName === "2") return { type: "text", text: recipient.phone || recipient.variables?.phone || campaign.variables_map?.[varName] || "" };
+      if (varName === "notes")                    return { type: "text", text: recipient.variables?.notes || campaign.variables_map?.[varName] || "" };
+      // Otherwise use campaign variables_map (static value set by owner)
+      return { type: "text", text: campaign.variables_map?.[varName] || recipient.variables?.[varName] || "" };
+    });
     components.push({ type: "body", parameters: bodyParams });
   }
 

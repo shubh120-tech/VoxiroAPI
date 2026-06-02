@@ -63,22 +63,32 @@ router.get("/billing/current", async (req, res) => {
 
     const { rows: subRows } = await query(`
       SELECT
-        s.*,
-        p.name           AS plan_name,
+        s.id,
+        s.business_id,
+        s.plan_id,
+        s.messages_used,
+        s.billing_cycle_start,
+        s.billing_cycle_end,
+        s.trial_ends_at,
+        s.is_active,
+        CASE WHEN s.trial_ends_at > NOW() THEN 'trialing'
+             WHEN s.is_active = TRUE THEN 'active'
+             ELSE 'inactive' END AS status,
+        p.name::text     AS plan_name,
         p.display_name   AS plan_display_name,
         p.price_monthly,
         p.message_limit,
         p.doc_limit,
-        p.trial_days,
+        COALESCE(p.trial_days, 0) AS trial_days,
         b.name           AS business_name,
         b.address,
         u.owner_name,
         u.email
       FROM subscriptions s
-      JOIN plans p ON p.id::text = s.plan_id::text
+      JOIN plans p ON p.id = s.plan_id
       JOIN businesses b ON b.id = s.business_id
       JOIN users u ON u.business_id = s.business_id AND u.role = 'owner'
-      WHERE s.business_id = $1
+      WHERE s.business_id = $1::uuid
       ORDER BY s.created_at DESC LIMIT 1
     `, [bId]);
 
@@ -285,19 +295,21 @@ router.post("/billing/verify-payment", async (req, res) => {
     if (existingSub.length > 0) {
       await query(`
         UPDATE subscriptions
-        SET plan_id           = $1::uuid,
-            status            = 'active',
-            trial_ends_at     = NULL,
-            billing_cycle_end = $2,
-            messages_used     = 0,
-            updated_at        = NOW()
+        SET plan_id              = $1::uuid,
+            is_active            = TRUE,
+            trial_ends_at        = NULL,
+            billing_cycle_start  = NOW(),
+            billing_cycle_end    = $2,
+            messages_used        = 0,
+            updated_at           = NOW()
         WHERE business_id = $3::uuid
       `, [plan_id, billingCycleEnd, bId]);
     } else {
       await query(`
         INSERT INTO subscriptions
-          (business_id, plan_id, status, billing_cycle_end, messages_used, created_at, updated_at)
-        VALUES ($1::uuid, $2::uuid, 'active', $3, 0, NOW(), NOW())
+          (business_id, plan_id, is_active, billing_cycle_start,
+           billing_cycle_end, messages_used, created_at, updated_at)
+        VALUES ($1::uuid, $2::uuid, TRUE, NOW(), $3, 0, NOW(), NOW())
       `, [bId, plan_id, billingCycleEnd]);
     }
 

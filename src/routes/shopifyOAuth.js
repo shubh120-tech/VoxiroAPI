@@ -78,11 +78,25 @@ router.post("/store/shopify/install", authMiddleware, async (req, res) => {
     const { shop, accessToken } = req.body;
     if (!shop?.trim()) return res.status(400).json({ message: "Store URL required" });
 
-    const shopDomain = shop.trim()
+    let shopDomain = shop.trim()
       .toLowerCase()
-      .replace(/^https?:\/\//, "")
-      .replace(/\/$/, "")
-      .replace(/^([^.]+)$/, "$1.myshopify.com"); // add .myshopify.com if just subdomain
+      .replace(/^https?:\/\//, "")   // remove protocol
+      .replace(/\/$/, "")             // remove trailing slash
+      .replace(/\/.*$/, "");          // remove any path
+
+    // Extract just the subdomain if full myshopify URL
+    if (shopDomain.includes(".myshopify.com")) {
+      shopDomain = shopDomain.split(".myshopify.com")[0] + ".myshopify.com";
+    } else if (!shopDomain.includes(".")) {
+      // Just a name like "mystore" → add .myshopify.com
+      shopDomain = shopDomain + ".myshopify.com";
+    } else {
+      // Has dots but not myshopify — extract first part and add myshopify
+      // e.g. mystore.mystore.com → mystore.myshopify.com
+      shopDomain = shopDomain.split(".")[0] + ".myshopify.com";
+    }
+
+    console.log(`🏪 Shop domain resolved: "${shop}" → "${shopDomain}"`);
 
     // ── Option A: Direct token (Custom App) ──────────────────
     if (accessToken?.trim()) {

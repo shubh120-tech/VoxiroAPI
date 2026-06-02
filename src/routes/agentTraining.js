@@ -274,4 +274,56 @@ function buildDiff(original, fixed) {
   return diff;
 }
 
+// ═══════════════════════════════════════════════════════════
+//  ADD THESE ROUTES TO agentTraining.js
+//  (add before the export default router line)
+// ═══════════════════════════════════════════════════════════
+
+// ── GET /training/qa — load saved answers ────────────────────
+router.get("/training/qa", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT question_id, question, answer, category, is_required FROM training_qa WHERE business_id = $1 ORDER BY category, question_id",
+      [bId(req)]
+    );
+    res.json({ answers: rows });
+  } catch (err) {
+    console.error("Load Q&A error:", err.message);
+    res.status(500).json({ message: "Failed to load training answers" });
+  }
+});
+
+// ── POST /training/qa — save answers ─────────────────────────
+router.post("/training/qa", async (req, res) => {
+  try {
+    const { answers } = req.body;
+    if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be an array" });
+
+    for (const a of answers) {
+      if (!a.question_id) continue;
+      await query(`
+        INSERT INTO training_qa
+          (business_id, question_id, question, answer, category, is_required, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+        ON CONFLICT (business_id, question_id)
+        DO UPDATE SET
+          answer     = $4,
+          updated_at = NOW()
+      `, [
+        bId(req),
+        a.question_id,
+        a.question    || "",
+        a.answer      || "",
+        a.category    || "general",
+        a.is_required || false,
+      ]);
+    }
+
+    res.json({ success: true, saved: answers.length });
+  } catch (err) {
+    console.error("Save Q&A error:", err.message);
+    res.status(500).json({ message: "Failed to save training answers: " + err.message });
+  }
+});
+
 export default router;

@@ -6,6 +6,64 @@ import { sendWhatsAppMessage, notifyOwnerWhatsApp, getWhatsAppCredentials, markR
 
 const router = express.Router();
 
+// ── Get agent behavior settings for a business ───────────────
+async function getAgentBehavior(businessId) {
+  const { rows } = await query(
+    "SELECT * FROM agent_behavior WHERE business_id = $1",
+    [businessId]
+  ).catch(() => ({ rows: [] }));
+  return rows[0] || null;
+}
+
+// ── Check if current IST time is within working hours ─────────
+function isWithinWorkingHours(behavior) {
+  if (!behavior || behavior.working_hours_mode === "24x7") return true;
+
+  const now  = new Date(Date.now() + 5.5 * 60 * 60 * 1000); // IST
+  const day  = ["sun","mon","tue","wed","thu","fri","sat"][now.getUTCDay()];
+  const days = behavior.working_days || ["mon","tue","wed","thu","fri","sat"];
+
+  if (!days.includes(day)) return false;
+
+  const hhmm  = `${String(now.getUTCHours()).padStart(2,"0")}:${String(now.getUTCMinutes()).padStart(2,"0")}`;
+  const start = behavior.working_start || "10:00";
+  const end   = behavior.working_end   || "22:00";
+
+  return hhmm >= start && hhmm < end;
+}
+
+// ── Check if customer message contains escalation keywords ────
+async function checkKeywordEscalation(businessId, messageText, conversationId) {
+  try {
+    const { rows } = await query(
+      "SELECT notify_on_keywords FROM agent_behavior WHERE business_id = $1",
+      [businessId]
+    ).catch(() => ({ rows: [] }));
+
+    if (!rows.length) return null;
+
+    const keywords  = rows[0].notify_on_keywords || [];
+    const lowerMsg  = messageText.toLowerCase();
+    const triggered = keywords.find(kw => lowerMsg.includes(kw.toLowerCase()));
+
+    if (triggered) {
+      await query(`
+        UPDATE conversations
+        SET status       = 'needs-help',
+            escalated_at = COALESCE(escalated_at, NOW()),
+            updated_at   = NOW()
+        WHERE id = $1
+      `, [conversationId]);
+      console.log(`🚨 Keyword escalation triggered: "${triggered}"`);
+      return triggered;
+    }
+    return null;
+  } catch (err) {
+    console.error("Keyword check error:", err.message);
+    return null;
+  }
+}
+
 // ── Debug endpoint — check webhook config ─────────────────────
 router.get("/debug", async (req, res) => {
   try {
@@ -30,7 +88,6 @@ router.get("/debug", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 router.get("/", (req, res) => {
   const mode      = req.query["hub.mode"];
@@ -102,7 +159,6 @@ router.post("/", async (req, res) => {
         `, [phoneNumberId]);
 
         if (!bizRows.length) {
-          // Show all stored phone IDs for comparison
           const { rows: allConfigs } = await query(
             "SELECT phone_number_id, business_id FROM whatsapp_configs LIMIT 5"
           );
@@ -181,6 +237,61 @@ async function processIncomingMessage({
   // 2c. If customer replied to a broadcast — mark as replied
   await markBroadcastReplied(business_id, customerPhone);
 
+  // 2d. Check keyword escalation — if triggered, notify team and stop
+  const triggeredKeyword = await checkKeywordEscalation(business_id, messageText, conversation.id);
+  if (triggeredKeyword) {
+    const alertMsg = `🚨 Keyword alert: Customer ${customerName || customerPhone} said "${triggeredKeyword}". Please check the conversation immediately.`;
+    await notifyOwnerWhatsApp(business_id, alertMsg);
+    console.log(`🚨 Keyword "${triggeredKeyword}" escalation — team notified, agent stopped`);
+    return;
+  }
+
+  // 2e. Check working hours
+  const behavior    = await getAgentBehavior(business_id);
+  const withinHours = isWithinWorkingHours(behavior);
+
+  if (!withinHours && behavior) {
+    const action = behavior.outside_hours_action || "reply_closed";
+
+    if (action === "silent") {
+      console.log(`🌙 Outside hours (silent mode) — message saved, no reply for ${customerPhone}`);
+      return;
+    }
+
+    if (action === "reply_closed" || action === "collect_only") {
+      const closedMsg = behavior.outside_hours_msg ||
+        "We are currently closed. We will get back to you during business hours. Thank you! 🙏";
+
+      await sendWhatsAppMessage({
+        phoneNumberId,
+        accessToken: access_token,
+        to:          customerPhone,
+        message:     closedMsg,
+      });
+
+      await query(`
+        INSERT INTO messages (conversation_id, business_id, role, content)
+        VALUES ($1, $2, 'agent', $3)
+      `, [conversation.id, business_id, closedMsg]);
+
+      // collect_only — mark for human follow-up
+      if (action === "collect_only") {
+        await query(`
+          UPDATE conversations
+          SET status       = 'needs-help',
+              escalated_at = COALESCE(escalated_at, NOW()),
+              updated_at   = NOW()
+          WHERE id = $1
+        `, [conversation.id]);
+        await notifyOwnerWhatsApp(business_id,
+          `📋 Outside-hours inquiry from ${customerName || customerPhone}: "${messageText.slice(0, 100)}"`);
+      }
+
+      console.log(`🌙 Outside hours (${action}) — closed message sent to ${customerPhone}`);
+      return;
+    }
+  }
+
   // 3. Check if subscription allows more messages
   const allowed = await checkMessageLimit(business_id);
   if (!allowed) {
@@ -193,14 +304,47 @@ async function processIncomingMessage({
     return;
   }
 
-  // 4. Increment message usage counter
+  // 4. Check max auto-replies limit
+  if (behavior?.max_auto_replies > 0) {
+    const { rows: convRows } = await query(
+      "SELECT auto_reply_count FROM conversations WHERE id = $1",
+      [conversation.id]
+    );
+    const replyCount = parseInt(convRows[0]?.auto_reply_count) || 0;
+
+    if (replyCount >= behavior.max_auto_replies) {
+      // Escalate — max replies reached
+      await query(`
+        UPDATE conversations
+        SET status       = 'needs-help',
+            escalated_at = COALESCE(escalated_at, NOW()),
+            updated_at   = NOW()
+        WHERE id = $1
+      `, [conversation.id]);
+
+      await notifyOwnerWhatsApp(business_id,
+        `👋 Customer ${customerName || customerPhone} has sent ${replyCount} messages. Please review and respond.`);
+
+      console.log(`🔔 Max auto-replies (${behavior.max_auto_replies}) reached for ${customerPhone} — escalated`);
+      return;
+    }
+  }
+
+  // 5. Increment message usage counter
   await query(`
     UPDATE subscriptions
     SET messages_used = messages_used + 1
     WHERE business_id = $1
   `, [business_id]);
 
-  // 5. Run agent — sends multi-part messages with typing indicators
+  // 6. Increment auto_reply_count on conversation
+  await query(`
+    UPDATE conversations
+    SET auto_reply_count = COALESCE(auto_reply_count, 0) + 1
+    WHERE id = $1
+  `, [conversation.id]);
+
+  // 7. Run agent — sends multi-part messages with typing indicators
   await handleIncomingMessage({
     businessId:     business_id,
     conversationId: conversation.id,
@@ -209,7 +353,7 @@ async function processIncomingMessage({
     message:        messageText,
     phoneNumberId,
     accessToken:    access_token,
-    waMessageId:    waMessageId,  // for marking as read + typing simulation
+    waMessageId:    waMessageId,
   });
 }
 
@@ -217,7 +361,6 @@ async function processIncomingMessage({
  * Get existing conversation or create new one.
  */
 async function getOrCreateConversation({ businessId, customerPhone, customerName }) {
-  // Look for existing ACTIVE conversation (not stopped/manual/needs-help)
   const { rows } = await query(`
     SELECT id, status FROM conversations
     WHERE business_id    = $1
@@ -237,8 +380,6 @@ async function getOrCreateConversation({ businessId, customerPhone, customerName
     return rows[0];
   }
 
-  // Also check if there's a manual/needs-help conversation
-  // If yes — keep it stopped, create a NEW conversation for this message
   const { rows: stoppedRows } = await query(`
     SELECT id FROM conversations
     WHERE business_id    = $1
@@ -248,11 +389,9 @@ async function getOrCreateConversation({ businessId, customerPhone, customerName
   `, [businessId, customerPhone]);
 
   if (stoppedRows.length > 0) {
-    // Previous conversation is stopped — create fresh one for new message
     console.log(`📞 New message from ${customerPhone} — creating fresh conversation (old one is stopped)`);
   }
 
-  // Create new conversation
   const { rows: newRows } = await query(`
     INSERT INTO conversations
       (business_id, customer_name, customer_phone, status, unread_count)
@@ -283,43 +422,9 @@ async function checkMessageLimit(businessId) {
  */
 function verifySignature(req) {
   return true;
-  // const signature = req.headers["x-hub-signature-256"];
-
-  // // If no secret configured — skip verification (dev mode)
-  // if (!process.env.META_APP_SECRET) {
-  //   console.warn("⚠️  META_APP_SECRET not set — skipping signature verification");
-  //   return true;
-  // }
-
-  // if (!signature) {
-  //   console.warn("⚠️  No x-hub-signature-256 header");
-  //   return false;
-  // }
-
-  // try {
-  //   // req.body is a Buffer when express.raw() is used
-  //   const rawBody = Buffer.isBuffer(req.body)
-  //     ? req.body
-  //     : Buffer.from(JSON.stringify(req.body));
-
-  //   const expected = "sha256=" + crypto
-  //     .createHmac("sha256", process.env.META_APP_SECRET)
-  //     .update(rawBody)
-  //     .digest("hex");
-
-  //   const sigBuffer      = Buffer.from(signature);
-  //   const expectedBuffer = Buffer.from(expected);
-
-  //   if (sigBuffer.length !== expectedBuffer.length) return false;
-
-  //   return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
-  // } catch (err) {
-  //   console.error("Signature verification error:", err.message);
-  //   return false;
-  // }
 }
 
-// ── Process Media / Document Message ────────────────────────
+// ── Process Media / Document Message ─────────────────────────
 async function processMediaMessage({ phoneNumberId, customerPhone, customerName, msg }) {
   try {
     const { rows: bizRows } = await query(`
@@ -346,7 +451,6 @@ async function processMediaMessage({ phoneNumberId, customerPhone, customerName,
     const isPayment = /pay|paid|upi|gpay|phonepe|paytm|neft|imps|receipt|transaction|txn|screenshot|advance|deposit|भुगतान|पेमेंट/i
       .test(`${caption} ${filename}`);
 
-    // Download and store media
     let storedUrl = null;
     if (mediaId && process.env.CLOUDFLARE_R2_ACCOUNT_ID) {
       try {
@@ -361,7 +465,6 @@ async function processMediaMessage({ phoneNumberId, customerPhone, customerName,
       ? `[Payment ${typeLabel}${caption ? `: ${caption}` : ""}]`
       : `[${typeLabel}${caption ? `: ${caption}` : ""}${filename ? ` (${filename})` : ""}]`;
 
-    // Save message with media URL
     await query(`
       INSERT INTO messages (conversation_id, business_id, role, content, media_url, media_type, media_filename)
       VALUES ($1, $2, 'customer', $3, $4, $5, $6)
@@ -376,20 +479,26 @@ async function processMediaMessage({ phoneNumberId, customerPhone, customerName,
       : `Thank you! I have received your ${typeLabel} and shared it with the team. They will review and get back to you shortly.`;
 
     await sendWhatsAppMessage({ phoneNumberId, accessToken: access_token, to: customerPhone, message: ackMsg });
+
     await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'agent', $3)`,
       [conversation.id, business_id, ackMsg]);
-    await query(`UPDATE conversations SET status = 'manual', updated_at = NOW() WHERE id = $1`, [conversation.id]);
+
+    // Mark as manual + set escalated_at for media messages
+    await query(`
+      UPDATE conversations
+      SET status       = 'manual',
+          escalated_at = COALESCE(escalated_at, NOW()),
+          updated_at   = NOW()
+      WHERE id = $1
+    `, [conversation.id]);
 
     const name     = customerName || customerPhone;
     const icon     = isPayment ? "💰" : "📎";
     const subject  = isPayment ? "Payment received" : `${typeLabel} received`;
     const ownerMsg = `${icon} ${subject} from ${name}`
-      + (caption  ? `
-Caption: "${caption}"` : "")
-      + (filename ? `
-File: ${filename}`     : "")
-      + `
-Open dashboard to view and respond.`;
+      + (caption  ? `\nCaption: "${caption}"` : "")
+      + (filename ? `\nFile: ${filename}`     : "")
+      + `\nOpen dashboard to view and respond.`;
 
     await notifyOwnerWhatsApp(business_id, ownerMsg);
     console.log(`${icon} Media (${typeLabel}) from ${customerPhone} — stored & owner notified`);
@@ -404,7 +513,6 @@ async function downloadAndStoreMedia({ mediaId, accessToken, businessId, mimeTyp
   const META_BASE    = process.env.META_BASE_URL    || "https://graph.facebook.com";
   const META_VERSION = process.env.META_API_VERSION || "v19.0";
 
-  // Get media URL from Meta
   const metaRes = await axios.get(
     `${META_BASE}/${META_VERSION}/${mediaId}`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -412,14 +520,12 @@ async function downloadAndStoreMedia({ mediaId, accessToken, businessId, mimeTyp
   const mediaUrl = metaRes.data?.url;
   if (!mediaUrl) throw new Error("No media URL from Meta");
 
-  // Download file
   const fileRes = await axios.get(mediaUrl, {
     responseType: "arraybuffer",
     headers:      { Authorization: `Bearer ${accessToken}` },
   });
   const buffer = Buffer.from(fileRes.data);
 
-  // Upload to R2
   const AWS = (await import("aws-sdk")).default;
   const r2  = new AWS.S3({
     endpoint:         `https://${process.env.CLOUDFLARE_R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -440,46 +546,33 @@ async function downloadAndStoreMedia({ mediaId, accessToken, businessId, mimeTyp
 
   await r2.putObject({ Bucket: bucket, Key: key, Body: buffer, ContentType: mimeType || "application/octet-stream" }).promise();
 
-  // Generate signed URL (valid 7 days) so dashboard can view it
   const signedUrl = r2.getSignedUrl("getObject", {
     Bucket:  bucket,
     Key:     key,
-    Expires: 7 * 24 * 60 * 60, // 7 days
+    Expires: 7 * 24 * 60 * 60,
   });
 
   return signedUrl;
 }
 
-
-// ── Mark Broadcast As Replied ────────────────────────────────
+// ── Mark Broadcast As Replied ─────────────────────────────────
 async function markBroadcastReplied(businessId, customerPhone) {
   try {
     const { rows } = await query(`
       SELECT br.id, br.campaign_id
       FROM broadcast_recipients br
-      WHERE br.business_id   = $1
-        AND br.phone         = $2
-        AND br.status        IN ('sent', 'delivered', 'read')
-        AND br.replied_at    IS NULL
+      WHERE br.business_id = $1
+        AND br.phone        = $2
+        AND br.status       IN ('sent', 'delivered', 'read')
+        AND br.replied_at   IS NULL
       ORDER BY br.sent_at DESC
       LIMIT 1
     `, [businessId, customerPhone]);
 
     if (!rows.length) return;
 
-    const { id, campaign_id } = rows[0];
-
-    await query(`
-      UPDATE broadcast_recipients
-      SET status = 'replied', replied_at = NOW()
-      WHERE id = $1
-    `, [id]);
-
-    await query(`
-      UPDATE broadcast_campaigns
-      SET replied_count = replied_count + 1
-      WHERE id = $1
-    `, [campaign_id]);
+    await query(`UPDATE broadcast_recipients SET status = 'replied', replied_at = NOW() WHERE id = $1`, [rows[0].id]);
+    await query(`UPDATE broadcast_campaigns SET replied_count = replied_count + 1 WHERE id = $1`, [rows[0].campaign_id]);
 
     console.log(`📢 Broadcast reply from ${customerPhone}`);
   } catch (err) {
@@ -487,28 +580,25 @@ async function markBroadcastReplied(businessId, customerPhone) {
   }
 }
 
-// ── Update Broadcast Delivery/Read Status ────────────────────
+// ── Update Broadcast Delivery/Read Status ─────────────────────
 async function updateBroadcastStatus(status) {
   try {
-    const { id: waMessageId, status: msgStatus, recipient_id } = status;
+    const { id: waMessageId, status: msgStatus } = status;
     if (!waMessageId) return;
 
-    // Check if this message is from a broadcast
     const { rows } = await query(`
       SELECT id, campaign_id FROM broadcast_recipients
-      WHERE wa_message_id = $1
-      LIMIT 1
+      WHERE wa_message_id = $1 LIMIT 1
     `, [waMessageId]);
 
     if (!rows.length) return;
 
-    const recipient  = rows[0];
-    const now        = new Date().toISOString();
-    const statusMap  = { delivered: "delivered", read: "read", failed: "failed" };
-    const newStatus  = statusMap[msgStatus];
+    const recipient = rows[0];
+    const now       = new Date().toISOString();
+    const statusMap = { delivered: "delivered", read: "read", failed: "failed" };
+    const newStatus = statusMap[msgStatus];
     if (!newStatus) return;
 
-    // Update recipient status
     await query(`
       UPDATE broadcast_recipients
       SET status = $1,
@@ -516,48 +606,29 @@ async function updateBroadcastStatus(status) {
       WHERE id = $3
     `, [newStatus, now, recipient.id]);
 
-    // Update campaign counters
-    const counterCol = {
-      delivered: "delivered_count",
-      read:      "read_count",
-      failed:    "failed_count",
-    }[newStatus];
-
+    const counterCol = { delivered: "delivered_count", read: "read_count", failed: "failed_count" }[newStatus];
     if (counterCol) {
-      await query(`
-        UPDATE broadcast_campaigns
-        SET ${counterCol} = ${counterCol} + 1
-        WHERE id = $1
-      `, [recipient.campaign_id]);
+      await query(`UPDATE broadcast_campaigns SET ${counterCol} = ${counterCol} + 1 WHERE id = $1`, [recipient.campaign_id]);
     }
-
   } catch (err) {
     console.error("Broadcast status update error:", err.message);
   }
 }
 
-// ── Save Pending Message (for 10s batch window) ─────────────
+// ── Save Pending Message (for 10s batch window) ───────────────
 async function savePendingMessage({
   businessId, customerPhone, customerName,
   phoneNumberId, accessToken, messageText, waMessageId,
 }) {
   try {
-    // Get or create conversation first
-    const conversation = await getOrCreateConversation({
-      businessId,
-      customerPhone,
-      customerName,
-    });
+    const conversation = await getOrCreateConversation({ businessId, customerPhone, customerName });
 
-    // Cancel pending follow-ups — customer is active
     await cancelPendingFollowUps(businessId, customerPhone);
 
-    // Mark as read immediately — blue ticks appear right away
     if (waMessageId) {
       await markReadAndShowTyping({ phoneNumberId, accessToken, waMessageId });
     }
 
-    // Save message to pending_messages table
     await query(`
       INSERT INTO pending_messages
         (business_id, conversation_id, customer_phone, customer_name,
@@ -565,17 +636,10 @@ async function savePendingMessage({
          message_type, received_at, processed)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'text', NOW(), FALSE)
     `, [
-      businessId,
-      conversation.id,
-      customerPhone,
-      customerName,
-      phoneNumberId,
-      accessToken,
-      messageText,
-      waMessageId,
+      businessId, conversation.id, customerPhone, customerName,
+      phoneNumberId, accessToken, messageText, waMessageId,
     ]);
 
-    // Save to messages table — check for existing wa_message_id first
     if (waMessageId) {
       const { rows: existing } = await query(
         "SELECT id FROM messages WHERE wa_message_id = $1 LIMIT 1",
@@ -607,7 +671,7 @@ async function savePendingMessage({
   }
 }
 
-// ── Cancel Pending Follow-ups ────────────────────────────────
+// ── Cancel Pending Follow-ups ─────────────────────────────────
 async function cancelPendingFollowUps(businessId, customerPhone) {
   try {
     const { rowCount } = await query(`
@@ -622,7 +686,7 @@ async function cancelPendingFollowUps(businessId, customerPhone) {
     `, [businessId, customerPhone]);
 
     if (rowCount > 0) {
-      console.log(`✅ Cancelled ${rowCount} pending follow-up(s) for ${customerPhone} — customer messaged first`);
+      console.log(`✅ Cancelled ${rowCount} pending follow-up(s) for ${customerPhone}`);
     }
   } catch (err) {
     console.error("Cancel follow-up error:", err.message);

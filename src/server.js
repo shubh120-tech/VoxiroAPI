@@ -25,6 +25,10 @@ import shopifyOAuthRouter from "./routes/shopifyOAuth.js";
 import whatsappWebhook   from "./webhook/whatsapp.js";
 import bizKnowledgeRouter from "./routes/businessKnowledge.js"
 import billingRouter from "./routes/billing.js";
+import agentBehaviorRouter from "./routes/agentBehavior.js";
+import { startEscalationCron } from "./crons/escalationCron.js";
+
+
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -115,6 +119,7 @@ app.use("/api",        trainingRouter);
 app.use("/api",        bizKnowledgeRouter);
 app.use("/api",        catalogRouter);
 app.use("/api",        shopifyOAuthRouter);
+app.use("/api", agentBehaviorRouter);
 
 
 // ── 404 Handler ───────────────────────────────────────────────
@@ -153,6 +158,8 @@ app.listen(PORT, () => {
   // Collects messages in 10 second window then sends combined reply
   console.log("📦 Message batch processor started — runs every 3 seconds");
   setInterval(processMessageBatches, 3 * 1000);
+  console.log("escalation ");
+  startEscalationCron();
 });
 
 export default app;

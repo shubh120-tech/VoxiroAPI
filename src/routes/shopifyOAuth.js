@@ -222,9 +222,28 @@ router.get("/store/shopify/callback", async (req, res) => {
     if (!accessToken) {
       return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=no_token`);
     }
-    console.log("✅ Got access token — saving integration...");
 
-    // Get shop info — optional, don't fail if 403
+    // Validate token works before saving
+    console.log("🔑 Token obtained:", accessToken.slice(0, 12) + "...");
+    try {
+      await axios.get(
+        `https://${shop}/admin/api/2026-04/shop.json`,
+        { headers: { "X-Shopify-Access-Token": accessToken }, timeout: 8000 }
+      );
+      console.log("✅ Token validated successfully");
+    } catch (validErr) {
+      console.error("❌ Token validation failed:", validErr.response?.status, validErr.response?.data);
+      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=invalid_token`);
+    }
+
+    if (!businessId) {
+      console.error("❌ No businessId — state lookup failed");
+      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=session_expired`);
+    }
+
+    console.log("✅ Got access token — saving integration for business:", businessId);
+
+    // Get shop info — reuse token validation call
     let shopName  = shop.replace(".myshopify.com", "");
     let shopEmail = "";
     let currency  = "INR";
@@ -237,9 +256,9 @@ router.get("/store/shopify/callback", async (req, res) => {
       shopName  = s?.name  || shopName;
       shopEmail = s?.email || "";
       currency  = s?.currency || "INR";
-      console.log("✅ Shop info fetched:", shopName);
+      console.log("✅ Shop info:", shopName, currency);
     } catch (err) {
-      console.warn("⚠️  Could not fetch shop info (non-fatal):", err.response?.status, "— using defaults");
+      console.warn("⚠️  Shop info fetch failed — using defaults");
     }
 
     // Save integration

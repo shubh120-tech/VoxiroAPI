@@ -273,7 +273,20 @@ export async function syncShopifyProducts(integrationId, businessId, storeUrl, a
     if (!accessToken) throw new Error("No access token available for Shopify sync");
 
     console.log("🔑 Sync using token:", accessToken?.slice(0, 10) + "...", "length:", accessToken?.length);
+
+    // Test token before syncing
     const headers = { "X-Shopify-Access-Token": accessToken };
+    try {
+      await axios.get(`https://${storeUrl}/admin/api/2026-04/shop.json`, { headers });
+      console.log("✅ Token valid — proceeding with sync");
+    } catch (tokenErr) {
+      const status = tokenErr.response?.status;
+      if (status === 401 || status === 403) {
+        throw new Error(`Token rejected by Shopify (${status}) — please reconnect your store`);
+      }
+      throw tokenErr;
+    }
+
     let pageInfo   = null;
     let hasMore    = true;
 

@@ -206,6 +206,48 @@ router.put("/store/products/:id", async (req, res) => {
   }
 });
 
+
+// ── Debug sync status ─────────────────────────────────────────
+router.get("/store/debug", authMiddleware, async (req, res) => {
+  try {
+    const bId = req.user.business_id;
+    const { rows: integrations } = await query(
+      "SELECT id, platform, store_url, status, product_count, error_message, subscription_status FROM store_integrations WHERE business_id = $1",
+      [bId]
+    );
+    const { rows: products } = await query(
+      "SELECT id, name, price, in_stock FROM store_products WHERE business_id = $1 LIMIT 5",
+      [bId]
+    );
+
+    const results = [];
+    for (const i of integrations) {
+      if (i.platform === "shopify") {
+        const { rows: tkRows } = await query(
+          "SELECT access_token FROM store_integrations WHERE id = $1", [i.id]
+        );
+        const token = tkRows[0]?.access_token;
+        let apiTest = null;
+        if (token) {
+          try {
+            const r = await axios.get(
+              `https://${i.store_url}/admin/api/2026-04/products.json?limit=1`,
+              { headers: { "X-Shopify-Access-Token": token } }
+            );
+            apiTest = { ok: true, count: r.data?.products?.length };
+          } catch (err) {
+            apiTest = { ok: false, status: err.response?.status, error: JSON.stringify(err.response?.data) };
+          }
+        }
+        results.push({ ...i, api_test: apiTest });
+      }
+    }
+    res.json({ integrations: results, sample_products: products });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════
 //  SYNC FUNCTIONS
 // ══════════════════════════════════════════════════════════════

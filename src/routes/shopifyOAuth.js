@@ -223,8 +223,15 @@ router.get("/store/shopify/callback", async (req, res) => {
       return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=no_token`);
     }
 
-    // Validate token works before saving
-    console.log("🔑 Token obtained:", accessToken.slice(0, 12) + "...");
+    if (!businessId) {
+      console.error("❌ No businessId — state lookup failed");
+      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=session_expired`);
+    }
+
+    console.log("🔑 Token obtained:", accessToken.slice(0, 12) + "...", "for business:", businessId);
+
+    // Light token validation — only reject on 401 (invalid token)
+    // 403 = valid token but permission/store restriction — still save it
     try {
       await axios.get(
         `https://${shop}/admin/api/2026-04/shop.json`,
@@ -232,16 +239,14 @@ router.get("/store/shopify/callback", async (req, res) => {
       );
       console.log("✅ Token validated successfully");
     } catch (validErr) {
-      console.error("❌ Token validation failed:", validErr.response?.status, validErr.response?.data);
-      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=invalid_token`);
+      const status = validErr.response?.status;
+      if (status === 401) {
+        console.error("❌ Token is invalid (401) — not saving");
+        return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=invalid_token`);
+      }
+      // 403 = password protected or permission issue — token is valid, save anyway
+      console.warn(`⚠️  Shop info returned ${status} — token valid, store may be password protected`);
     }
-
-    if (!businessId) {
-      console.error("❌ No businessId — state lookup failed");
-      return res.redirect(`${FRONTEND_URL}/dashboard/integrations?error=session_expired`);
-    }
-
-    console.log("✅ Got access token — saving integration for business:", businessId);
 
     // Get shop info — reuse token validation call
     let shopName  = shop.replace(".myshopify.com", "");

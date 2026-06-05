@@ -1,7 +1,13 @@
 import cron        from "node-cron";
 import { query }   from "../db/postgres.js";
-import { analyzeConversations } from "../agents/insightsAgent.js";
-import { runReEngagement }      from "../agents/reEngagementAgent.js";
+import { analyzeConversations }  from "../agents/insightsAgent.js";
+import { runReEngagement }       from "../agents/reEngagementAgent.js";
+import { runScheduledBroadcasts } from "../routes/broadcast.js";
+
+// ── Broadcast scheduler — every 5 minutes ─────────────────────
+cron.schedule("*/5 * * * *", async () => {
+  await runScheduledBroadcasts();
+});
 
 // ── Insights analysis — runs daily at 2 AM IST (8:30 PM UTC) ─
 cron.schedule("30 20 * * *", async () => {

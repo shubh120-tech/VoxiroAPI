@@ -27,6 +27,7 @@ import bizKnowledgeRouter from "./routes/businessKnowledge.js"
 import billingRouter from "./routes/billing.js";
 import agentBehaviorRouter from "./routes/agentBehavior.js";
 import { startEscalationCron } from "./crons/escalationCron.js";
+import reportsRouter     from "./routes/reports.js";
 
 
 
@@ -120,6 +121,7 @@ app.use("/api",        bizKnowledgeRouter);
 app.use("/api",        catalogRouter);
 app.use("/api",        shopifyOAuthRouter);
 app.use("/api", agentBehaviorRouter);
+app.use("/api",        reportsRouter);
 
 
 // ── 404 Handler ───────────────────────────────────────────────
@@ -132,6 +134,10 @@ app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
   res.status(500).json({ message: "Internal server error" });
 });
+
+// ── Start Crons ───────────────────────────────────────────────
+import("./crons/storeSyncCron.js").catch(e => console.warn("storeSyncCron:", e.message));
+import("./crons/insightsCron.js").catch(e => console.warn("insightsCron:", e.message));
 
 // ── Start Server ──────────────────────────────────────────────
 app.listen(PORT, () => {

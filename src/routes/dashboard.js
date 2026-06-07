@@ -229,9 +229,21 @@ router.get("/analytics/dashboard", async (req, res) => {
 router.get("/leads", async (req, res) => {
   try {
     const { page = 1, limit = 20, status, search } = req.query;
-    const offset = (page - 1) * limit;
-    let sql    = `SELECT * FROM leads WHERE business_id = $1`;
+    const offset  = (page - 1) * limit;
+    const isTeam  = req.user.type === "team_member";
+
+    let sql      = `SELECT * FROM leads WHERE business_id = $1`;
     const params = [req.user.business_id];
+
+    // Team member — only leads from their assigned conversations
+    if (isTeam) {
+      sql += ` AND conversation_id IN (
+        SELECT id FROM conversations
+        WHERE business_id = $1 AND assigned_to = $${params.length + 1}::uuid
+      )`;
+      params.push(req.user.id);
+    }
+
     if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
     if (search) { params.push(`%${search}%`); sql += ` AND (customer_name ILIKE $${params.length} OR phone ILIKE $${params.length})`; }
     const countSql = sql.replace("SELECT *", "SELECT COUNT(*)");
@@ -269,8 +281,20 @@ router.get("/orders", async (req, res) => {
   try {
     const { page = 1, limit = 20, status, search } = req.query;
     const offset = (page - 1) * limit;
-    let sql    = `SELECT * FROM orders WHERE business_id = $1`;
+    const isTeam = req.user.type === "team_member";
+
+    let sql      = `SELECT * FROM orders WHERE business_id = $1`;
     const params = [req.user.business_id];
+
+    // Team member — only orders from their assigned conversations
+    if (isTeam) {
+      sql += ` AND conversation_id IN (
+        SELECT id FROM conversations
+        WHERE business_id = $1 AND assigned_to = $${params.length + 1}::uuid
+      )`;
+      params.push(req.user.id);
+    }
+
     if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
     if (search) { params.push(`%${search}%`); sql += ` AND (customer_name ILIKE $${params.length} OR customer_phone ILIKE $${params.length})`; }
     const countSql = sql.replace("SELECT *", "SELECT COUNT(*)");
@@ -298,8 +322,20 @@ router.get("/appointments", async (req, res) => {
   try {
     const { page = 1, limit = 20, status, date } = req.query;
     const offset = (page - 1) * limit;
-    let sql    = `SELECT * FROM appointments WHERE business_id = $1`;
+    const isTeam = req.user.type === "team_member";
+
+    let sql      = `SELECT * FROM appointments WHERE business_id = $1`;
     const params = [req.user.business_id];
+
+    // Team member — only appointments from their assigned conversations
+    if (isTeam) {
+      sql += ` AND conversation_id IN (
+        SELECT id FROM conversations
+        WHERE business_id = $1 AND assigned_to = $${params.length + 1}::uuid
+      )`;
+      params.push(req.user.id);
+    }
+
     if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
     if (date)   { params.push(date);   sql += ` AND DATE(scheduled_at) = $${params.length}`; }
     const countSql = sql.replace("SELECT *", "SELECT COUNT(*)");
@@ -687,17 +723,28 @@ router.delete("/knowledge/:id", async (req, res) => {
 // ── Follow-ups ───────────────────────────────────────────────
 router.get("/followups", async (req, res) => {
   try {
-    const { rows } = await query(`
+    const isTeam = req.user.type === "team_member";
+
+    let sql      = `
       SELECT
         f.*,
-        COALESCE(c.customer_name, f.customer_name) AS customer_name,
+        COALESCE(c.customer_name, f.customer_name)   AS customer_name,
         COALESCE(c.customer_phone, f.customer_phone) AS customer_phone
       FROM follow_ups f
       LEFT JOIN conversations c ON c.id = f.conversation_id
       WHERE f.business_id = $1
-      ORDER BY f.scheduled_at DESC
-      LIMIT 200
-    `, [req.user.business_id]);
+    `;
+    const params = [req.user.business_id];
+
+    // Team member — only follow-ups from their assigned conversations
+    if (isTeam) {
+      params.push(req.user.id);
+      sql += ` AND c.assigned_to = $${params.length}::uuid`;
+    }
+
+    sql += ` ORDER BY f.scheduled_at DESC LIMIT 200`;
+
+    const { rows } = await query(sql, params);
     res.json({ followups: rows });
   } catch (err) {
     console.error("Followups error:", err.message);

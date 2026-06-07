@@ -348,29 +348,39 @@ router.post("/team/invite", async (req, res) => {
 // Update team member role/permissions
 router.put("/team/:id", async (req, res) => {
   try {
-    const { role, permissions, status } = req.body;
-
-    const finalPermissions = role === "custom"
-      ? (permissions || {})
-      : ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.agent;
-
+    const { role, permissions, status, conversation_access } = req.body;
+ 
+    // FIX: Always save the permissions exactly as sent from frontend
+    // Don't override with role defaults — owner explicitly customized these
+    const finalPermissions = permissions || {};
+ 
     const { rows } = await query(`
       UPDATE team_members
-      SET role        = COALESCE($1, role),
-          permissions = COALESCE($2, permissions),
-          status      = COALESCE($3, status),
-          updated_at  = NOW()
-      WHERE id = $4 AND business_id = $5
-      RETURNING id, name, email, role, permissions, status
-    `, [role, JSON.stringify(finalPermissions), status, req.params.id, bId(req)]);
-
+      SET role                = COALESCE($1, role),
+          permissions         = $2,
+          conversation_access = COALESCE($3, conversation_access),
+          status              = COALESCE($4, status),
+          updated_at          = NOW()
+      WHERE id = $5 AND business_id = $6
+      RETURNING id, name, email, role, permissions, conversation_access, status
+    `, [
+      role                  || null,
+      JSON.stringify(finalPermissions),
+      conversation_access   || null,
+      status                || null,
+      req.params.id,
+      bId(req),
+    ]);
+ 
     if (!rows.length) return res.status(404).json({ message: "Member not found" });
-    res.json(rows[0]);
+ 
+    console.log(`✅ Updated team member ${rows[0].name}: role=${rows[0].role}, conversation_access=${rows[0].conversation_access}`);
+    res.json({ success: true, member: rows[0] });
   } catch (err) {
-    res.status(500).json({ message: "Failed to update member" });
+    console.error("Update team member error:", err.message);
+    res.status(500).json({ message: "Failed to update member: " + err.message });
   }
 });
-
 // Revoke access (suspend)
 router.patch("/team/:id/revoke", async (req, res) => {
   try {

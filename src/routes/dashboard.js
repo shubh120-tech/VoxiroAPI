@@ -411,14 +411,40 @@ router.get("/agent/conversations", async (req, res) => {
   try {
     const { page = 1, limit = 30, status } = req.query;
     const offset = (page - 1) * limit;
-    let sql    = `SELECT * FROM conversations WHERE business_id = $1`;
-    const params = [req.user.business_id];
-    if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
+    const bId    = req.user.business_id;
+    const isTeam = req.user.type === "team_member";
+
+    // Check conversation_access for team members
+    let conversationAccess = "all";
+    if (isTeam) {
+      const { rows: memberRows } = await query(
+        "SELECT conversation_access FROM team_members WHERE id = $1",
+        [req.user.id]
+      ).catch(() => ({ rows: [] }));
+      conversationAccess = memberRows[0]?.conversation_access || "all";
+    }
+
+    let sql      = `SELECT * FROM conversations WHERE business_id = $1`;
+    const params = [bId];
+
+    if (status) {
+      params.push(status);
+      sql += ` AND status = $${params.length}`;
+    }
+
+    // Team member with "assigned" access — only show their assigned conversations
+    if (isTeam && conversationAccess === "assigned") {
+      params.push(req.user.id);
+      sql += ` AND assigned_to = $${params.length}::uuid`;
+    }
+
     sql += ` ORDER BY last_message_at DESC NULLS LAST LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
+
     const { rows } = await query(sql, params);
     res.json({ conversations: rows });
   } catch (err) {
+    console.error("Conversations error:", err.message);
     res.status(500).json({ message: "Failed to load conversations" });
   }
 });

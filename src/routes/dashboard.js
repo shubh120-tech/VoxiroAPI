@@ -1,6 +1,7 @@
 import express      from "express";
 import { query }    from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
+import { clearPromptCache } from "../agents/systemPrompt.js";
 
 const router = express.Router();
 
@@ -436,6 +437,7 @@ router.patch("/agent/toggle", async (req, res) => {
   try {
     await query("UPDATE agent_configs SET is_active = $1 WHERE business_id = $2",
       [req.body.active, req.user.business_id]);
+    clearPromptCache(req.user.business_id);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to toggle agent" });
@@ -714,6 +716,7 @@ router.delete("/knowledge/:id", async (req, res) => {
   try {
     await query("DELETE FROM knowledge_docs WHERE id = $1 AND business_id = $2",
       [req.params.id, req.user.business_id]);
+    clearPromptCache(req.user.business_id);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ message: "Failed to delete document" });

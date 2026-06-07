@@ -15,7 +15,6 @@ import {
   cancelFollowupTool,    executeCancelFollowup,
 } from "./tools/orderAppointmentTools.js";
 import { sendWhatsAppMessages,  splitIntoMessages          } from "../whatsapp/sender.js";
-import { fetchRelevantContext } from "./knowledgeFetcher.js";
 import { query } from "../db/postgres.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -196,20 +195,11 @@ RULE: Never ask for anything listed above. Move forward with what you have.]`;
       },
     ];
 
-    // ── Fetch dynamic context based on customer message ─────
-    // Loads only relevant data (services, products, FAQs, payment)
-    // keeping token usage low while keeping answers accurate
-    let dynamicContext = null;
-    try {
-      dynamicContext = await fetchRelevantContext(businessId, message);
-    } catch (err) {
-      console.warn("Context fetch failed (non-fatal):", err.message);
-    }
-
     // ── Call Claude ───────────────────────────────────────────
+    // System prompt is built fresh from DB every 5 min (cached)
+    // Contains all services, products, FAQs, payment, docs, Q&A training
     const reply = await callClaudeWithCache({
       systemPrompt,
-      dynamicContext,
       messages,
       businessId,
       conversationId,

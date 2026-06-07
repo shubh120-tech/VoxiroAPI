@@ -283,7 +283,14 @@ async function processMediaMessage({ phoneNumberId, customerPhone, customerName,
       : `Thank you! I have received your ${typeLabel} and shared it with the team. They will review and get back to you shortly.`;
 
     await sendWhatsAppMessage({ phoneNumberId, accessToken, to: customerPhone, message: ackMsg });
-    await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'agent', $3)`, [conversation.id, businessId, ackMsg]);
+    // Check for duplicate before inserting ack message
+    const { rows: existingAck } = await query(
+      "SELECT id FROM messages WHERE conversation_id = $1 AND role = 'agent' AND content = $2 AND created_at > NOW() - INTERVAL '30 seconds' LIMIT 1",
+      [conversation.id, ackMsg]
+    );
+    if (!existingAck.length) {
+      await query(`INSERT INTO messages (conversation_id, business_id, role, content) VALUES ($1, $2, 'agent', $3)`, [conversation.id, businessId, ackMsg]);
+    }
     await query(`UPDATE conversations SET status = 'manual', escalated_at = COALESCE(escalated_at, NOW()), updated_at = NOW() WHERE id = $1`, [conversation.id]);
 
     const name     = customerName || customerPhone;

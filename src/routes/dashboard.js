@@ -3,6 +3,77 @@ import { query }    from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 
 const router = express.Router();
+
+// ── Media Proxy — fetch fresh URL from Meta on-demand ─────────
+// Handles both R2 stored URLs and meta_media_id: fallback
+router.get("/media/:messageId", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT m.media_url, m.media_type, m.media_filename, c.business_id
+      FROM messages m
+      JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.id = $1
+    `, [req.params.messageId]);
+
+    if (!rows.length) return res.status(404).json({ message: "Message not found" });
+    const msg = rows[0];
+
+    // Direct stored URL (R2) — redirect
+    if (msg.media_url && !msg.media_url.startsWith("meta_media_id:")) {
+      return res.redirect(msg.media_url);
+    }
+
+    // meta_media_id fallback — fetch fresh from Meta
+    if (msg.media_url?.startsWith("meta_media_id:")) {
+      const metaMediaId = msg.media_url.replace("meta_media_id:", "");
+
+      const { rows: wc } = await query(
+        "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
+        [msg.business_id]
+      );
+      if (!wc.length || !wc[0].access_token) {
+        return res.status(503).json({ message: "WhatsApp not configured" });
+      }
+
+      const axios = (await import("axios")).default;
+      const META_VERSION = process.env.META_API_VERSION || "v19.0";
+
+      // Step 1: Get the download URL from Meta
+      const metaRes = await axios.get(
+        `https://graph.facebook.com/${META_VERSION}/${metaMediaId}`,
+        { headers: { Authorization: `Bearer ${wc[0].access_token}` } }
+      );
+      const freshUrl = metaRes.data?.url;
+      if (!freshUrl) {
+        return res.status(410).json({ message: "Media expired or unavailable on Meta" });
+      }
+
+      // Step 2: Stream file to client
+      const fileRes = await axios.get(freshUrl, {
+        responseType: "stream",
+        headers: { Authorization: `Bearer ${wc[0].access_token}` },
+      });
+
+      const contentType = fileRes.headers["content-type"] || "application/octet-stream";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "private, max-age=300"); // cache 5 min in browser
+
+      if (msg.media_filename) {
+        const disposition = contentType.startsWith("image/") ? "inline" : "attachment";
+        res.setHeader("Content-Disposition", `${disposition}; filename="${msg.media_filename}"`);
+      }
+
+      return fileRes.data.pipe(res);
+    }
+
+    res.status(404).json({ message: "No media available for this message" });
+  } catch (err) {
+    console.error("Media proxy error:", err.message);
+    if (err.response?.status === 401) return res.status(401).json({ message: "WhatsApp token expired" });
+    res.status(500).json({ message: "Failed to load media" });
+  }
+});
+
 router.use(authMiddleware);
 
 // ── Analytics / Home ──────────────────────────────────────────
@@ -1009,77 +1080,6 @@ router.get("/agent/team-members", async (req, res) => {
     res.json({ members: rows });
   } catch (err) {
     res.status(500).json({ message: "Failed to load team members" });
-  }
-});
-
-
-// ── Media Proxy — fetch fresh URL from Meta on-demand ─────────
-// Handles both R2 stored URLs and meta_media_id: fallback
-router.get("/media/:messageId", async (req, res) => {
-  try {
-    const { rows } = await query(`
-      SELECT m.media_url, m.media_type, m.media_filename, c.business_id
-      FROM messages m
-      JOIN conversations c ON c.id = m.conversation_id
-      WHERE m.id = $1
-    `, [req.params.messageId]);
-
-    if (!rows.length) return res.status(404).json({ message: "Message not found" });
-    const msg = rows[0];
-
-    // Direct stored URL (R2) — redirect
-    if (msg.media_url && !msg.media_url.startsWith("meta_media_id:")) {
-      return res.redirect(msg.media_url);
-    }
-
-    // meta_media_id fallback — fetch fresh from Meta
-    if (msg.media_url?.startsWith("meta_media_id:")) {
-      const metaMediaId = msg.media_url.replace("meta_media_id:", "");
-
-      const { rows: wc } = await query(
-        "SELECT access_token FROM whatsapp_configs WHERE business_id = $1",
-        [msg.business_id]
-      );
-      if (!wc.length || !wc[0].access_token) {
-        return res.status(503).json({ message: "WhatsApp not configured" });
-      }
-
-      const axios = (await import("axios")).default;
-      const META_VERSION = process.env.META_API_VERSION || "v19.0";
-
-      // Step 1: Get the download URL from Meta
-      const metaRes = await axios.get(
-        `https://graph.facebook.com/${META_VERSION}/${metaMediaId}`,
-        { headers: { Authorization: `Bearer ${wc[0].access_token}` } }
-      );
-      const freshUrl = metaRes.data?.url;
-      if (!freshUrl) {
-        return res.status(410).json({ message: "Media expired or unavailable on Meta" });
-      }
-
-      // Step 2: Stream file to client
-      const fileRes = await axios.get(freshUrl, {
-        responseType: "stream",
-        headers: { Authorization: `Bearer ${wc[0].access_token}` },
-      });
-
-      const contentType = fileRes.headers["content-type"] || "application/octet-stream";
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Cache-Control", "private, max-age=300"); // cache 5 min in browser
-
-      if (msg.media_filename) {
-        const disposition = contentType.startsWith("image/") ? "inline" : "attachment";
-        res.setHeader("Content-Disposition", `${disposition}; filename="${msg.media_filename}"`);
-      }
-
-      return fileRes.data.pipe(res);
-    }
-
-    res.status(404).json({ message: "No media available for this message" });
-  } catch (err) {
-    console.error("Media proxy error:", err.message);
-    if (err.response?.status === 401) return res.status(401).json({ message: "WhatsApp token expired" });
-    res.status(500).json({ message: "Failed to load media" });
   }
 });
 

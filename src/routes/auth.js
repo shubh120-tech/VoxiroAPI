@@ -82,26 +82,31 @@ router.post("/signup", async (req, res) => {
 });
 
 // ── Login ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+//  PATCH FOR src/routes/auth.js
+//  Find your existing POST /login route and REPLACE it with this
+// ═══════════════════════════════════════════════════════════
+
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ message: "Email and password required" });
     }
- 
+
     // ── Step 1: Check owners table (users) ───────────────────
     const { rows: ownerRows } = await query(
       "SELECT * FROM users WHERE email = $1 AND is_active = TRUE LIMIT 1",
       [email]
     );
- 
+
     if (ownerRows.length) {
       const owner = ownerRows[0];
       const valid = await bcrypt.compare(password, owner.password_hash);
       if (!valid) return res.status(401).json({ message: "Invalid email or password" });
- 
+
       await query("UPDATE users SET last_login_at = NOW() WHERE id = $1", [owner.id]);
- 
+
       const token = jwt.sign(
         {
           id:          owner.id,
@@ -114,7 +119,7 @@ router.post("/login", async (req, res) => {
         process.env.JWT_SECRET,
         { expiresIn: "30d" }
       );
- 
+
       return res.json({
         token,
         user: {
@@ -127,7 +132,7 @@ router.post("/login", async (req, res) => {
         },
       });
     }
- 
+
     // ── Step 2: Not an owner — check team_members ────────────
     const { rows: memberRows } = await query(`
       SELECT tm.*, b.name AS business_name
@@ -137,17 +142,17 @@ router.post("/login", async (req, res) => {
         AND tm.status = 'active'
       LIMIT 1
     `, [email]);
- 
+
     if (!memberRows.length) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
- 
+
     const member = memberRows[0];
     const valid  = await bcrypt.compare(password, member.password_hash);
     if (!valid) return res.status(401).json({ message: "Invalid email or password" });
- 
+
     await query("UPDATE team_members SET last_login_at = NOW() WHERE id = $1", [member.id]);
- 
+
     const token = jwt.sign(
       {
         id:          member.id,
@@ -160,7 +165,13 @@ router.post("/login", async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: "30d" }
     );
- 
+
+    // Parse permissions if stored as JSON string in DB
+    let permissions = member.permissions || {};
+    if (typeof permissions === "string") {
+      try { permissions = JSON.parse(permissions); } catch { permissions = {}; }
+    }
+
     return res.json({
       token,
       user: {
@@ -170,11 +181,11 @@ router.post("/login", async (req, res) => {
         businessId:   member.business_id,
         businessName: member.business_name,
         role:         member.role,
-        permissions:  member.permissions,
+        permissions,
         type:         "team_member",
       },
     });
- 
+
   } catch (err) {
     console.error("Login error:", err.message);
     res.status(500).json({ message: "Login failed" });

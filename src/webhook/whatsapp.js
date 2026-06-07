@@ -204,17 +204,30 @@ async function processIncomingMessage({ phoneNumberId, customerPhone, customerNa
 }
 
 async function getOrCreateConversation({ businessId, customerPhone, customerName }) {
+  // Reuse any active conversation including manual/needs-help
+  // Only skip 'closed' conversations — those are truly done
+  // manual = owner is handling → new message goes into same conversation
+  // needs-help = waiting for owner → new message goes into same conversation
   const { rows } = await query(`
     SELECT id, status FROM conversations
-    WHERE business_id = $1 AND customer_phone = $2 AND status NOT IN ('closed', 'manual', 'needs-help')
-    ORDER BY created_at DESC LIMIT 1
+    WHERE business_id = $1 AND customer_phone = $2 AND status != 'closed'
+    ORDER BY last_message_at DESC NULLS LAST, created_at DESC
+    LIMIT 1
   `, [businessId, customerPhone]);
 
   if (rows.length > 0) {
-    if (customerName) await query("UPDATE conversations SET customer_name = $1 WHERE id = $2", [customerName, rows[0].id]);
+    if (customerName) {
+      await query(
+        "UPDATE conversations SET customer_name = $1, unread_count = unread_count + 1 WHERE id = $2",
+        [customerName, rows[0].id]
+      );
+    }
+    console.log(`🔄 Reusing conversation ${rows[0].id} (status: ${rows[0].status}) for ${customerPhone}`);
     return rows[0];
   }
 
+  // No active conversation — create new one
+  console.log(`🆕 Creating new conversation for ${customerPhone}`);
   const { rows: newRows } = await query(`
     INSERT INTO conversations (business_id, customer_name, customer_phone, status, unread_count)
     VALUES ($1, $2, $3, 'agent', 1) RETURNING id, status

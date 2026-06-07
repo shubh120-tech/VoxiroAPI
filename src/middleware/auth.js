@@ -2,7 +2,8 @@ import jwt from "jsonwebtoken";
 import { query } from "../db/postgres.js";
 
 /**
- * Protect business owner routes.
+ * Protect business owner + team member routes.
+ * Supports both owners (users table) and team members (team_members table).
  */
 export async function authMiddleware(req, res, next) {
   try {
@@ -14,26 +15,53 @@ export async function authMiddleware(req, res, next) {
     const token   = header.split(" ")[1];
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Load user + business from DB
+    // FIX 1: JWT is signed with `id` not `userId`
+    const userId = decoded.id || decoded.userId;
+    const type   = decoded.type || "owner";
+
+    if (type === "team_member") {
+      // ── Team member — look up in team_members table ────────
+      const { rows } = await query(`
+        SELECT tm.id, tm.name AS owner_name, tm.email, tm.role,
+               tm.business_id, tm.permissions, tm.status,
+               b.name AS business_name, b.is_active
+        FROM team_members tm
+        JOIN businesses b ON b.id = tm.business_id
+        WHERE tm.id = $1 AND tm.status = 'active'
+      `, [userId]);
+
+      if (!rows.length) {
+        return res.status(401).json({ message: "Team member not found or inactive" });
+      }
+      if (!rows[0].is_active) {
+        return res.status(403).json({ message: "Business account deactivated" });
+      }
+
+      req.user = { ...rows[0], type: "team_member" };
+      return next();
+    }
+
+    // ── Owner — look up in users table ────────────────────────
     const { rows } = await query(`
       SELECT u.id, u.owner_name, u.email, u.role, u.business_id,
              b.name AS business_name, b.is_active
       FROM users u
       JOIN businesses b ON b.id = u.business_id
       WHERE u.id = $1 AND u.is_active = TRUE
-    `, [decoded.userId]);
+    `, [userId]);
 
     if (!rows.length) {
       return res.status(401).json({ message: "User not found" });
     }
-
     if (!rows[0].is_active) {
       return res.status(403).json({ message: "Account deactivated" });
     }
 
-    req.user = rows[0];
+    req.user = { ...rows[0], type: "owner" };
     next();
+
   } catch (err) {
+    console.error("Auth middleware error:", err.message);
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 }

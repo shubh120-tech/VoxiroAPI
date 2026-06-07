@@ -88,46 +88,95 @@ router.post("/login", async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ message: "Email and password required" });
     }
-
-    const { rows } = await query(`
-      SELECT u.id, u.password_hash, u.owner_name, u.business_id, u.is_active,
-             b.name AS business_name, b.onboarded
-      FROM users u JOIN businesses b ON b.id = u.business_id
-      WHERE u.email = $1
+ 
+    // ── Step 1: Check owners table (users) ───────────────────
+    const { rows: ownerRows } = await query(
+      "SELECT * FROM users WHERE email = $1 AND is_active = TRUE LIMIT 1",
+      [email]
+    );
+ 
+    if (ownerRows.length) {
+      const owner = ownerRows[0];
+      const valid = await bcrypt.compare(password, owner.password_hash);
+      if (!valid) return res.status(401).json({ message: "Invalid email or password" });
+ 
+      await query("UPDATE users SET last_login_at = NOW() WHERE id = $1", [owner.id]);
+ 
+      const token = jwt.sign(
+        {
+          id:          owner.id,
+          business_id: owner.business_id,
+          email:       owner.email,
+          owner_name:  owner.owner_name,
+          role:        "owner",
+          type:        "owner",
+        },
+        process.env.JWT_SECRET,
+        { expiresIn: "30d" }
+      );
+ 
+      return res.json({
+        token,
+        user: {
+          id:           owner.id,
+          email:        owner.email,
+          name:         owner.owner_name,
+          businessId:   owner.business_id,
+          role:         "owner",
+          type:         "owner",
+        },
+      });
+    }
+ 
+    // ── Step 2: Not an owner — check team_members ────────────
+    const { rows: memberRows } = await query(`
+      SELECT tm.*, b.name AS business_name
+      FROM team_members tm
+      JOIN businesses b ON b.id = tm.business_id
+      WHERE tm.email = $1
+        AND tm.status = 'active'
+      LIMIT 1
     `, [email]);
-
-    if (!rows.length) {
+ 
+    if (!memberRows.length) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
-
-    const user = rows[0];
-    if (!user.is_active) {
-      return res.status(403).json({ message: "Account deactivated" });
-    }
-
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      return res.status(401).json({ message: "Invalid email or password" });
-    }
-
-    // Update last login
-    await query("UPDATE users SET last_login_at = NOW() WHERE id = $1", [user.id]);
-
-    const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: "7d" });
-
-    res.json({
+ 
+    const member = memberRows[0];
+    const valid  = await bcrypt.compare(password, member.password_hash);
+    if (!valid) return res.status(401).json({ message: "Invalid email or password" });
+ 
+    await query("UPDATE team_members SET last_login_at = NOW() WHERE id = $1", [member.id]);
+ 
+    const token = jwt.sign(
+      {
+        id:          member.id,
+        business_id: member.business_id,
+        email:       member.email,
+        role:        member.role,
+        permissions: member.permissions,
+        type:        "team_member",
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+ 
+    return res.json({
       token,
       user: {
-        id:           user.id,
-        businessId:   user.business_id,
-        businessName: user.business_name,
-        ownerName:    user.owner_name,
-        email,
-        onboarded:    user.onboarded,
+        id:           member.id,
+        email:        member.email,
+        name:         member.name,
+        businessId:   member.business_id,
+        businessName: member.business_name,
+        role:         member.role,
+        permissions:  member.permissions,
+        type:         "team_member",
       },
     });
+ 
   } catch (err) {
-    console.error("Login error:", err);
+    console.error("Login error:", err.message);
     res.status(500).json({ message: "Login failed" });
   }
 });

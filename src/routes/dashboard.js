@@ -727,14 +727,52 @@ router.delete("/account", async (req, res) => {
 
     console.log(`🗑️ Account deletion started: business ${businessId}`);
 
+    // ── Delete all user-generated and operational data ──────
     const tables = [
-      "messages", "conversations", "leads", "orders", "appointments",
-      "follow_ups", "pending_messages", "knowledge_docs", "agent_configs",
-      "whatsapp_configs", "notification_settings", "activity_logs",
-      "business_services", "business_faqs", "business_payment_methods",
-      "business_company_details", "broadcast_contacts", "broadcast_lists",
-      "broadcast_campaigns", "broadcast_templates", "products",
-      "website_crawls", "prompt_history", "oauth_states",
+      // Conversations & messages
+      "messages",
+      "conversations",
+      "pending_messages",
+
+      // CRM data
+      "leads",
+      "orders",
+      "appointments",
+      "follow_ups",
+
+      // Broadcast
+      "contact_list_members",
+      "contact_lists",
+      "broadcast_recipients",
+      "broadcast_campaigns",
+      "business_contacts",
+      "whatsapp_templates",
+
+      // Knowledge & training
+      "knowledge_docs",
+      "business_services",
+      "business_faqs",
+      "business_payment_methods",
+      "business_company_details",
+      "training_qa",
+      "prompt_history",
+
+      // Products & integrations
+      "products",
+      "website_crawls",
+      "store_integrations",
+
+      // Config & settings
+      "agent_configs",
+      "whatsapp_configs",
+      "notification_settings",
+      "activity_logs",
+      "oauth_states",
+
+      // Subscriptions
+      "subscriptions",
+
+      // NOTE: payment_history is NOT deleted — required for 7-year financial audit trail (Indian law)
     ];
 
     for (const table of tables) {
@@ -742,9 +780,29 @@ router.delete("/account", async (req, res) => {
         .catch(err => console.warn(`Skip delete from ${table}: ${err.message}`));
     }
 
-    await query("DELETE FROM users WHERE business_id = $1 AND id != $2", [businessId, userId]).catch(() => {});
-    await query("UPDATE users SET is_active = FALSE, updated_at = NOW() WHERE id = $1", [userId]).catch(() => {});
-    await query(`UPDATE businesses SET is_active = FALSE, name = CONCAT('[DELETED] ', name), updated_at = NOW() WHERE id = $1`, [businessId]);
+    // Anonymize owner user — don't delete (needed for login audit)
+    await query(`
+      UPDATE users
+      SET is_active    = FALSE,
+          owner_name   = '[DELETED]',
+          email        = CONCAT('deleted_', id, '@deleted.yougant.com'),
+          password_hash = 'DELETED',
+          updated_at   = NOW()
+      WHERE id = $1
+    `, [userId]).catch(() => {});
+
+    // Delete team members fully
+    await query(
+      "DELETE FROM users WHERE business_id = $1 AND id != $2",
+      [businessId, userId]
+    ).catch(() => {});
+
+    // Anonymize payment_history — keep rows but remove personal identifiers
+    await query(`
+      UPDATE payment_history
+      SET description = 'Account deleted'
+      WHERE business_id = $1
+    `, [businessId]).catch(() => {});
 
     console.log(`✅ Account deleted: business ${businessId}`);
     res.json({ success: true });
@@ -752,6 +810,205 @@ router.delete("/account", async (req, res) => {
   } catch (err) {
     console.error("Account deletion error:", err.message);
     res.status(500).json({ message: "Failed to delete account: " + err.message });
+  }
+});
+
+
+// ── Conversation Labels ───────────────────────────────────────
+
+// Get labels for a conversation
+router.get("/agent/conversations/:id/labels", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT * FROM conversation_labels WHERE conversation_id = $1 AND business_id = $2 ORDER BY created_at ASC",
+      [req.params.id, req.user.business_id]
+    );
+    res.json({ labels: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load labels" });
+  }
+});
+
+// Add label to conversation
+router.post("/agent/conversations/:id/labels", async (req, res) => {
+  try {
+    const { label_key, label_label, label_color, label_icon } = req.body;
+    if (!label_key) return res.status(400).json({ message: "label_key required" });
+
+    await query(`
+      INSERT INTO conversation_labels
+        (conversation_id, business_id, label_key, label_label, label_color, label_icon, created_by)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (conversation_id, label_key) DO UPDATE SET
+        label_label = $4, label_color = $5, label_icon = $6
+    `, [req.params.id, req.user.business_id, label_key, label_label, label_color, label_icon, req.user.id]);
+
+    // Update labels cache on conversation
+    const { rows: allLabels } = await query(
+      "SELECT label_key, label_label, label_color, label_icon FROM conversation_labels WHERE conversation_id = $1",
+      [req.params.id]
+    );
+    await query(
+      "UPDATE conversations SET labels = $1, updated_at = NOW() WHERE id = $2",
+      [JSON.stringify(allLabels), req.params.id]
+    );
+
+    // Auto-actions based on label
+    if (label_key === "follow_up") {
+      // Create a follow-up record — scheduled 24h from now by default
+      const { rows: conv } = await query(
+        "SELECT customer_phone, customer_name FROM conversations WHERE id = $1",
+        [req.params.id]
+      );
+      if (conv.length) {
+        await query(`
+          INSERT INTO follow_ups
+            (business_id, conversation_id, customer_phone, customer_name, scheduled_at, message, sent)
+          VALUES ($1, $2, $3, $4, NOW() + INTERVAL '24 hours', 'Following up on your inquiry. How can we help?', FALSE)
+          ON CONFLICT DO NOTHING
+        `, [req.user.business_id, req.params.id, conv[0].customer_phone, conv[0].customer_name])
+        .catch(() => {}); // ignore if follow_ups has unique constraint
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Add label error:", err.message);
+    res.status(500).json({ message: "Failed to add label: " + err.message });
+  }
+});
+
+// Remove label from conversation
+router.delete("/agent/conversations/:id/labels/:key", async (req, res) => {
+  try {
+    await query(
+      "DELETE FROM conversation_labels WHERE conversation_id = $1 AND business_id = $2 AND label_key = $3",
+      [req.params.id, req.user.business_id, req.params.key]
+    );
+
+    // Update labels cache
+    const { rows: allLabels } = await query(
+      "SELECT label_key, label_label, label_color, label_icon FROM conversation_labels WHERE conversation_id = $1",
+      [req.params.id]
+    );
+    await query(
+      "UPDATE conversations SET labels = $1, updated_at = NOW() WHERE id = $2",
+      [JSON.stringify(allLabels), req.params.id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to remove label" });
+  }
+});
+
+// ── Conversation Assignment ───────────────────────────────────
+router.post("/agent/conversations/:id/assign", async (req, res) => {
+  try {
+    const { team_member_id } = req.body;
+    const bId = req.user.business_id;
+
+    // Get conversation details
+    const { rows: conv } = await query(
+      "SELECT customer_name, customer_phone, last_message FROM conversations WHERE id = $1 AND business_id = $2",
+      [req.params.id, bId]
+    );
+    if (!conv.length) return res.status(404).json({ message: "Conversation not found" });
+
+    if (!team_member_id) {
+      // Unassign
+      await query(
+        "UPDATE conversations SET assigned_to = NULL, assigned_name = NULL, updated_at = NOW() WHERE id = $1",
+        [req.params.id]
+      );
+      return res.json({ success: true });
+    }
+
+    // Get team member details
+    const { rows: member } = await query(
+      "SELECT id, name, role FROM team_members WHERE id = $1 AND business_id = $2 AND status = 'active'",
+      [team_member_id, bId]
+    );
+    if (!member.length) return res.status(404).json({ message: "Team member not found" });
+
+    // Update conversation assignment
+    await query(
+      "UPDATE conversations SET assigned_to = $1, assigned_name = $2, updated_at = NOW() WHERE id = $3",
+      [team_member_id, member[0].name, req.params.id]
+    );
+
+    // Send WhatsApp notification to assigned member
+    try {
+      const { rows: memberNotif } = await query(
+        "SELECT notify_for FROM team_members WHERE id = $1",
+        [team_member_id]
+      );
+
+      const { rows: wc } = await query(
+        "SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id = $1",
+        [bId]
+      );
+
+      // Get member's phone — from team_members or notification_settings
+      const { rows: memberPhone } = await query(`
+        SELECT ns.owner_notify_number AS phone
+        FROM notification_settings ns
+        WHERE ns.business_id = $1
+        UNION
+        SELECT NULL AS phone
+        LIMIT 1
+      `, [bId]).catch(() => ({ rows: [] }));
+
+      // Build notification message
+      const customerName  = conv[0].customer_name || conv[0].customer_phone;
+      const lastMsg       = (conv[0].last_message || "").slice(0, 100);
+      const dashboardLink = `${process.env.FRONTEND_URL || "https://yougant.com"}/dashboard?conv=${req.params.id}`;
+
+      const notifMsg =
+        `👤 ${member[0].name}, you have been assigned a conversation.
+
+` +
+        `Customer: ${customerName}
+` +
+        `Last message: "${lastMsg}"
+
+` +
+        `Open: ${dashboardLink}`;
+
+      // Send to member's registered notify number if available
+      if (wc.length && memberPhone[0]?.phone) {
+        const { sendWhatsAppMessage } = await import("../whatsapp/sender.js");
+        await sendWhatsAppMessage({
+          phoneNumberId: wc[0].phone_number_id,
+          accessToken:   wc[0].access_token,
+          to:            memberPhone[0].phone.replace(/\D/g, ""),
+          message:       notifMsg,
+        });
+      }
+
+      console.log(`✅ Conversation ${req.params.id} assigned to ${member[0].name}`);
+    } catch (notifErr) {
+      console.error("Assignment notification error:", notifErr.message);
+      // Don't fail — assignment already saved
+    }
+
+    res.json({ success: true, assigned_to: team_member_id, assigned_name: member[0].name });
+  } catch (err) {
+    console.error("Assign error:", err.message);
+    res.status(500).json({ message: "Failed to assign: " + err.message });
+  }
+});
+
+// Get team members for assignment dropdown
+router.get("/agent/team-members", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT id, name, role FROM team_members WHERE business_id = $1 AND status = 'active' ORDER BY name ASC",
+      [req.user.business_id]
+    );
+    res.json({ members: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load team members" });
   }
 });
 

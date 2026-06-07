@@ -6,6 +6,14 @@ import { bookAppointmentTool,   executeBookAppointment    } from "./tools/bookAp
 import { checkAvailabilityTool, executeCheckAvailability  } from "./tools/checkAvailability.js";
 import { notifyOwnerTool,       executeNotifyOwner        } from "./tools/notifyOwner.js";
 import { scheduleFollowupTool,  executeScheduleFollowup   } from "./tools/scheduleFollowup.js";
+import {
+  updateAppointmentTool, executeUpdateAppointment,
+  cancelAppointmentTool, executeCancelAppointment,
+  updateOrderTool,       executeUpdateOrder,
+  cancelOrderTool,       executeCancelOrder,
+  updateFollowupTool,    executeUpdateFollowup,
+  cancelFollowupTool,    executeCancelFollowup,
+} from "./tools/orderAppointmentTools.js";
 import { sendWhatsAppMessages,  splitIntoMessages          } from "../whatsapp/sender.js";
 import { fetchRelevantContext } from "./knowledgeFetcher.js";
 import { query } from "../db/postgres.js";
@@ -19,6 +27,12 @@ const TOOLS = [
   checkAvailabilityTool,
   notifyOwnerTool,
   scheduleFollowupTool,
+  updateAppointmentTool,
+  cancelAppointmentTool,
+  updateOrderTool,
+  cancelOrderTool,
+  updateFollowupTool,
+  cancelFollowupTool,
 ];
 
 // ── Processing lock — prevents double replies ─────────────────
@@ -66,7 +80,7 @@ export async function handleIncomingMessage({
   message,
   phoneNumberId,
   accessToken,
-  waMessageId = null,  // for read receipt + typing simulation
+  waMessageId = null,
 }) {
   // ── Prevent double processing ─────────────────────────────
   const lockKey = `${conversationId}_${message.slice(0, 50)}`;
@@ -78,10 +92,7 @@ export async function handleIncomingMessage({
   setTimeout(() => processingLock.delete(lockKey), 30000);
 
   try {
-    // ── Check manual mode — per conversation only ───────────────
-    // manual = owner took over, needs-help = agent notified owner
-    // Both mean agent should stop for THIS conversation
-    // Other conversations are completely unaffected
+    // ── Check manual mode ─────────────────────────────────────
     const { rows: convRows } = await query(
       "SELECT status FROM conversations WHERE id = $1",
       [conversationId]
@@ -91,15 +102,14 @@ export async function handleIncomingMessage({
       return null;
     }
 
-    // ── Customer message already saved in webhook (savePendingMessage) ──
-    // Only update last_message timestamp — don't insert duplicate
+    // ── Update last_message timestamp ─────────────────────────
     await query(`
       UPDATE conversations
       SET last_message = $1, last_message_at = NOW(), updated_at = NOW()
       WHERE id = $2
     `, [message, conversationId]);
 
-    // ── Handle simple one-word replies without Claude ───────
+    // ── Handle simple one-word replies without Claude ─────────
     if (isSimpleReply(message)) {
       const holding = getHoldingReply(message);
       if (holding) {
@@ -115,30 +125,25 @@ export async function handleIncomingMessage({
       }
     }
 
-    // ── Get system prompt (cached) ──────────────────────────
+    // ── Get system prompt (cached) ────────────────────────────
     const systemPrompt = await getCachedPrompt(businessId);
 
-    // ── Fetch already collected details for this conversation ─
+    // ── Fetch already collected details ───────────────────────
     const { rows: detailRows } = await query(`
       SELECT collected_details, customer_name, customer_phone FROM conversations WHERE id = $1
     `, [conversationId]).catch(() => ({ rows: [] }));
 
-    const savedDetails     = detailRows[0]?.collected_details || {};
-    const savedName        = detailRows[0]?.customer_name || customerName;
-    const savedPhone       = detailRows[0]?.customer_phone || customerPhone;
+    const savedDetails = detailRows[0]?.collected_details || {};
+    const savedName    = detailRows[0]?.customer_name || customerName;
+    const savedPhone   = detailRows[0]?.customer_phone || customerPhone;
 
-    // Auto-populate from conversation — agent always knows these
     const collectedDetails = {
       ...savedDetails,
-      // Always inject what we already know from conversation
       ...(savedName  && !savedDetails.name  ? { name: savedName }   : {}),
       ...(savedPhone && !savedDetails.phone ? { phone: savedPhone } : {}),
     };
-    const hasDetails = Object.keys(collectedDetails).length > 0;
 
-    // ── Two-step reply for complex questions ─────────────────
-    // Send "hmm" / "let me check" first, then actual reply
-    // Makes agent feel like a human thinking before answering
+    // ── Two-step reply for complex questions ──────────────────
     if (phoneNumberId && accessToken && isComplexQuestion(message)) {
       const thinkingMsg = getThinkingMessage(message);
       await sendWhatsAppMessages({
@@ -147,17 +152,13 @@ export async function handleIncomingMessage({
         messages: [thinkingMsg],
       });
       await saveMessage({ conversationId, businessId, role: "agent", content: thinkingMsg });
-      // Extra pause — human is "checking"
       await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
     }
 
-    // ── Load history: first 6 msgs + last 14 msgs ──────────
-    // Agent never forgets customer name/details (in first msgs)
-    // While still having recent context (last msgs)
+    // ── Load history ──────────────────────────────────────────
     const history = await loadConversationHistory(conversationId, 20);
 
-    // Build context — inject everything we already know
-    // This is appended to every message so agent NEVER asks for known info
+    // ── Build context note ────────────────────────────────────
     const knownParts = [];
     knownParts.push(`WhatsApp/Contact Number: ${customerPhone} — NEVER ask for this`);
     if (collectedDetails.name || customerName)
@@ -166,8 +167,6 @@ export async function handleIncomingMessage({
       knownParts.push(`Domain/Subject: ${collectedDetails.domain}`);
     if (collectedDetails.service)
       knownParts.push(`Service: ${collectedDetails.service}`);
-
-    // Optional fields — show if collected OR if already skipped
     if (collectedDetails.word_count)
       knownParts.push(collectedDetails.word_count === "SKIPPED"
         ? `Word count: client did not provide — DO NOT ASK AGAIN`
@@ -197,7 +196,7 @@ RULE: Never ask for anything listed above. Move forward with what you have.]`;
       },
     ];
 
-    // ── Call Claude with prompt caching ─────────────────────
+    // ── Call Claude ───────────────────────────────────────────
     const reply = await callClaudeWithCache({
       systemPrompt,
       messages,
@@ -209,16 +208,15 @@ RULE: Never ask for anything listed above. Move forward with what you have.]`;
 
     if (!reply) return null;
 
-    // ── Split into human-like parts ─────────────────────────
+    // ── Split + send ──────────────────────────────────────────
     const parts = splitIntoMessages(reply);
 
-    // ── Send messages + save to DB ──────────────────────────
     if (phoneNumberId && accessToken) {
       const results = await sendWhatsAppMessages({
         phoneNumberId, accessToken,
         to:           customerPhone,
         messages:     parts,
-        waMessageId,  // mark as read + show typing
+        waMessageId,
       });
 
       for (let i = 0; i < parts.length; i++) {
@@ -232,7 +230,6 @@ RULE: Never ask for anything listed above. Move forward with what you have.]`;
     return parts;
 
   } finally {
-    // Always release lock
     processingLock.delete(lockKey);
   }
 }
@@ -243,32 +240,19 @@ function getHoldingReply(message) {
   if (["thanks", "thank you", "thankyou", "ty", "🙏"].includes(msg)) {
     return "You're welcome! Is there anything else I can help you with?";
   }
-  if (["hi", "hello", "hey"].includes(msg)) {
-    return null; // Let Claude handle greetings
-  }
-  if (["ok", "okay", "k", "done", "noted", "got it", "👍", "👌", "✅"].includes(msg)) {
-    return null; // Let Claude handle confirmations — context matters
-  }
   return null;
 }
 
-// ── Detect complex question ─────────────────────────────────
-// ── Two-step reply ONLY for: negotiation, very tight deadline, trust concern ──
-// NOT for regular questions, service info, domain/subject, word count etc.
+// ── Detect complex question ───────────────────────────────────
 function isComplexQuestion(message) {
   const msg = message.toLowerCase();
-  // Price negotiation only — NOT just asking price
   if (/discount|negotiate|kam karo|thoda kam|best price|cheaper|reduce price|less price/.test(msg)) return true;
-  // Very tight deadline — 1, 2, 3 days only
   if (/\b1 day\b|\b2 day\b|\b3 day\b|tomorrow deadline|aaj chahiye|kal chahiye|tonight|emergency/.test(msg)) return true;
-  // Trust or refund concern
   if (/refund|scam|fake|fraud|trust|verify|genuine|proof/.test(msg)) return true;
   return false;
-  // NOTE: Do NOT add price/cost/fee here — asking price is normal, not complex
-  // NOTE: Do NOT add service/thesis/domain — those are normal questions
 }
 
-// ── Thinking message — used only in above cases ───────────────
+// ── Thinking message ──────────────────────────────────────────
 function getThinkingMessage(message) {
   const msg = message.toLowerCase();
   if (/discount|negotiate|kam karo|best price|cheaper/.test(msg)) {
@@ -283,17 +267,13 @@ function getThinkingMessage(message) {
 }
 
 // ── Load conversation history ─────────────────────────────────
-// Always keeps FIRST 6 messages (customer details) + LAST N messages (recent context)
-// This way agent never forgets name, domain, deadline etc.
 async function loadConversationHistory(conversationId, limit = 20) {
-  // Get total message count
   const { rows: countRows } = await query(
     "SELECT COUNT(*) FROM messages WHERE conversation_id = $1",
     [conversationId]
   );
   const total = parseInt(countRows[0].count) || 0;
 
-  // If total fits in limit — just return all
   if (total <= limit) {
     const { rows } = await query(`
       SELECT role, content FROM messages
@@ -303,7 +283,6 @@ async function loadConversationHistory(conversationId, limit = 20) {
     return rows.map(toMessage);
   }
 
-  // Otherwise: first 6 messages + last (limit - 6) messages
   const firstCount = 6;
   const lastCount  = limit - firstCount;
 
@@ -321,18 +300,13 @@ async function loadConversationHistory(conversationId, limit = 20) {
     LIMIT $2
   `, [conversationId, lastCount]);
 
-  // Reverse lastRows to get chronological order
   lastRows.reverse();
 
-  // Combine: first messages + separator + recent messages
-  const combined = [
+  return [
     ...firstRows,
-    // Add a system note so Claude knows there's a gap
     { role: "assistant", content: "[Earlier conversation context omitted — customer details above are still valid]" },
     ...lastRows,
-  ];
-
-  return combined.map(toMessage);
+  ].map(toMessage);
 }
 
 function toMessage(row) {
@@ -352,18 +326,17 @@ async function callClaudeWithCache({
       max_tokens: 400,
       system: [
         {
-          type: "text",
-          text: systemPrompt,
-          cache_control: { type: "ephemeral" }, // ← cached — paid once per 5 min
+          type:          "text",
+          text:          systemPrompt,
+          cache_control: { type: "ephemeral" },
         },
       ],
       tools:    TOOLS,
-      // Inject dynamic context as last user message context
       messages: dynamicContext
         ? [
             ...messages.slice(0, -1),
             {
-              role: "user",
+              role:    "user",
               content: messages[messages.length - 1].content +
                 "[RELEVANT BUSINESS DATA FOR THIS MESSAGE:" + dynamicContext + "]",
             },
@@ -371,13 +344,12 @@ async function callClaudeWithCache({
         : messages,
     });
 
-    // Log cache usage for monitoring
     const usage = response.usage;
     if (usage?.cache_read_input_tokens > 0) {
       console.log(`💰 Cache hit: ${usage.cache_read_input_tokens} tokens cached (saved $${((usage.cache_read_input_tokens * 0.9) / 1000000).toFixed(6)})`);
     }
 
-    // Handle tool calls
+    // ── Handle tool calls ─────────────────────────────────────
     while (response.stop_reason === "tool_use") {
       const toolUseBlocks = response.content.filter(b => b.type === "tool_use");
       const toolResults   = [];
@@ -405,8 +377,8 @@ async function callClaudeWithCache({
         max_tokens: 400,
         system: [
           {
-            type: "text",
-            text: systemPrompt,
+            type:          "text",
+            text:          systemPrompt,
             cache_control: { type: "ephemeral" },
           },
         ],
@@ -433,13 +405,19 @@ async function callClaudeWithCache({
 async function executeTool({ toolName, input, businessId, conversationId, customerPhone, customerName }) {
   const ctx = { businessId, conversationId, customerPhone, customerName, input };
   switch (toolName) {
-    case "save_lead":          return executeSaveLead(ctx);
-    case "confirm_order":      return executeConfirmOrder(ctx);
-    case "book_appointment":   return executeBookAppointment(ctx);
-    case "check_availability": return executeCheckAvailability(ctx);
-    case "notify_owner":       return executeNotifyOwner(ctx);
-    case "schedule_followup":  return executeScheduleFollowup(ctx);
-    default:                   return { error: `Unknown tool: ${toolName}` };
+    case "save_lead":           return executeSaveLead(ctx);
+    case "confirm_order":       return executeConfirmOrder(ctx);
+    case "book_appointment":    return executeBookAppointment(ctx);
+    case "check_availability":  return executeCheckAvailability(ctx);
+    case "notify_owner":        return executeNotifyOwner(ctx);
+    case "schedule_followup":   return executeScheduleFollowup(ctx);
+    case "update_appointment":  return executeUpdateAppointment(ctx);
+    case "cancel_appointment":  return executeCancelAppointment(ctx);
+    case "update_order":        return executeUpdateOrder(ctx);
+    case "cancel_order":        return executeCancelOrder(ctx);
+    case "update_followup":     return executeUpdateFollowup(ctx);
+    case "cancel_followup":     return executeCancelFollowup(ctx);
+    default:                    return { error: `Unknown tool: ${toolName}` };
   }
 }
 

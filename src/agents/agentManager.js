@@ -196,9 +196,20 @@ RULE: Never ask for anything listed above. Move forward with what you have.]`;
       },
     ];
 
+    // ── Fetch dynamic context based on customer message ─────
+    // Loads only relevant data (services, products, FAQs, payment)
+    // keeping token usage low while keeping answers accurate
+    let dynamicContext = null;
+    try {
+      dynamicContext = await fetchRelevantContext(businessId, message);
+    } catch (err) {
+      console.warn("Context fetch failed (non-fatal):", err.message);
+    }
+
     // ── Call Claude ───────────────────────────────────────────
     const reply = await callClaudeWithCache({
       systemPrompt,
+      dynamicContext,
       messages,
       businessId,
       conversationId,

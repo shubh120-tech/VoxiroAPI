@@ -1,8 +1,9 @@
 import { query } from "../db/postgres.js";
 
 /**
- * Detect what type of context is needed based on customer message.
- * Returns only relevant data — keeps prompt small.
+ * Fetch relevant context based on customer message.
+ * Only loads what's needed — keeps token usage low.
+ * Called on every incoming message before Claude reply.
  */
 export async function fetchRelevantContext(businessId, message) {
   const msg = message.toLowerCase();
@@ -15,20 +16,22 @@ export async function fetchRelevantContext(businessId, message) {
     faq:       needsFaqInfo(msg),
     company:   needsCompanyInfo(msg),
     products:  needsProductInfo(msg),
+    docs:      needsDocInfo(msg),
   };
 
-  const [services, faqs, payment, company, products] = await Promise.all([
+  const [services, faqs, payment, company, products, docs] = await Promise.all([
     needs.services || needs.pricing ? fetchServices(businessId) : null,
     needs.faq ? fetchRelevantFaqs(businessId, message) : null,
     needs.payment ? fetchPaymentDetails(businessId) : null,
     needs.trust || needs.company ? fetchCompanyDetails(businessId) : null,
     needs.products || needs.pricing ? fetchStoreProducts(businessId, message) : null,
+    needs.docs ? fetchKnowledgeDocs(businessId, message) : null,
   ]);
 
-  return buildContextBlock({ services, faqs, payment, company, products, needs });
+  return buildContextBlock({ services, faqs, payment, company, products, docs, needs });
 }
 
-// ── Detection Functions ───────────────────────────────────────
+// ── Detection functions ───────────────────────────────────────
 
 function needsServiceInfo(msg) {
   return /service|offer|provide|work|help|do you|what kind|kya karte|kya milega|available|product|item|sell/.test(msg);
@@ -58,41 +61,41 @@ function needsCompanyInfo(msg) {
   return /about|company|who are|contact|address|location|office|gst|registered|website/.test(msg);
 }
 
-// ── Fetch Functions ───────────────────────────────────────────
+function needsDocInfo(msg) {
+  // Load knowledge docs when customer asks something specific not covered above
+  return /menu|catalogue|brochure|details|specification|spec|manual|guide|list|document/.test(msg);
+}
+
+// ── Fetch functions ───────────────────────────────────────────
 
 async function fetchServices(businessId) {
   const { rows } = await query(`
     SELECT name, description, price, price_min, price_max, price_unit, duration
     FROM business_services
     WHERE business_id = $1 AND is_active = TRUE
-    ORDER BY sort_order ASC, name ASC
+    ORDER BY sort_order ASC NULLS LAST, name ASC
   `, [businessId]);
   return rows;
 }
 
 async function fetchRelevantFaqs(businessId, message) {
-  // Get all active FAQs
   const { rows } = await query(`
     SELECT question, answer, category
     FROM business_faqs
-    WHERE business_id = $1 AND is_active = TRUE
-    ORDER BY sort_order ASC
-    LIMIT 20
+    WHERE business_id = $1
+    ORDER BY sort_order ASC NULLS LAST
+    LIMIT 25
   `, [businessId]);
 
   if (!rows.length) return [];
 
-  // Simple keyword matching to find relevant FAQs
-  const msg    = message.toLowerCase();
-  const words  = msg.split(/\s+/).filter(w => w.length > 3);
-
+  const words = message.toLowerCase().split(/\s+/).filter(w => w.length > 3);
   const scored = rows.map(faq => {
     const text  = `${faq.question} ${faq.answer}`.toLowerCase();
     const score = words.reduce((s, w) => s + (text.includes(w) ? 1 : 0), 0);
     return { ...faq, score };
   });
 
-  // Return top 5 most relevant
   return scored
     .filter(f => f.score > 0)
     .sort((a, b) => b.score - a.score)
@@ -100,10 +103,11 @@ async function fetchRelevantFaqs(businessId, message) {
 }
 
 async function fetchPaymentDetails(businessId) {
+  // FIX: correct table name is business_payment_methods
   const { rows } = await query(`
     SELECT method_name, details, instructions, is_primary
-    FROM business_payment_details
-    WHERE business_id = $1 AND is_active = TRUE
+    FROM business_payment_methods
+    WHERE business_id = $1
     ORDER BY is_primary DESC, created_at ASC
   `, [businessId]);
   return rows;
@@ -119,28 +123,58 @@ async function fetchCompanyDetails(businessId) {
   return rows[0] || null;
 }
 
-// ── Fetch Store Products ──────────────────────────────────────
 async function fetchStoreProducts(businessId, message) {
   try {
-    const keywords = message.toLowerCase().split(/\s+/).filter(w => w.length > 2).join("|");
+    const keyword = message.split(" ").slice(0, 3).join("%");
     const { rows } = await query(`
-      SELECT name, agent_description, description, price, variants,
-             in_stock, stock_count, category
-      FROM store_products
+      SELECT name, description, price, in_stock, category
+      FROM products
       WHERE business_id = $1
         AND (name ILIKE $2 OR description ILIKE $2 OR category ILIKE $2)
       ORDER BY in_stock DESC, name ASC
       LIMIT 8
-    `, [businessId, `%${message.split(" ").slice(0, 3).join("%")}%`]);
+    `, [businessId, `%${keyword}%`]);
     return rows;
   } catch {
     return [];
   }
 }
 
-// ── Build Context Block ───────────────────────────────────────
+async function fetchKnowledgeDocs(businessId, message) {
+  try {
+    const { rows } = await query(`
+      SELECT file_name, extracted_text
+      FROM knowledge_docs
+      WHERE business_id = $1
+        AND status = 'processed'
+        AND extracted_text IS NOT NULL
+      ORDER BY created_at DESC
+      LIMIT 3
+    `, [businessId]);
 
-function buildContextBlock({ services, faqs, payment, company, products, needs }) {
+    if (!rows.length) return [];
+
+    // Score docs by keyword relevance
+    const words  = message.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    const scored = rows.map(doc => {
+      const text  = (doc.extracted_text || "").toLowerCase();
+      const score = words.reduce((s, w) => s + (text.includes(w) ? 1 : 0), 0);
+      return { ...doc, score };
+    });
+
+    return scored
+      .filter(d => d.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .map(d => ({ ...d, extracted_text: d.extracted_text.slice(0, 500) }));
+  } catch {
+    return [];
+  }
+}
+
+// ── Build context block ───────────────────────────────────────
+
+function buildContextBlock({ services, faqs, payment, company, products, docs, needs }) {
   let context = "";
 
   // Services & Pricing
@@ -148,47 +182,35 @@ function buildContextBlock({ services, faqs, payment, company, products, needs }
     context += "\n\nSERVICES & PRICING:\n";
     context += services.map(s => {
       let price = "";
-      if (s.price)                price = `₹${s.price}`;
+      if (s.price)                         price = `₹${s.price}`;
       else if (s.price_min && s.price_max) price = `₹${s.price_min}–₹${s.price_max}`;
-      else if (s.price_min)       price = `From ₹${s.price_min}`;
-      const duration = s.duration ? ` | ${s.duration}` : "";
+      else if (s.price_min)                price = `From ₹${s.price_min}`;
+      const duration = s.duration    ? ` | ${s.duration}` : "";
       const desc     = s.description ? ` — ${s.description}` : "";
       return `• ${s.name}${desc}: ${price}${duration}`;
     }).join("\n");
   }
 
-  // Payment Details
+  // Store Products
+  if (products?.length > 0) {
+    context += "\n\nPRODUCTS:\n";
+    context += products.map(p => {
+      const stock = p.in_stock === false ? " [Out of stock]" : "";
+      const price = p.price ? `₹${p.price}` : "Price on request";
+      const desc  = p.description ? ` — ${p.description.slice(0, 80)}` : "";
+      return `• ${p.name}: ${price}${stock}${desc}`;
+    }).join("\n");
+  }
+
+  // Payment details
   if (payment?.length > 0) {
     context += "\n\nPAYMENT DETAILS:\n";
     context += payment.map(p => {
       let line = `${p.method_name}: ${p.details}`;
-      if (p.instructions) line += `\nNote: ${p.instructions}`;
+      if (p.instructions) line += ` — ${p.instructions}`;
       return line;
-    }).join("\n\n");
-    context += "\n\nSend as ONE message. Ask customer to share screenshot after payment.";
-  }
-
-  // Store Products
-  if (products?.length > 0) {
-    context += "PRODUCTS FROM STORE (use exact prices):";
-    context += products.map(p => {
-      const desc     = p.agent_description || p.description || "";
-      const variants = p.variants || [];
-      let priceStr   = p.price ? `₹${p.price}` : "Price on request";
-      if (variants.length > 1) {
-        const prices = variants.map(v => v.price).filter(Boolean);
-        if (prices.length) {
-          const minP = Math.min(...prices);
-          const maxP = Math.max(...prices);
-          priceStr   = minP === maxP ? `₹${minP}` : `₹${minP}–₹${maxP}`;
-        }
-      }
-      const stock    = p.in_stock ? "In stock" : "Out of stock";
-      const varStr   = variants.length > 1 ? `
-  Variants: ${variants.map(v => `${v.title} (₹${v.price})`).join(", ")}` : "";
-      return `• ${p.name}: ${priceStr} | ${stock}${desc ? `
-  ${desc.slice(0, 120)}` : ""}${varStr}`;
-    }).join("");
+    }).join("\n");
+    context += "\n\nAsk customer to share screenshot after payment.";
   }
 
   // Relevant FAQs
@@ -197,7 +219,7 @@ function buildContextBlock({ services, faqs, payment, company, products, needs }
     context += faqs.map(f => `Q: ${f.question}\nA: ${f.answer}`).join("\n\n");
   }
 
-  // Company/Trust Details
+  // Company / Trust details
   if (company) {
     const parts = [];
     if (company.gst_number)      parts.push(`GST: ${company.gst_number}`);
@@ -207,11 +229,9 @@ function buildContextBlock({ services, faqs, payment, company, products, needs }
     if (company.certifications)  parts.push(`Certifications: ${company.certifications}`);
 
     if (parts.length > 0 || company.trust_message) {
-      context += "\n\nCOMPANY VERIFICATION DETAILS (share as ONE message when asked):\n";
+      context += "\n\nCOMPANY DETAILS:\n";
       if (company.trust_message) context += `${company.trust_message}\n`;
       if (parts.length > 0)      context += parts.join("\n");
-
-      // Social links
       const links = company.social_links || {};
       if (links.website)   context += `\nWebsite: ${links.website}`;
       if (links.instagram) context += `\nInstagram: ${links.instagram}`;
@@ -219,5 +239,11 @@ function buildContextBlock({ services, faqs, payment, company, products, needs }
     }
   }
 
-  return context;
+  // Knowledge docs
+  if (docs?.length > 0) {
+    context += "\n\nFROM BUSINESS DOCUMENTS:\n";
+    context += docs.map(d => `[${d.file_name}]: ${d.extracted_text}`).join("\n\n");
+  }
+
+  return context || null;
 }

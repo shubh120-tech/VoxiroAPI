@@ -3,7 +3,6 @@ import bcrypt   from "bcryptjs";
 import jwt      from "jsonwebtoken";
 import crypto   from "crypto";
 import axios    from "axios";
-// Email via Resend API (HTTP — works on Railway)
 import { query } from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 
@@ -17,7 +16,6 @@ const bId = (req) => req.user.business_id;
 
 // Validate invite token
 router.get("/invite/:token", async (req, res) => {
-  console.log("✅ Public invite route hit:", req.params.token?.slice(0, 10) + "...");
   try {
     const { rows } = await query(`
       SELECT tm.id, tm.name, tm.email, tm.role, tm.invite_expires_at, tm.status,
@@ -27,10 +25,12 @@ router.get("/invite/:token", async (req, res) => {
       WHERE tm.invite_token = $1
     `, [req.params.token]);
 
-    console.log("Token lookup result:", rows.length, "rows", rows[0]?.status);
-
-    if (!rows.length) return res.status(200).json({ valid: false, message: "Invalid invite link. Please ask the owner to resend your invitation." });
-    if (rows[0].status !== "pending") return res.status(200).json({ valid: false, message: `Invite already used or account is ${rows[0].status}. Try logging in instead.` });
+    if (!rows.length) {
+      return res.status(200).json({ valid: false, message: "Invalid invite link. Please ask the owner to resend your invitation." });
+    }
+    if (rows[0].status !== "pending") {
+      return res.status(200).json({ valid: false, message: `Invite already used or account is ${rows[0].status}. Try logging in instead.` });
+    }
 
     const member = rows[0];
     if (new Date(member.invite_expires_at) < new Date()) {
@@ -129,20 +129,38 @@ router.post("/team/login", async (req, res) => {
 
     await query("UPDATE team_members SET last_login_at = NOW() WHERE id = $1", [member.id]);
 
+    // Parse permissions if string
+    let permissions = member.permissions || {};
+    if (typeof permissions === "string") {
+      try { permissions = JSON.parse(permissions); } catch { permissions = {}; }
+    }
+
     const token = jwt.sign(
       {
         id:          member.id,
         business_id: member.business_id,
         email:       member.email,
         role:        member.role,
-        permissions: member.permissions,
+        permissions,
         type:        "team_member",
       },
       process.env.JWT_SECRET,
       { expiresIn: "30d" }
     );
 
-    res.json({ token, name: member.name, email: member.email, role: member.role, permissions: member.permissions, businessName: member.business_name });
+    res.json({
+      token,
+      user: {
+        id:           member.id,
+        email:        member.email,
+        name:         member.name,
+        businessId:   member.business_id,
+        businessName: member.business_name,
+        role:         member.role,
+        permissions,
+        type:         "team_member",
+      },
+    });
 
   } catch (err) {
     res.status(500).json({ message: "Login failed" });
@@ -152,63 +170,76 @@ router.post("/team/login", async (req, res) => {
 // ── Default permissions per role ──────────────────────────────
 export const ROLE_PERMISSIONS = {
   owner: {
-    conversations: ["view", "reply", "delete", "assign"],
-    leads:         ["view", "edit", "delete", "export"],
-    orders:        ["view", "edit", "delete"],
-    settings:      ["view", "edit"],
-    broadcast:     ["view", "create", "send", "delete"],
-    knowledge:     ["view", "edit", "delete"],
-    team:          ["view", "add", "edit", "remove"],
-    analytics:     ["view", "export"],
+    conversations:    ["view", "reply", "delete", "assign"],
+    leads:            ["view", "edit", "delete", "export"],
+    orders:           ["view", "edit", "delete"],
+    settings:         ["view", "edit"],
+    broadcast:        ["view", "create", "send", "delete"],
+    knowledge:        ["view", "edit", "delete"],
+    knowledge_upload: ["view", "upload", "delete"],
+    agent_training:   ["view", "edit"],
+    products:         ["view", "edit", "delete"],
+    integrations:     ["view", "edit"],
+    team:             ["view", "add", "edit", "remove"],
+    analytics:        ["view", "export"],
   },
   manager: {
-    conversations: ["view", "reply", "delete", "assign"],
-    leads:         ["view", "edit", "delete", "export"],
-    orders:        ["view", "edit"],
-    settings:      ["view"],
-    broadcast:     ["view", "create", "send"],
-    knowledge:     ["view", "edit"],
-    team:          ["view"],
-    analytics:     ["view"],
+    conversations:    ["view", "reply", "delete", "assign"],
+    leads:            ["view", "edit", "delete", "export"],
+    orders:           ["view", "edit"],
+    settings:         ["view"],
+    broadcast:        ["view", "create", "send"],
+    knowledge:        ["view", "edit"],
+    knowledge_upload: [],
+    agent_training:   [],
+    products:         ["view"],
+    integrations:     [],
+    team:             ["view"],
+    analytics:        ["view"],
   },
   agent: {
-    conversations: ["view", "reply"],
-    leads:         ["view", "edit"],
-    orders:        ["view"],
-    settings:      [],
-    broadcast:     [],
-    knowledge:     ["view"],
-    team:          [],
-    analytics:     [],
+    conversations:    ["view", "reply"],
+    leads:            ["view", "edit"],
+    orders:           ["view"],
+    settings:         [],
+    broadcast:        [],
+    knowledge:        [],
+    knowledge_upload: [],
+    agent_training:   [],
+    products:         [],
+    integrations:     [],
+    team:             [],
+    analytics:        [],
   },
   viewer: {
-    conversations: ["view"],
-    leads:         ["view"],
-    orders:        ["view"],
-    settings:      [],
-    broadcast:     ["view"],
-    knowledge:     ["view"],
-    team:          [],
-    analytics:     ["view"],
+    conversations:    ["view"],
+    leads:            ["view"],
+    orders:           ["view"],
+    settings:         [],
+    broadcast:        ["view"],
+    knowledge:        ["view"],
+    knowledge_upload: [],
+    agent_training:   [],
+    products:         ["view"],
+    integrations:     [],
+    team:             [],
+    analytics:        ["view"],
   },
 };
 
-// ── Send invite email via Resend HTTP API ────────────────────
+// ── Send invite email via Resend HTTP API ─────────────────────
 async function sendInviteEmail({ name, email, businessName, inviteToken, inviterName }) {
   const frontendUrl = (process.env.FRONTEND_URL || "").replace(/\/$/, "");
   const inviteLink  = `${frontendUrl}/accept-invite/${inviteToken}`;
   const apiKey      = process.env.RESEND_API_KEY;
-  // Resend free tier only allows sending from onboarding@resend.dev
-  // unless you verify your own domain
   const fromEmail   = process.env.FROM_EMAIL || "onboarding@resend.dev";
 
-  if (!apiKey) throw new Error("RESEND_API_KEY not set in environment variables");
+  if (!apiKey) throw new Error("RESEND_API_KEY not set");
 
-  // Force use resend default if no custom domain configured
   const finalFromEmail = fromEmail.includes("resend.dev") ? fromEmail :
     (process.env.RESEND_DOMAIN_VERIFIED === "true" ? fromEmail : "onboarding@resend.dev");
 
-  const response = await axios.post(
+  await axios.post(
     "https://api.resend.com/emails",
     {
       from:    `${businessName} via Yougant <${finalFromEmail}>`,
@@ -231,9 +262,7 @@ async function sendInviteEmail({ name, email, businessName, inviteToken, inviter
           <p style="color: #6b7280; font-size: 13px; border-top: 1px solid #e5e7eb; padding-top: 16px;">
             This link expires in 48 hours. If you didn't expect this invite, you can ignore this email.
           </p>
-          <p style="color: #9ca3af; font-size: 12px;">
-            Or copy this link: ${inviteLink}
-          </p>
+          <p style="color: #9ca3af; font-size: 12px;">Or copy this link: ${inviteLink}</p>
         </div>
       `,
     },
@@ -246,7 +275,6 @@ async function sendInviteEmail({ name, email, businessName, inviteToken, inviter
   );
 
   console.log(`✅ Invite email sent via Resend to ${email}`);
-  return response.data;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -258,8 +286,8 @@ router.use("/team", authMiddleware);
 router.get("/team", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT id, name, email, role, permissions, status,
-             last_login_at, created_at, invite_expires_at
+      SELECT id, name, email, role, permissions, conversation_access,
+             whatsapp_number, status, last_login_at, created_at, invite_expires_at
       FROM team_members
       WHERE business_id = $1
       ORDER BY created_at DESC
@@ -273,64 +301,56 @@ router.get("/team", async (req, res) => {
 // Invite team member
 router.post("/team/invite", async (req, res) => {
   try {
-    const { name, email, role, permissions, conversation_access } = req.body;
-
-    console.log("Invite request:", { name, email, role, businessId: bId(req) });
+    const { name, email, role, permissions, conversation_access, whatsapp_number } = req.body;
 
     if (!name || !email) return res.status(400).json({ message: "Name and email required" });
-    if (!role) return res.status(400).json({ message: "Role is required" });
+    if (!role)           return res.status(400).json({ message: "Role is required" });
     if (!["manager", "agent", "viewer", "custom"].includes(role)) {
-      return res.status(400).json({ message: `Invalid role: ${role}. Must be manager, agent, viewer, or custom` });
+      return res.status(400).json({ message: `Invalid role: ${role}` });
     }
 
-    // Check if already exists
     const { rows: existing } = await query(
       "SELECT id FROM team_members WHERE business_id = $1 AND email = $2",
       [bId(req), email]
     );
     if (existing.length) return res.status(400).json({ message: "Team member with this email already exists" });
 
-    // Build permissions — use role defaults or custom
     const finalPermissions = role === "custom"
       ? (permissions || {})
       : ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.agent;
 
-    // Generate invite token
     const inviteToken   = crypto.randomBytes(32).toString("hex");
-    const inviteExpires = new Date(Date.now() + 48 * 60 * 60 * 1000); // 48 hours
+    const inviteExpires = new Date(Date.now() + 48 * 60 * 60 * 1000);
 
     const { rows } = await query(`
       INSERT INTO team_members
-        (business_id, name, email, role, permissions, status,
-         invite_token, invite_expires_at)
-      VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+        (business_id, name, email, role, permissions, conversation_access,
+         whatsapp_number, status, invite_token, invite_expires_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9)
       RETURNING id, name, email, role, status, created_at
     `, [
       bId(req), name, email, role,
       JSON.stringify(finalPermissions),
-      inviteToken, inviteExpires,
+      conversation_access || "all",
+      whatsapp_number     || null,
+      inviteToken,
+      inviteExpires,
     ]);
 
     // Get business + inviter details for email
-    const { rows: bizRows } = await query(
-      "SELECT name FROM businesses WHERE id = $1",
-      [bId(req)]
-    );
+    const { rows: bizRows } = await query("SELECT name FROM businesses WHERE id = $1", [bId(req)]);
     const { rows: inviterRows } = await query(
-      "SELECT name FROM team_members WHERE id = $1 UNION SELECT name FROM businesses WHERE id = $1",
+      "SELECT owner_name AS name FROM users WHERE id = $1",
       [req.user.id]
-    );
+    ).catch(() => ({ rows: [] }));
 
-    const businessName = bizRows[0]?.name || "the business";
+    const businessName = bizRows[0]?.name    || "the business";
     const inviterName  = inviterRows[0]?.name || "The owner";
 
-    // Send invite email
     try {
       await sendInviteEmail({ name, email, businessName, inviteToken, inviterName });
-      console.log(`✅ Invite sent to ${email}`);
     } catch (emailErr) {
       console.error("Email send error:", emailErr.message);
-      // Don't fail the request — still save the member
     }
 
     res.status(201).json({
@@ -345,42 +365,44 @@ router.post("/team/invite", async (req, res) => {
   }
 });
 
-// Update team member role/permissions
+// Update team member role/permissions/whatsapp
 router.put("/team/:id", async (req, res) => {
   try {
-    const { role, permissions, status, conversation_access } = req.body;
- 
-    // FIX: Always save the permissions exactly as sent from frontend
-    // Don't override with role defaults — owner explicitly customized these
+    const { role, permissions, status, conversation_access, whatsapp_number } = req.body;
+
+    // Always save permissions exactly as sent — don't override with role defaults
     const finalPermissions = permissions || {};
- 
+
     const { rows } = await query(`
       UPDATE team_members
       SET role                = COALESCE($1, role),
           permissions         = $2,
           conversation_access = COALESCE($3, conversation_access),
-          status              = COALESCE($4, status),
+          whatsapp_number     = $4,
+          status              = COALESCE($5, status),
           updated_at          = NOW()
-      WHERE id = $5 AND business_id = $6
-      RETURNING id, name, email, role, permissions, conversation_access, status
+      WHERE id = $6 AND business_id = $7
+      RETURNING id, name, email, role, permissions, conversation_access, whatsapp_number, status
     `, [
-      role                  || null,
+      role                || null,
       JSON.stringify(finalPermissions),
-      conversation_access   || null,
-      status                || null,
+      conversation_access || null,
+      whatsapp_number     !== undefined ? (whatsapp_number || null) : undefined,
+      status              || null,
       req.params.id,
       bId(req),
     ]);
- 
+
     if (!rows.length) return res.status(404).json({ message: "Member not found" });
- 
-    console.log(`✅ Updated team member ${rows[0].name}: role=${rows[0].role}, conversation_access=${rows[0].conversation_access}`);
+
+    console.log(`✅ Updated ${rows[0].name}: role=${rows[0].role}, wa=${rows[0].whatsapp_number}`);
     res.json({ success: true, member: rows[0] });
   } catch (err) {
     console.error("Update team member error:", err.message);
     res.status(500).json({ message: "Failed to update member: " + err.message });
   }
 });
+
 // Revoke access (suspend)
 router.patch("/team/:id/revoke", async (req, res) => {
   try {
@@ -452,7 +474,5 @@ router.delete("/team/:id", async (req, res) => {
     res.status(500).json({ message: "Failed to remove member" });
   }
 });
-
-
 
 export default router;

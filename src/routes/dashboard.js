@@ -953,7 +953,7 @@ router.post("/agent/conversations/:id/assign", async (req, res) => {
 
     // Get team member details
     const { rows: member } = await query(
-      "SELECT id, name, role FROM team_members WHERE id = $1 AND business_id = $2 AND status = 'active'",
+      "SELECT id, name, role, whatsapp_number FROM team_members WHERE id = $1 AND business_id = $2 AND status = 'active'",
       [team_member_id, bId]
     );
     if (!member.length) return res.status(404).json({ message: "Team member not found" });
@@ -976,16 +976,6 @@ router.post("/agent/conversations/:id/assign", async (req, res) => {
         [bId]
       );
 
-      // Get member's phone — from team_members or notification_settings
-      const { rows: memberPhone } = await query(`
-        SELECT ns.owner_notify_number AS phone
-        FROM notification_settings ns
-        WHERE ns.business_id = $1
-        UNION
-        SELECT NULL AS phone
-        LIMIT 1
-      `, [bId]).catch(() => ({ rows: [] }));
-
       // Build notification message
       const customerName  = conv[0].customer_name || conv[0].customer_phone;
       const lastMsg       = (conv[0].last_message || "").slice(0, 100);
@@ -1002,15 +992,23 @@ router.post("/agent/conversations/:id/assign", async (req, res) => {
 ` +
         `Open: ${dashboardLink}`;
 
-      // Send to member's registered notify number if available
-      if (wc.length && memberPhone[0]?.phone) {
+      // Send to member's own WhatsApp number
+      const memberWaNumber = member[0].whatsapp_number;
+      if (wc.length && memberWaNumber) {
         const { sendWhatsAppMessage } = await import("../whatsapp/sender.js");
+        const cleanNumber = memberWaNumber
+          .replace(/\s/g, "")
+          .replace(/^\+/, "")
+          .replace(/^0/, "91");
         await sendWhatsAppMessage({
           phoneNumberId: wc[0].phone_number_id,
           accessToken:   wc[0].access_token,
-          to:            memberPhone[0].phone.replace(/\D/g, ""),
+          to:            cleanNumber,
           message:       notifMsg,
         });
+        console.log(`✅ Assignment notification sent to ${member[0].name} (${cleanNumber})`);
+      } else {
+        console.warn(`⚠️ No WhatsApp number for ${member[0].name} — assignment saved but notification skipped`);
       }
 
       console.log(`✅ Conversation ${req.params.id} assigned to ${member[0].name}`);

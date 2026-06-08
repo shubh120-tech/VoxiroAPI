@@ -246,6 +246,76 @@ router.get("/broadcast/templates", async (req, res) => {
   } catch (err) { res.status(500).json({ message: "Failed to load templates" }); }
 });
 
+// ── AI Template Generator ─────────────────────────────────────
+router.post("/broadcast/templates/ai-generate", async (req, res) => {
+  try {
+    const { prompt, category, language } = req.body;
+    if (!prompt?.trim()) return res.status(400).json({ message: "Prompt required" });
+
+    const META_POLICY = `
+Meta WhatsApp template rules (MUST follow or template gets rejected):
+- No spam words: FREE!!, WINNER, CLAIM NOW, ACT NOW, GUARANTEED, URGENT in all caps
+- No false urgency or misleading claims
+- No promises of guaranteed results
+- No phone numbers or raw URLs in body — use button components instead
+- Variables like {{name}} must be syntactically correct
+- Footer should have opt-out for marketing templates
+- Max 1024 characters for body, 60 for header/footer
+- Keep tone conversational and genuine — not pushy or salesy
+- Max 4-5 emojis total
+`.trim();
+
+    const userPrompt = `You are an expert WhatsApp Business template writer who knows Meta policies deeply.
+
+${META_POLICY}
+
+Business request: "${prompt}"
+Category: ${category || "MARKETING"}
+Language: ${language === "hi" ? "Hindi" : "English"}
+
+Generate a WhatsApp template that will get APPROVED by Meta.
+Return ONLY valid JSON with no explanation, no markdown backticks:
+
+{
+  "name": "snake_case_name_under_30_chars",
+  "category": "${category || "MARKETING"}",
+  "header_text": "short header text or empty string if not needed",
+  "body": "main message body, use {{name}} for personalization, max 1024 chars",
+  "footer_text": "Reply STOP to unsubscribe",
+  "variables": ["name"],
+  "meta_compliance_notes": "one line explaining why this passes Meta review",
+  "warnings": []
+}`;
+
+    const response = await anthropic.messages.create({
+      model:      process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-5",
+      max_tokens: 1000,
+      messages:   [{ role: "user", content: userPrompt }],
+    });
+
+    const text  = response.content[0]?.text || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(clean);
+    } catch {
+      return res.status(500).json({ message: "AI returned invalid response. Please try again." });
+    }
+
+    // Sanitize name to snake_case
+    if (parsed.name) {
+      parsed.name = parsed.name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 60);
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    console.error("AI template generate error:", err.message);
+    res.status(500).json({ message: "Generation failed: " + err.message });
+  }
+});
+
+
 // ── Create template (now includes header_type + header_media_url) ──
 router.post("/broadcast/templates", async (req, res) => {
   try {

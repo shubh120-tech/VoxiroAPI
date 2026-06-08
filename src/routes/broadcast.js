@@ -8,6 +8,15 @@ import { query } from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 
 const router = express.Router();
+
+// ── Public route — no auth needed ────────────────────────────
+// Must be BEFORE authMiddleware so Meta and browsers can fetch without token
+router.get("/broadcast/media/:filename", (req, res) => {
+  const filePath = `/tmp/broadcast_media/${req.params.filename}`;
+  if (!fs.existsSync(filePath)) return res.status(404).json({ message: "File not found" });
+  res.sendFile(path.resolve(filePath));
+});
+
 router.use(authMiddleware);
 
 const bId = (req) => req.user.business_id;
@@ -85,12 +94,7 @@ router.post("/broadcast/templates/upload-media", upload.single("file"), async (r
   }
 });
 
-// Serve uploaded media files (no auth — needed for Meta to fetch during review)
-router.get("/broadcast/media/:filename", (req, res) => {
-  const filePath = `/tmp/broadcast_media/${req.params.filename}`;
-  if (!fs.existsSync(filePath)) return res.status(404).json({ message: "File not found" });
-  res.sendFile(path.resolve(filePath));
-});
+
 
 // ══════════════════════════════════════════════════════════════
 //  CONTACT LISTS
@@ -333,6 +337,29 @@ router.post("/broadcast/templates/sync", async (req, res) => {
     const { rows } = await query("SELECT * FROM whatsapp_templates WHERE business_id=$1 ORDER BY created_at DESC", [businessId]);
     res.json({ success: true, synced, templates: rows });
   } catch (err) { res.status(500).json({ message: "Failed to sync templates: " + err.message }); }
+});
+
+// ── Get single template status from Meta ──
+router.get("/broadcast/templates/:id/status", async (req, res) => {
+  try {
+    const businessId = req.user.business_id;
+    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, businessId]);
+    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+    const template = tRows[0];
+    const { rows: wRows } = await query("SELECT access_token FROM whatsapp_configs WHERE business_id=$1", [businessId]);
+    if (!wRows[0]?.access_token) return res.json({ template });
+    const sanitized = sanitizeTemplateName(template.name);
+    const metaRes = await axios.get(
+      `https://graph.facebook.com/${META_VERSION}/${template.meta_template_id || sanitized}`,
+      { params: { fields: "name,status,quality_score" }, headers: { Authorization: `Bearer ${wRows[0].access_token}` } }
+    ).catch(() => null);
+    if (metaRes?.data?.status) {
+      const newStatus = metaRes.data.status.toLowerCase();
+      await query("UPDATE whatsapp_templates SET meta_status=$1, updated_at=NOW() WHERE id=$2", [newStatus, template.id]);
+      template.meta_status = newStatus;
+    }
+    res.json({ template });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 // ── Sync single template ──

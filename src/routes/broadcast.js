@@ -1,6 +1,9 @@
 import express   from "express";
 import axios     from "axios";
 import Anthropic from "@anthropic-ai/sdk";
+import multer    from "multer";
+import path      from "path";
+import fs        from "fs";
 import { query } from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 
@@ -12,40 +15,82 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const META_BASE    = process.env.META_BASE_URL    || "https://graph.facebook.com";
 const META_VERSION = process.env.META_API_VERSION || "v19.0";
+const BACKEND_URL  = process.env.BACKEND_URL      || "https://voxiroapi-production.up.railway.app";
 
 // ── IST helpers ───────────────────────────────────────────────
-const IST_OFFSET_MS   = 5.5 * 60 * 60 * 1000; // 5h30m in ms
+const IST_OFFSET_MS   = 5.5 * 60 * 60 * 1000;
 const SEND_HOUR_START = 6;
 const SEND_HOUR_END   = 23;
 
-function nowIST()       { return new Date(Date.now() + IST_OFFSET_MS); }
-function getISTHour(d)  { return new Date(d.getTime() + IST_OFFSET_MS).getUTCHours(); }
+function nowIST()      { return new Date(Date.now() + IST_OFFSET_MS); }
+function getISTHour(d) { return new Date(d.getTime() + IST_OFFSET_MS).getUTCHours(); }
 function isValidSendTime(date) {
   const h = getISTHour(date);
   return h >= SEND_HOUR_START && h < SEND_HOUR_END;
 }
-
-// Convert IST datetime string input → UTC Date
-// User picks "2026-06-01T17:30" which they mean as IST
 function istInputToUTC(istStr) {
   if (!istStr) return null;
   const normalized = istStr.includes("T") ? istStr : istStr.replace(" ", "T");
   const istDate    = new Date(normalized + (normalized.includes("Z") ? "" : ":00"));
   if (isNaN(istDate.getTime())) return null;
-  // Subtract IST offset to get UTC
   return new Date(istDate.getTime() - IST_OFFSET_MS);
 }
-
-// Format UTC date to IST string for display
 function utcToISTString(utcDate) {
   if (!utcDate) return null;
   const ist = new Date(new Date(utcDate).getTime() + IST_OFFSET_MS);
   return ist.toISOString().replace("Z", "+05:30");
 }
-
 function sanitizeTemplateName(name) {
   return name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
 }
+
+// ── Multer — media upload ─────────────────────────────────────
+const mediaStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = "/tmp/broadcast_media";
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `media_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
+  },
+});
+
+const upload = multer({
+  storage: mediaStorage,
+  limits: { fileSize: 16 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = ["image/jpeg", "image/png", "image/webp", "video/mp4", "video/3gpp"];
+    allowed.includes(file.mimetype)
+      ? cb(null, true)
+      : cb(new Error("Only JPG/PNG/WebP images and MP4/3GPP videos are allowed"));
+  },
+});
+
+// ══════════════════════════════════════════════════════════════
+//  MEDIA UPLOAD & SERVE
+// ══════════════════════════════════════════════════════════════
+
+// Upload image or video → returns public URL
+router.post("/broadcast/templates/upload-media", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    const fileType  = req.file.mimetype.startsWith("image/") ? "image" : "video";
+    const publicUrl = `${BACKEND_URL}/api/broadcast/media/${req.file.filename}`;
+    console.log(`📎 Media uploaded: ${req.file.filename} (${fileType})`);
+    res.json({ url: publicUrl, type: fileType, fileName: req.file.filename });
+  } catch (err) {
+    res.status(500).json({ message: "Upload failed: " + err.message });
+  }
+});
+
+// Serve uploaded media files (no auth — needed for Meta to fetch during review)
+router.get("/broadcast/media/:filename", (req, res) => {
+  const filePath = `/tmp/broadcast_media/${req.params.filename}`;
+  if (!fs.existsSync(filePath)) return res.status(404).json({ message: "File not found" });
+  res.sendFile(path.resolve(filePath));
+});
 
 // ══════════════════════════════════════════════════════════════
 //  CONTACT LISTS
@@ -61,9 +106,7 @@ router.get("/broadcast/lists", async (req, res) => {
       GROUP BY cl.id ORDER BY cl.created_at DESC
     `, [bId(req)]);
     res.json({ lists: rows });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to load lists" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to load lists" }); }
 });
 
 router.post("/broadcast/lists", async (req, res) => {
@@ -75,9 +118,7 @@ router.post("/broadcast/lists", async (req, res) => {
       VALUES ($1,$2,$3,$4) RETURNING *
     `, [bId(req), name, description || null, color || "#0d9488"]);
     res.status(201).json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to create list" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to create list" }); }
 });
 
 router.put("/broadcast/lists/:id", async (req, res) => {
@@ -88,18 +129,14 @@ router.put("/broadcast/lists/:id", async (req, res) => {
       WHERE id=$4 AND business_id=$5 RETURNING *
     `, [name, description, color, req.params.id, bId(req)]);
     res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to update list" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to update list" }); }
 });
 
 router.delete("/broadcast/lists/:id", async (req, res) => {
   try {
     await query("DELETE FROM contact_lists WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to delete list" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to delete list" }); }
 });
 
 router.get("/broadcast/lists/:id/contacts", async (req, res) => {
@@ -110,9 +147,7 @@ router.get("/broadcast/lists/:id/contacts", async (req, res) => {
       WHERE clm.list_id=$1 AND bc.business_id=$2 ORDER BY bc.name ASC
     `, [req.params.id, bId(req)]);
     res.json({ contacts: rows });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to load list contacts" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to load list contacts" }); }
 });
 
 router.post("/broadcast/lists/:id/contacts", async (req, res) => {
@@ -121,24 +156,17 @@ router.post("/broadcast/lists/:id/contacts", async (req, res) => {
     if (!contact_ids?.length) return res.status(400).json({ message: "No contacts provided" });
     let added = 0;
     for (const contactId of contact_ids) {
-      try {
-        await query(`INSERT INTO contact_list_members (list_id, contact_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.params.id, contactId]);
-        added++;
-      } catch {}
+      try { await query(`INSERT INTO contact_list_members (list_id, contact_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.params.id, contactId]); added++; } catch {}
     }
     res.json({ success: true, added });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to add contacts" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to add contacts" }); }
 });
 
 router.delete("/broadcast/lists/:id/contacts/:contactId", async (req, res) => {
   try {
     await query("DELETE FROM contact_list_members WHERE list_id=$1 AND contact_id=$2", [req.params.id, req.params.contactId]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to remove contact" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to remove contact" }); }
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -154,9 +182,7 @@ router.get("/broadcast/contacts", async (req, res) => {
     sql += ` ORDER BY created_at DESC`;
     const { rows } = await query(sql, params);
     res.json({ contacts: rows });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to load contacts" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to load contacts" }); }
 });
 
 router.post("/broadcast/contacts/extract", async (req, res) => {
@@ -172,9 +198,7 @@ router.post("/broadcast/contacts/extract", async (req, res) => {
     try { contacts = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch { contacts = []; }
     contacts = contacts.filter(c => c.phone && c.phone.length >= 10);
     res.json({ contacts, count: contacts.length });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to extract contacts" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to extract contacts" }); }
 });
 
 router.post("/broadcast/contacts/import", async (req, res) => {
@@ -189,39 +213,31 @@ router.post("/broadcast/contacts/import", async (req, res) => {
           INSERT INTO business_contacts (business_id, name, phone, email, notes, source)
           VALUES ($1,$2,$3,$4,$5,'import')
           ON CONFLICT (business_id, phone) DO UPDATE
-          SET name=COALESCE($2, business_contacts.name),
-              notes=COALESCE($5, business_contacts.notes),
-              updated_at=NOW()
+          SET name=COALESCE($2, business_contacts.name), notes=COALESCE($5, business_contacts.notes), updated_at=NOW()
         `, [bId(req), c.name, c.phone, c.email, c.notes]);
         imported++;
       } catch { skipped++; }
     }
     res.json({ success: true, imported, skipped });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to import contacts" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to import contacts" }); }
 });
 
 router.delete("/broadcast/contacts/:id", async (req, res) => {
   try {
     await query("DELETE FROM business_contacts WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to delete contact" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to delete contact" }); }
 });
 
 router.patch("/broadcast/contacts/:id/optout", async (req, res) => {
   try {
     await query("UPDATE business_contacts SET opted_out=TRUE WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to opt out contact" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to opt out contact" }); }
 });
 
 // ══════════════════════════════════════════════════════════════
-//  TEMPLATES
+//  TEMPLATES — with image/video header support
 // ══════════════════════════════════════════════════════════════
 
 router.get("/broadcast/templates", async (req, res) => {
@@ -231,11 +247,59 @@ router.get("/broadcast/templates", async (req, res) => {
       [bId(req)]
     );
     res.json({ templates: rows });
+  } catch (err) { res.status(500).json({ message: "Failed to load templates" }); }
+});
+
+// ── Create template (now includes header_type + header_media_url) ──
+router.post("/broadcast/templates", async (req, res) => {
+  try {
+    const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables } = req.body;
+    if (!name || !body) return res.status(400).json({ message: "Name and body required" });
+
+    const { rows } = await query(`
+      INSERT INTO whatsapp_templates
+        (business_id, name, category, language, header_type, header_text, header_media_url, body, footer_text, variables)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *
+    `, [
+      bId(req), name,
+      category  || "MARKETING",
+      language  || "en",
+      header_type       || "none",
+      header_text       || null,
+      header_media_url  || null,
+      body, footer_text || null,
+      variables || [],
+    ]);
+    res.status(201).json(rows[0]);
   } catch (err) {
-    res.status(500).json({ message: "Failed to load templates" });
+    res.status(500).json({ message: "Failed to create template: " + err.message });
   }
 });
 
+// ── Update template ──
+router.put("/broadcast/templates/:id", async (req, res) => {
+  try {
+    const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables } = req.body;
+    const { rows } = await query(`
+      UPDATE whatsapp_templates SET
+        name=$1, category=$2, language=$3,
+        header_type=$4, header_text=$5, header_media_url=$6,
+        body=$7, footer_text=$8, variables=$9,
+        meta_status='draft', updated_at=NOW()
+      WHERE id=$10 AND business_id=$11 RETURNING *
+    `, [name, category, language, header_type || "none", header_text || null, header_media_url || null, body, footer_text, variables, req.params.id, bId(req)]);
+    res.json(rows[0]);
+  } catch (err) { res.status(500).json({ message: "Failed to update template" }); }
+});
+
+router.delete("/broadcast/templates/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: "Failed to delete template" }); }
+});
+
+// ── Sync all templates ──
 router.post("/broadcast/templates/sync", async (req, res) => {
   try {
     const businessId = req.user.business_id;
@@ -263,21 +327,16 @@ router.post("/broadcast/templates/sync", async (req, res) => {
       if (!mt) continue;
       const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
       const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
-      await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE id=$3`, [newStatus, rejReason, lt.id]).catch(async () => {
-        await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS meta_status VARCHAR(50) DEFAULT 'pending'`);
-        await query(`ALTER TABLE whatsapp_templates ADD COLUMN IF NOT EXISTS rejection_reason TEXT`);
-        await query(`UPDATE whatsapp_templates SET meta_status=$1 WHERE id=$2`, [newStatus, lt.id]);
-      });
+      await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE id=$3`, [newStatus, rejReason, lt.id]);
       synced++;
     }
     const { rows } = await query("SELECT * FROM whatsapp_templates WHERE business_id=$1 ORDER BY created_at DESC", [businessId]);
     res.json({ success: true, synced, templates: rows });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to sync templates: " + err.message });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to sync templates: " + err.message }); }
 });
 
-router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) => {
+// ── Sync single template ──
+router.post("/broadcast/templates/:id/sync", async (req, res) => {
   try {
     const businessId = req.user.business_id;
     const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, businessId]);
@@ -291,95 +350,29 @@ router.post("/broadcast/templates/:id/sync", authMiddleware, async (req, res) =>
       params: { name: sanitized, fields: "name,status,rejected_reason,quality_score" },
       headers: { Authorization: `Bearer ${access_token}` },
     });
-    let mt = metaRes.data?.data?.[0];
-    if (!mt && sanitized !== template.name) {
-      const fb = await axios.get(`https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`, {
-        params: { name: template.name, fields: "name,status,rejected_reason,quality_score" },
-        headers: { Authorization: `Bearer ${access_token}` },
-      }).catch(() => null);
-      mt = fb?.data?.data?.[0];
-    }
+    const mt = metaRes.data?.data?.[0];
     if (!mt) return res.json({ template, message: "Template not found on Meta yet" });
     const STATUS_MAP = { APPROVED:"approved", PENDING:"pending", REJECTED:"rejected", DISABLED:"rejected", PAUSED:"paused", IN_APPEAL:"pending" };
     const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
     const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
     await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE id=$3`, [newStatus, rejReason, template.id]);
     res.json({ success: true, status: newStatus, rejection_reason: rejReason });
-  } catch (err) {
-    res.status(500).json({ message: "Sync failed: " + err.message });
-  }
+  } catch (err) { res.status(500).json({ message: "Sync failed: " + err.message }); }
 });
 
-router.get("/broadcast/templates/:id/status", async (req, res) => {
-  try {
-    const businessId = req.user.business_id;
-    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, businessId]);
-    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
-    const template = tRows[0];
-    const { rows: wRows } = await query("SELECT access_token FROM whatsapp_configs WHERE business_id=$1", [businessId]);
-    if (!wRows[0]?.access_token) return res.json({ template });
-    const sanitized = sanitizeTemplateName(template.name);
-    const metaRes = await axios.get(
-      `https://graph.facebook.com/${META_VERSION}/${template.meta_template_id || sanitized}`,
-      { params: { fields: "name,status,quality_score" }, headers: { Authorization: `Bearer ${wRows[0].access_token}` } }
-    ).catch(() => null);
-    if (metaRes?.data?.status) {
-      const newStatus = metaRes.data.status.toLowerCase();
-      await query("UPDATE whatsapp_templates SET meta_status=$1, updated_at=NOW() WHERE id=$2", [newStatus, template.id]);
-      template.meta_status = newStatus;
-    }
-    res.json({ template });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-});
-
-router.post("/broadcast/templates", async (req, res) => {
-  try {
-    const { name, category, language, header_text, body, footer_text, variables } = req.body;
-    if (!name || !body) return res.status(400).json({ message: "Name and body required" });
-    const { rows } = await query(`
-      INSERT INTO whatsapp_templates (business_id, name, category, language, header_text, body, footer_text, variables)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
-    `, [bId(req), name, category || "MARKETING", language || "en", header_text, body, footer_text, variables || []]);
-    res.status(201).json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to create template" });
-  }
-});
-
-router.put("/broadcast/templates/:id", async (req, res) => {
-  try {
-    const { name, category, language, header_text, body, footer_text, variables } = req.body;
-    const { rows } = await query(`
-      UPDATE whatsapp_templates SET name=$1, category=$2, language=$3, header_text=$4,
-        body=$5, footer_text=$6, variables=$7, meta_status='draft', updated_at=NOW()
-      WHERE id=$8 AND business_id=$9 RETURNING *
-    `, [name, category, language, header_text, body, footer_text, variables, req.params.id, bId(req)]);
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to update template" });
-  }
-});
-
-router.delete("/broadcast/templates/:id", async (req, res) => {
-  try {
-    await query("DELETE FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to delete template" });
-  }
-});
-
+// ── Submit template to Meta (handles text, image, video headers) ──
 router.post("/broadcast/templates/:id/submit", async (req, res) => {
   try {
     const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
     if (!tRows.length) return res.status(404).json({ message: "Template not found" });
     const template = tRows[0];
+
     const { rows: wc } = await query("SELECT * FROM whatsapp_configs WHERE business_id=$1", [bId(req)]);
     if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
     const { access_token, waba_id, phone_number_id } = wc[0];
     if (!access_token) return res.status(400).json({ message: "Access token missing" });
+
+    // Resolve WABA ID if missing
     let finalWabaId = waba_id;
     if (!finalWabaId) {
       try {
@@ -389,35 +382,69 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       } catch (err) { console.warn("Could not fetch WABA ID:", err.message); }
     }
     if (!finalWabaId) return res.status(400).json({ message: "WABA ID not found. Please re-save WhatsApp credentials." });
-    const metaName = sanitizeTemplateName(template.name);
-    const namedVarRegex = /\{\{(\w+)\}\}/g;
-    const varNames = [];
-    const metaBody = (template.body || "").replace(namedVarRegex, (match, name) => {
+
+    // Convert named vars ({{name}}) → numbered ({{1}}) for Meta
+    const varNames  = [];
+    const metaBody  = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
       if (/^\d+$/.test(name)) { if (!varNames.includes(name)) varNames.push(name); return match; }
       if (!varNames.includes(name)) varNames.push(name);
       return `{{${varNames.indexOf(name) + 1}}}`;
     });
-    const metaHeaderText = template.header_text
-      ? template.header_text.replace(namedVarRegex, (match, name) => {
-          if (/^\d+$/.test(name)) return match;
-          if (!varNames.includes(name)) varNames.push(name);
-          return `{{${varNames.indexOf(name) + 1}}}`;
-        })
-      : null;
+
+    // ── Build components array ────────────────────────────────
     const components = [];
-    if (metaHeaderText) components.push({ type: "HEADER", format: "TEXT", text: metaHeaderText });
-    components.push({ type: "BODY", text: metaBody });
-    if (template.footer_text) components.push({ type: "FOOTER", text: template.footer_text });
-    const metaRes = await axios.post(
+    const headerType = template.header_type || (template.header_text ? "text" : "none");
+
+    if (headerType === "image" && template.header_media_url) {
+      // Image header — Meta needs a public URL to fetch during review
+      components.push({
+        type:    "HEADER",
+        format:  "IMAGE",
+        example: { header_handle: [template.header_media_url] },
+      });
+    } else if (headerType === "video" && template.header_media_url) {
+      // Video header
+      components.push({
+        type:    "HEADER",
+        format:  "VIDEO",
+        example: { header_handle: [template.header_media_url] },
+      });
+    } else if (headerType === "text" && template.header_text) {
+      // Text header — convert named vars too
+      const metaHeaderText = template.header_text.replace(/\{\{(\w+)\}\}/g, (match, name) => {
+        if (/^\d+$/.test(name)) return match;
+        if (!varNames.includes(name)) varNames.push(name);
+        return `{{${varNames.indexOf(name) + 1}}}`;
+      });
+      components.push({ type: "HEADER", format: "TEXT", text: metaHeaderText });
+    }
+
+    // Body component
+    const bodyComponent = { type: "BODY", text: metaBody };
+    if (varNames.length > 0) {
+      bodyComponent.example = { body_text: [varNames.map((_, i) => `example_${i + 1}`)] };
+    }
+    components.push(bodyComponent);
+
+    if (template.footer_text) {
+      components.push({ type: "FOOTER", text: template.footer_text });
+    }
+
+    const metaName = sanitizeTemplateName(template.name);
+    const metaRes  = await axios.post(
       `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
-      { name: metaName, category: template.category, language: template.language, components },
+      { name: metaName, category: template.category || "MARKETING", language: template.language || "en", components },
       { headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" } }
     );
-    await query(`UPDATE whatsapp_templates SET meta_status='pending', meta_template_id=$1, name=$2, variables=$3, updated_at=NOW() WHERE id=$4`,
-      [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]);
+
+    await query(
+      `UPDATE whatsapp_templates SET meta_status='pending', meta_template_id=$1, name=$2, variables=$3, updated_at=NOW() WHERE id=$4`,
+      [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]
+    );
+
     res.json({ success: true, metaTemplateId: metaRes.data?.id });
   } catch (err) {
-    const errMsg = err.response?.data?.error?.message || err.message;
+    const errMsg  = err.response?.data?.error?.message || err.message;
     const errCode = err.response?.data?.error?.code;
     let userMessage = errMsg;
     if (errCode === 100) userMessage = "Invalid template format. Check your template body and variables.";
@@ -435,9 +462,7 @@ export async function handleTemplateStatusUpdate(value) {
     const status = statusMap[event] || event.toLowerCase();
     await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE meta_template_id=$3`,
       [status, value.rejection_reason || null, message_template_id.toString()]);
-  } catch (err) {
-    console.error("Template status update error:", err.message);
-  }
+  } catch (err) { console.error("Template status update error:", err.message); }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -446,21 +471,10 @@ export async function handleTemplateStatusUpdate(value) {
 
 router.get("/broadcast/campaigns", async (req, res) => {
   try {
-    const { rows } = await query(
-      "SELECT * FROM broadcast_campaigns WHERE business_id=$1 ORDER BY created_at DESC",
-      [bId(req)]
-    );
-    // Convert all stored UTC times to IST for display
-    const formatted = rows.map(c => ({
-      ...c,
-      scheduled_at_ist: utcToISTString(c.scheduled_at),
-      next_run_at_ist:  utcToISTString(c.next_run_at),
-      last_run_at_ist:  utcToISTString(c.last_run_at),
-    }));
+    const { rows } = await query("SELECT * FROM broadcast_campaigns WHERE business_id=$1 ORDER BY created_at DESC", [bId(req)]);
+    const formatted = rows.map(c => ({ ...c, scheduled_at_ist: utcToISTString(c.scheduled_at), next_run_at_ist: utcToISTString(c.next_run_at), last_run_at_ist: utcToISTString(c.last_run_at) }));
     res.json({ campaigns: formatted });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to load campaigns" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to load campaigns" }); }
 });
 
 router.get("/broadcast/campaigns/:id", async (req, res) => {
@@ -470,87 +484,35 @@ router.get("/broadcast/campaigns/:id", async (req, res) => {
       query("SELECT * FROM broadcast_recipients WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 100", [req.params.id]),
     ]);
     const c = camp.rows[0];
-    res.json({
-      campaign: {
-        ...c,
-        scheduled_at_ist: utcToISTString(c?.scheduled_at),
-        next_run_at_ist:  utcToISTString(c?.next_run_at),
-      },
-      recipients: recipients.rows,
-    });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to load campaign" });
-  }
+    res.json({ campaign: { ...c, scheduled_at_ist: utcToISTString(c?.scheduled_at), next_run_at_ist: utcToISTString(c?.next_run_at) }, recipients: recipients.rows });
+  } catch (err) { res.status(500).json({ message: "Failed to load campaign" }); }
 });
 
 router.post("/broadcast/campaigns", async (req, res) => {
   try {
-    const {
-      name, message_type, template_id, message_body,
-      variables_map, scheduled_at, recurring_rule,
-      recurring_time, recurring_days,
-      recipient_source, contact_list_id, contact_ids, lead_filter,
-    } = req.body;
-
+    const { name, message_type, template_id, message_body, variables_map, scheduled_at, recurring_rule, recurring_time, recurring_days, recipient_source, contact_list_id, contact_ids, lead_filter } = req.body;
     if (!name) return res.status(400).json({ message: "Campaign name required" });
     if (!message_body && !template_id) return res.status(400).json({ message: "Message required" });
-
-    // ── Convert IST input to UTC for storage ──────────────────
     let utcScheduledAt = null;
     if (scheduled_at) {
       const utcDate = istInputToUTC(scheduled_at);
       if (!utcDate) return res.status(400).json({ message: "Invalid scheduled time format" });
-      if (!isValidSendTime(utcDate)) {
-        return res.status(400).json({ message: "Scheduled time must be between 6 AM and 11 PM IST" });
-      }
+      if (!isValidSendTime(utcDate)) return res.status(400).json({ message: "Scheduled time must be between 6 AM and 11 PM IST" });
       utcScheduledAt = utcDate.toISOString();
-      console.log(`📅 Scheduled: IST ${scheduled_at} → UTC ${utcScheduledAt}`);
     }
-
     const { rows: campRows } = await query(`
       INSERT INTO broadcast_campaigns
-        (business_id, name, message_type, template_id, message_body,
-         variables_map, scheduled_at, recurring_rule, recurring_time, recurring_days, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      RETURNING *
-    `, [
-      bId(req), name,
-      message_type  || "session",
-      template_id   || null,
-      message_body  || null,
-      variables_map ? JSON.stringify(variables_map) : "{}",
-      utcScheduledAt || null,
-      recurring_rule  || null,
-      recurring_time  || null,
-      recurring_days  || null,
-      utcScheduledAt ? "scheduled" : "draft",
-    ]);
-
-    const campaign = campRows[0];
-
-    // ── Add recipients ─────────────────────────────────────────
-    const recipients = await resolveRecipients(bId(req), { recipient_source, contact_list_id, contact_ids, lead_filter });
-
+        (business_id, name, message_type, template_id, message_body, variables_map, scheduled_at, recurring_rule, recurring_time, recurring_days, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *
+    `, [bId(req), name, message_type || "session", template_id || null, message_body || null, variables_map ? JSON.stringify(variables_map) : "{}", utcScheduledAt || null, recurring_rule || null, recurring_time || null, recurring_days || null, utcScheduledAt ? "scheduled" : "draft"]);
+    const campaign    = campRows[0];
+    const recipients  = await resolveRecipients(bId(req), { recipient_source, contact_list_id, contact_ids, lead_filter });
     for (const r of recipients) {
-      await query(`
-        INSERT INTO broadcast_recipients
-          (campaign_id, business_id, contact_id, phone, name, variables)
-        VALUES ($1,$2,$3::uuid,$4,$5,$6)
-        ON CONFLICT DO NOTHING
-      `, [campaign.id, bId(req), r.contact_id || null, r.phone, r.name || null, JSON.stringify(r.variables || {})]);
+      await query(`INSERT INTO broadcast_recipients (campaign_id, business_id, contact_id, phone, name, variables) VALUES ($1,$2,$3::uuid,$4,$5,$6) ON CONFLICT DO NOTHING`, [campaign.id, bId(req), r.contact_id || null, r.phone, r.name || null, JSON.stringify(r.variables || {})]);
     }
-
     await query("UPDATE broadcast_campaigns SET total_recipients=$1 WHERE id=$2", [recipients.length, campaign.id]);
-
-    res.status(201).json({
-      ...campaign,
-      total_recipients:  recipients.length,
-      scheduled_at_ist:  utcToISTString(campaign.scheduled_at),
-    });
-  } catch (err) {
-    console.error("Create campaign error:", err.message);
-    res.status(500).json({ message: err.message });
-  }
+    res.status(201).json({ ...campaign, total_recipients: recipients.length, scheduled_at_ist: utcToISTString(campaign.scheduled_at) });
+  } catch (err) { console.error("Create campaign error:", err.message); res.status(500).json({ message: err.message }); }
 });
 
 router.post("/broadcast/campaigns/:id/launch", async (req, res) => {
@@ -560,43 +522,30 @@ router.post("/broadcast/campaigns/:id/launch", async (req, res) => {
     await query("UPDATE broadcast_campaigns SET status='running', scheduled_at=NOW() WHERE id=$1", [req.params.id]);
     executeCampaign(rows[0], bId(req)).catch(console.error);
     res.json({ success: true, message: "Campaign launched" });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to launch campaign" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to launch campaign" }); }
 });
 
 router.post("/broadcast/campaigns/:id/pause", async (req, res) => {
   try {
     await query("UPDATE broadcast_campaigns SET status='paused' WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to pause" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to pause" }); }
 });
 
 router.delete("/broadcast/campaigns/:id", async (req, res) => {
   try {
     await query("DELETE FROM broadcast_campaigns WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ message: "Failed to delete" });
-  }
+  } catch (err) { res.status(500).json({ message: "Failed to delete" }); }
 });
 
-// ── Update broadcast delivery status from webhook ─────────────
 export async function updateBroadcastStatus(status) {
   try {
-    const { id, status: s, recipient_id } = status;
+    const { id, status: s } = status;
     if (!id) return;
     const statusMap = { sent:"sent", delivered:"delivered", read:"read", failed:"failed" };
-    const mapped = statusMap[s] || s;
-    await query(
-      "UPDATE broadcast_recipients SET status=$1, updated_at=NOW() WHERE wa_message_id=$2",
-      [mapped, id]
-    ).catch(() => {});
-  } catch (err) {
-    console.error("Broadcast status update error:", err.message);
-  }
+    await query("UPDATE broadcast_recipients SET status=$1, updated_at=NOW() WHERE wa_message_id=$2", [statusMap[s] || s, id]).catch(() => {});
+  } catch (err) { console.error("Broadcast status update error:", err.message); }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -608,45 +557,29 @@ export async function executeCampaign(campaign, businessId) {
     const { rows: wc } = await query("SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id=$1", [businessId]);
     if (!wc.length) throw new Error("WhatsApp not configured");
     const { phone_number_id, access_token } = wc[0];
-
-    const { rows: recipients } = await query(
-      "SELECT * FROM broadcast_recipients WHERE campaign_id=$1 AND status='pending' ORDER BY created_at ASC",
-      [campaign.id]
-    );
-
-    console.log(`📢 Broadcasting to ${recipients.length} recipients for: ${campaign.name}`);
-
+    const { rows: recipients } = await query("SELECT * FROM broadcast_recipients WHERE campaign_id=$1 AND status='pending' ORDER BY created_at ASC", [campaign.id]);
+    console.log(`📢 Broadcasting to ${recipients.length} recipients: ${campaign.name}`);
     for (const recipient of recipients) {
-      const { rows: campCheck } = await query("SELECT status FROM broadcast_campaigns WHERE id=$1", [campaign.id]);
-      if (campCheck[0]?.status !== "running") break;
-
+      const { rows: check } = await query("SELECT status FROM broadcast_campaigns WHERE id=$1", [campaign.id]);
+      if (check[0]?.status !== "running") break;
       try {
         let result;
         if (campaign.message_type === "template" && campaign.template_id) {
           result = await sendTemplateMessage({ phoneNumberId: phone_number_id, accessToken: access_token, to: recipient.phone, campaign, recipient });
         } else {
-          let message = campaign.message_body || "";
-          message = message
-            .replace(/\{\{name\}\}/gi,  recipient.name  || "there")
-            .replace(/\{\{phone\}\}/gi, recipient.phone)
-            .replace(/\{\{notes\}\}/gi, recipient.variables?.notes || "");
+          let message = (campaign.message_body || "").replace(/\{\{name\}\}/gi, recipient.name || "there").replace(/\{\{phone\}\}/gi, recipient.phone);
           result = await sendSessionMessage({ phoneNumberId: phone_number_id, accessToken: access_token, to: recipient.phone, message });
         }
-
         await query("UPDATE broadcast_recipients SET status='sent', wa_message_id=$1, sent_at=NOW() WHERE id=$2", [result?.messages?.[0]?.id, recipient.id]);
         await query("UPDATE broadcast_campaigns SET sent_count=sent_count+1, updated_at=NOW() WHERE id=$1", [campaign.id]);
-        console.log(`✅ Sent to ${recipient.phone}`);
         await sleep(1500 + Math.random() * 1000);
-
       } catch (err) {
         const errMsg = err.response?.data?.error?.message || err.message;
         await query("UPDATE broadcast_recipients SET status='failed', error_message=$1 WHERE id=$2", [errMsg, recipient.id]);
         await query("UPDATE broadcast_campaigns SET failed_count=failed_count+1 WHERE id=$1", [campaign.id]);
       }
     }
-
     await query("UPDATE broadcast_campaigns SET status='completed', last_run_at=NOW(), updated_at=NOW() WHERE id=$1", [campaign.id]);
-
     if (campaign.recurring_rule) {
       const nextRun = calculateNextRun(campaign);
       if (nextRun) {
@@ -654,15 +587,12 @@ export async function executeCampaign(campaign, businessId) {
         await query("UPDATE broadcast_recipients SET status='pending' WHERE campaign_id=$1", [campaign.id]);
       }
     }
-
-    console.log(`✅ Campaign completed: ${campaign.name}`);
   } catch (err) {
     console.error("Campaign execution error:", err.message);
     await query("UPDATE broadcast_campaigns SET status='failed', updated_at=NOW() WHERE id=$1", [campaign.id]);
   }
 }
 
-// ── Send session message ──────────────────────────────────────
 async function sendSessionMessage({ phoneNumberId, accessToken, to, message }) {
   const response = await axios.post(
     `${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
@@ -672,7 +602,6 @@ async function sendSessionMessage({ phoneNumberId, accessToken, to, message }) {
   return response.data;
 }
 
-// ── Send template message ─────────────────────────────────────
 async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, recipient }) {
   const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1", [campaign.template_id]);
   if (!tRows.length) throw new Error("Template not found");
@@ -680,11 +609,20 @@ async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, r
   const variables  = template.variables || [];
   const components = [];
 
+  // Header component for image/video templates
+  const headerType = template.header_type || "none";
+  if ((headerType === "image" || headerType === "video") && template.header_media_url) {
+    components.push({
+      type:       "header",
+      parameters: [{ type: headerType, [headerType]: { link: template.header_media_url } }],
+    });
+  }
+
+  // Body parameters
   if (variables.length > 0) {
     const bodyParams = variables.map(varName => {
       if (varName === "name"  || varName === "1") return { type:"text", text: recipient.name  || campaign.variables_map?.[varName] || "" };
       if (varName === "phone" || varName === "2") return { type:"text", text: recipient.phone || campaign.variables_map?.[varName] || "" };
-      if (varName === "notes")                    return { type:"text", text: recipient.variables?.notes || campaign.variables_map?.[varName] || "" };
       return { type:"text", text: campaign.variables_map?.[varName] || recipient.variables?.[varName] || "" };
     });
     components.push({ type:"body", parameters: bodyParams });
@@ -702,90 +640,54 @@ async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, r
   return response.data;
 }
 
-// ── Resolve recipients ────────────────────────────────────────
 async function resolveRecipients(businessId, { recipient_source, contact_list_id, contact_ids, lead_filter }) {
   const recipients = [];
-
   if (recipient_source === "list" && contact_list_id) {
-    const { rows } = await query(`
-      SELECT bc.id AS contact_id, bc.phone, bc.name
-      FROM business_contacts bc
-      JOIN contact_list_members clm ON clm.contact_id = bc.id
-      WHERE clm.list_id=$1 AND bc.business_id=$2 AND bc.opted_out=FALSE AND bc.phone IS NOT NULL
-    `, [contact_list_id, businessId]);
+    const { rows } = await query(`SELECT bc.id AS contact_id, bc.phone, bc.name FROM business_contacts bc JOIN contact_list_members clm ON clm.contact_id = bc.id WHERE clm.list_id=$1 AND bc.business_id=$2 AND bc.opted_out=FALSE AND bc.phone IS NOT NULL`, [contact_list_id, businessId]);
     recipients.push(...rows);
   }
-
   if (recipient_source === "contacts" || recipient_source === "all") {
-    const { rows } = await query(
-      "SELECT id AS contact_id, phone, name FROM business_contacts WHERE business_id=$1 AND opted_out=FALSE AND phone IS NOT NULL",
-      [businessId]
-    );
+    const { rows } = await query("SELECT id AS contact_id, phone, name FROM business_contacts WHERE business_id=$1 AND opted_out=FALSE AND phone IS NOT NULL", [businessId]);
     recipients.push(...rows);
   }
-
   if (recipient_source === "leads" || recipient_source === "all") {
-    // ✅ NULL for contact_id — leads are NOT in business_contacts
     let sql = "SELECT NULL::uuid AS contact_id, phone, customer_name AS name FROM leads WHERE business_id=$1 AND phone IS NOT NULL";
     const params = [businessId];
     if (lead_filter?.status) { params.push(lead_filter.status); sql += ` AND status=$${params.length}`; }
     const { rows } = await query(sql, params);
     recipients.push(...rows);
   }
-
   if (contact_ids?.length > 0) {
-    const { rows } = await query(
-      "SELECT id AS contact_id, phone, name FROM business_contacts WHERE business_id=$1 AND id=ANY($2) AND opted_out=FALSE AND phone IS NOT NULL",
-      [businessId, contact_ids]
-    );
+    const { rows } = await query("SELECT id AS contact_id, phone, name FROM business_contacts WHERE business_id=$1 AND id=ANY($2) AND opted_out=FALSE AND phone IS NOT NULL", [businessId, contact_ids]);
     recipients.push(...rows);
   }
-
-  // Deduplicate by phone
   const seen = new Set();
   return recipients.filter(r => r.phone && !seen.has(r.phone) && seen.add(r.phone));
 }
 
-// ── Calculate next recurring run ──────────────────────────────
 function calculateNextRun(campaign) {
   const now  = nowIST();
   const rule = campaign.recurring_rule;
   const time = campaign.recurring_time || "10:00";
   const [h, m] = time.split(":").map(Number);
   const next = new Date(now);
-  // Convert IST time to UTC for storage
   next.setUTCHours(h - 5, m - 30, 0, 0);
-  if (rule === "daily")       next.setUTCDate(next.getUTCDate() + 1);
-  else if (rule === "weekly") next.setUTCDate(next.getUTCDate() + 7);
+  if (rule === "daily")        next.setUTCDate(next.getUTCDate() + 1);
+  else if (rule === "weekly")  next.setUTCDate(next.getUTCDate() + 7);
   else if (rule === "monthly") next.setUTCMonth(next.getUTCMonth() + 1);
   else return null;
   return next;
 }
 
-// ══════════════════════════════════════════════════════════════
-//  BROADCAST CRON — runs scheduled campaigns
-// ══════════════════════════════════════════════════════════════
 export async function runScheduledBroadcasts() {
   try {
-    const { rows } = await query(`
-      SELECT * FROM broadcast_campaigns
-      WHERE status = 'scheduled'
-        AND scheduled_at <= NOW()
-        AND scheduled_at IS NOT NULL
-    `);
-
+    const { rows } = await query(`SELECT * FROM broadcast_campaigns WHERE status='scheduled' AND scheduled_at<=NOW() AND scheduled_at IS NOT NULL`);
     for (const campaign of rows) {
-      if (!isValidSendTime(new Date())) {
-        console.log(`⏸️ Outside send hours — skipping campaign: ${campaign.name}`);
-        continue;
-      }
-      console.log(`🚀 Auto-launching scheduled campaign: ${campaign.name}`);
+      if (!isValidSendTime(new Date())) { console.log(`⏸️ Outside send hours — skipping: ${campaign.name}`); continue; }
       await query("UPDATE broadcast_campaigns SET status='running' WHERE id=$1", [campaign.id]);
       executeCampaign(campaign, campaign.business_id).catch(console.error);
     }
-  } catch (err) {
-    console.error("Scheduled broadcast error:", err.message);
-  }
+  } catch (err) { console.error("Scheduled broadcast error:", err.message); }
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

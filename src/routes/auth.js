@@ -32,7 +32,7 @@ router.post("/signup", async (req, res) => {
       // 1. Create business
       const { rows: bizRows } = await client.query(`
         INSERT INTO businesses (name) VALUES ($1) RETURNING id
-      `, 'BusinessName');
+      `, [businessName]);
       const businessId = bizRows[0].id;
 
       // 2. Create user

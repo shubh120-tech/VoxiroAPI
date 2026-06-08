@@ -475,4 +475,45 @@ router.delete("/team/:id", async (req, res) => {
   }
 });
 
+router.post("/team/change-password", async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+ 
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: "Both passwords required" });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ message: "Minimum 8 characters" });
+    }
+ 
+    // Get current password hash from team_members
+    const { rows } = await query(
+      "SELECT password_hash FROM team_members WHERE id = $1 AND status = 'active'",
+      [req.user.id]
+    );
+ 
+    if (!rows.length) {
+      return res.status(404).json({ message: "Member not found" });
+    }
+ 
+    const valid = await bcrypt.compare(currentPassword, rows[0].password_hash || "");
+    if (!valid) {
+      return res.status(400).json({ message: "Current password is incorrect" });
+    }
+ 
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await query(
+      "UPDATE team_members SET password_hash = $1, updated_at = NOW() WHERE id = $2",
+      [newHash, req.user.id]
+    );
+ 
+    console.log(`✅ Password changed for team member ${req.user.id}`);
+    res.json({ success: true });
+ 
+  } catch (err) {
+    console.error("Team password change error:", err.message);
+    res.status(500).json({ message: "Failed to change password: " + err.message });
+  }
+});
+
 export default router;

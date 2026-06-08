@@ -10,77 +10,108 @@ const router = express.Router();
 router.post("/signup", async (req, res) => {
   try {
     const { ownerName, email, password } = req.body;
+
     if (!ownerName || !email || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
 
+    // ✅ AUTO GENERATE BUSINESS NAME (FIX)
+    const finalBusinessName = ownerName
+      ? `${ownerName.split(" ")[0]}'s Business`
+      : "My Business";
+
     // Check email not already used
     const { rows: existing } = await query(
-      "SELECT id FROM users WHERE email = $1", [email]
+      "SELECT id FROM users WHERE email = $1",
+      [email]
     );
+
     if (existing.length) {
       return res.status(409).json({ message: "Email already registered" });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Transaction — create business + user + defaults
     const client = await (await import("../db/postgres.js")).getClient();
+
     try {
       await client.query("BEGIN");
 
-      // 1. Create business
-      const { rows: bizRows } = await client.query(`
-        INSERT INTO businesses (name) VALUES ($1) RETURNING id
-      `, ['BusinessName']);
+      // 1. Create business (FIX APPLIED HERE)
+      const { rows: bizRows } = await client.query(
+        `INSERT INTO businesses (name) VALUES ($1) RETURNING id`,
+        [finalBusinessName]
+      );
+
       const businessId = bizRows[0].id;
 
       // 2. Create user
-      const { rows: userRows } = await client.query(`
-        INSERT INTO users (business_id, owner_name, email, password_hash)
-        VALUES ($1, $2, $3, $4) RETURNING id
-      `, [businessId, ownerName, email, passwordHash]);
+      const { rows: userRows } = await client.query(
+        `INSERT INTO users (business_id, owner_name, email, password_hash)
+         VALUES ($1, $2, $3, $4) RETURNING id`,
+        [businessId, ownerName, email, passwordHash]
+      );
+
       const userId = userRows[0].id;
 
-      // 3. Seed starter plan subscription
+      // 3. Seed starter plan
       const { rows: planRows } = await client.query(
         "SELECT id FROM plans WHERE name = 'starter'"
       );
-      await client.query(`
-        INSERT INTO subscriptions (business_id, plan_id)
-        VALUES ($1, $2)
-      `, [businessId, planRows[0].id]);
 
-      // 4. Seed default agent config
-      await client.query(`
-        INSERT INTO agent_configs (business_id, agent_name) VALUES ($1, 'Aria')
-      `, [businessId]);
+      await client.query(
+        `INSERT INTO subscriptions (business_id, plan_id)
+         VALUES ($1, $2)`,
+        [businessId, planRows[0].id]
+      );
 
-      // 5. Seed default notification settings
-      await client.query(`
-        INSERT INTO notification_settings (business_id) VALUES ($1)
-      `, [businessId]);
+      // 4. Agent config
+      await client.query(
+        `INSERT INTO agent_configs (business_id, agent_name)
+         VALUES ($1, 'Aria')`,
+        [businessId]
+      );
+
+      // 5. Notification settings
+      await client.query(
+        `INSERT INTO notification_settings (business_id)
+         VALUES ($1)`,
+        [businessId]
+      );
 
       await client.query("COMMIT");
 
-      const token = jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || "7d" });
+      const token = jwt.sign(
+        { userId },
+        process.env.JWT_SECRET,
+        { expiresIn: process.env.JWT_EXPIRES_IN || "7d" }
+      );
 
+      // ✅ FIX: RETURN BUSINESS NAME PROPERLY
       res.status(201).json({
         token,
-        user: { id: userId, businessId, businessName, ownerName, email, onboarded: false },
+        user: {
+          id: userId,
+          businessId,
+          businessName: finalBusinessName,
+          ownerName,
+          email,
+          onboarded: false,
+        },
       });
+
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
     } finally {
       client.release();
     }
+
   } catch (err) {
     console.error("Signup error:", err);
     res.status(500).json({ message: "Could not create account" });
   }
 });
-
 // ── Login ─────────────────────────────────────────────────────
 // ═══════════════════════════════════════════════════════════
 //  PATCH FOR src/routes/auth.js

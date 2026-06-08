@@ -30,6 +30,65 @@ const getRazorpay = () => {
 const USD_TO_INR = 84;
 
 // ── Public: Get all active plans ──────────────────────────────
+router.post("/billing/select-free-plan", async (req, res) => {
+  try {
+    const { plan_id } = req.body;
+    const bId = req.user.business_id;
+ 
+    const { rows: planRows } = await query(
+      "SELECT * FROM plans WHERE id = $1 AND is_active = TRUE",
+      [plan_id]
+    );
+    if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
+ 
+    const plan = planRows[0];
+ 
+    // Only allow free or trial plans through this endpoint
+    if (plan.price_monthly > 0 && plan.trial_days === 0) {
+      return res.status(400).json({ message: "Paid plans require payment. Use /billing/create-order instead." });
+    }
+ 
+    const now      = new Date();
+    const trialEnd = plan.trial_days > 0
+      ? new Date(now.getTime() + plan.trial_days * 24 * 60 * 60 * 1000)
+      : null;
+    const cycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+ 
+    await query(`
+      INSERT INTO subscriptions
+        (business_id, plan_id, status, billing_cycle_start, billing_cycle_end,
+         trial_ends_at, messages_used, is_active)
+      VALUES ($1, $2, $3, $4, $5, $6, 0, TRUE)
+      ON CONFLICT (business_id) DO UPDATE SET
+        plan_id             = $2,
+        status              = $3,
+        billing_cycle_start = $4,
+        billing_cycle_end   = $5,
+        trial_ends_at       = $6,
+        messages_used       = 0,
+        is_active           = TRUE,
+        updated_at          = NOW()
+    `, [
+      bId, plan.id,
+      plan.trial_days > 0 ? "trialing" : "active",
+      now, cycleEnd,
+      trialEnd,
+    ]);
+ 
+    // Mark onboarding complete
+    await query(
+      "UPDATE users SET onboarding_completed = TRUE WHERE id = $1",
+      [req.user.id]
+    ).catch(() => {});
+ 
+    console.log(`✅ Free/trial plan activated: ${plan.name} for business ${bId}`);
+    res.json({ success: true, status: plan.trial_days > 0 ? "trialing" : "active" });
+  } catch (err) {
+    console.error("Free plan activation error:", err.message);
+    res.status(500).json({ message: "Failed to activate plan: " + err.message });
+  }
+});
+
 router.get("/plans/public", async (req, res) => {
   try {
     const { rows } = await query(`

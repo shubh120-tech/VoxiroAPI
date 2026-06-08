@@ -241,4 +241,178 @@ router.post("/reset-password", async (req, res) => {
   }
 });
 
+router.post("/auth/send-otp", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: "Email required" });
+ 
+    // Check user exists
+    const { rows } = await query(
+      "SELECT id, owner_name FROM users WHERE email = $1 AND is_active = TRUE LIMIT 1",
+      [email]
+    );
+    if (!rows.length) return res.status(404).json({ message: "Account not found" });
+ 
+    const user = rows[0];
+ 
+    // Generate 6-digit OTP
+    const otp     = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+ 
+    // Save OTP to DB
+    await query(`
+      INSERT INTO email_otps (user_id, email, otp, expires_at)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (email) DO UPDATE SET
+        otp        = $3,
+        expires_at = $4,
+        attempts   = 0,
+        used       = FALSE,
+        created_at = NOW()
+    `, [user.id, email, otp, expires]);
+ 
+    // Send email via Resend
+    const apiKey = process.env.RESEND_API_KEY;
+    if (!apiKey) {
+      console.error("RESEND_API_KEY not set — OTP not sent, here it is for dev:", otp);
+      // In dev: return OTP in response so you can test
+      if (process.env.NODE_ENV !== "production") {
+        return res.json({ success: true, dev_otp: otp, message: "OTP logged (dev mode)" });
+      }
+      return res.status(503).json({ message: "Email service not configured" });
+    }
+ 
+    const axios = (await import("axios")).default;
+    await axios.post(
+      "https://api.resend.com/emails",
+      {
+        from:    `Yougant <onboarding@resend.dev>`,
+        to:      [email],
+        subject: `${otp} — Your Yougant verification code`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 32px 24px; background: #f8fafc; border-radius: 16px;">
+            <div style="text-align: center; margin-bottom: 24px;">
+              <h1 style="color: #0d9488; font-size: 24px; margin: 0;">Yougant</h1>
+              <p style="color: #6b7280; font-size: 13px; margin-top: 4px;">AI WhatsApp Agent Platform</p>
+            </div>
+            <div style="background: white; border-radius: 12px; padding: 28px; border: 1px solid #e5e7eb;">
+              <p style="color: #374151; font-size: 15px; margin: 0 0 20px;">Hi ${user.owner_name || "there"},</p>
+              <p style="color: #374151; font-size: 14px; margin: 0 0 24px;">Use this code to verify your email address:</p>
+              <div style="text-align: center; margin: 24px 0;">
+                <div style="display: inline-block; background: #f0fdfa; border: 2px solid #0d9488; border-radius: 12px; padding: 16px 32px;">
+                  <span style="font-size: 36px; font-weight: 900; color: #0d9488; letter-spacing: 8px;">${otp}</span>
+                </div>
+              </div>
+              <p style="color: #6b7280; font-size: 13px; text-align: center; margin: 0;">This code expires in <strong>10 minutes</strong></p>
+            </div>
+            <p style="color: #9ca3af; font-size: 12px; text-align: center; margin-top: 20px;">
+              If you didn't create a Yougant account, you can ignore this email.
+            </p>
+          </div>
+        `,
+      },
+      { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" } }
+    );
+ 
+    console.log(`📧 OTP sent to ${email}`);
+    res.json({ success: true, message: "OTP sent to your email" });
+ 
+  } catch (err) {
+    console.error("Send OTP error:", err.message);
+    res.status(500).json({ message: "Failed to send OTP: " + err.message });
+  }
+});
+ 
+ 
+// ── Verify Email OTP ──────────────────────────────────────────
+// Called from VerifyEmail.jsx with the 6-digit code
+router.post("/auth/verify-email", async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ message: "Email and OTP required" });
+ 
+    // Get OTP record
+    const { rows } = await query(
+      "SELECT * FROM email_otps WHERE email = $1 AND used = FALSE ORDER BY created_at DESC LIMIT 1",
+      [email]
+    );
+ 
+    if (!rows.length) {
+      return res.status(400).json({ message: "OTP not found. Please request a new one." });
+    }
+ 
+    const record = rows[0];
+ 
+    // Check expiry
+    if (new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({ message: "OTP has expired. Please request a new one." });
+    }
+ 
+    // Check attempts (max 5)
+    if (record.attempts >= 5) {
+      return res.status(400).json({ message: "Too many attempts. Please request a new OTP." });
+    }
+ 
+    // Check OTP match
+    if (record.otp !== otp.toString()) {
+      await query(
+        "UPDATE email_otps SET attempts = attempts + 1 WHERE id = $1",
+        [record.id]
+      );
+      const left = 4 - record.attempts;
+      return res.status(400).json({ message: `Incorrect OTP. ${left} attempt${left !== 1 ? "s" : ""} remaining.` });
+    }
+ 
+    // ✅ OTP correct — mark used and verify user
+    await query("UPDATE email_otps SET used = TRUE WHERE id = $1", [record.id]);
+    await query(
+      "UPDATE users SET email_verified = TRUE, updated_at = NOW() WHERE id = $1",
+      [record.user_id]
+    );
+ 
+    // Return a fresh JWT so user is logged in right after verification
+    const { rows: userRows } = await query(`
+      SELECT u.*, b.name AS business_name
+      FROM users u
+      JOIN businesses b ON b.id = u.business_id
+      WHERE u.id = $1
+    `, [record.user_id]);
+ 
+    const user = userRows[0];
+ 
+    const jwt   = (await import("jsonwebtoken")).default;
+    const token = jwt.sign(
+      {
+        id:          user.id,
+        business_id: user.business_id,
+        email:       user.email,
+        role:        "owner",
+        type:        "owner",
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "30d" }
+    );
+ 
+    console.log(`✅ Email verified for ${email}`);
+    res.json({
+      success: true,
+      token,
+      user: {
+        id:           user.id,
+        email:        user.email,
+        name:         user.owner_name,
+        businessId:   user.business_id,
+        businessName: user.business_name,
+        role:         "owner",
+        type:         "owner",
+      },
+    });
+ 
+  } catch (err) {
+    console.error("Verify OTP error:", err.message);
+    res.status(500).json({ message: "Verification failed: " + err.message });
+  }
+});
+ 
+
 export default router;

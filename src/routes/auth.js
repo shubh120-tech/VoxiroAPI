@@ -272,7 +272,7 @@ router.post("/reset-password", async (req, res) => {
   }
 });
 
-router.post("/auth/send-otp", async (req, res) => {
+router.post("/send-otp", async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ message: "Email required" });
@@ -357,7 +357,7 @@ router.post("/auth/send-otp", async (req, res) => {
  
 // ── Verify Email OTP ──────────────────────────────────────────
 // Called from VerifyEmail.jsx with the 6-digit code
-router.post("/auth/verify-email", async (req, res) => {
+router.post("/verify-email", async (req, res) => {
   try {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ message: "Email and OTP required" });

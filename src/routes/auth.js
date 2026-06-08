@@ -318,7 +318,7 @@ router.post("/send-otp", async (req, res) => {
     await axios.post(
       "https://api.resend.com/emails",
       {
-        from:    `Yougant <onboarding@resend.dev>`,
+        from:    `Yougant <care@yougant.com>`,
         to:      [email],
         subject: `${otp} — Your Yougant verification code`,
         html: `

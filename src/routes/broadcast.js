@@ -9,14 +9,6 @@ import { authMiddleware } from "../middleware/auth.js";
 
 const router = express.Router();
 
-// ── Public route — no auth needed ────────────────────────────
-// Must be BEFORE authMiddleware so Meta and browsers can fetch without token
-router.get("/broadcast/media/:filename", (req, res) => {
-  const filePath = `/tmp/broadcast_media/${req.params.filename}`;
-  if (!fs.existsSync(filePath)) return res.status(404).json({ message: "File not found" });
-  res.sendFile(path.resolve(filePath));
-});
-
 router.use(authMiddleware);
 
 const bId = (req) => req.user.business_id;

@@ -1,5 +1,7 @@
 import "dotenv/config";
 import express      from "express";
+import fs           from "fs";
+import path         from "path";
 import cors         from "cors";
 import helmet       from "helmet";
 import morgan       from "morgan";
@@ -166,6 +168,14 @@ app.get("/api/media/:messageId", async (req, res) => {
     console.error("Media proxy error:", err.message);
     res.status(500).json({ message: "Failed to load media" });
   }
+});
+
+// ── PUBLIC: Broadcast media — no auth required ───────────────
+// Serve uploaded template images/videos for Meta review and browser preview
+app.get("/api/broadcast/media/:filename", (req, res) => {
+  const filePath = `/tmp/broadcast_media/${req.params.filename}`;
+  if (!fs.existsSync(filePath)) return res.status(404).json({ message: "File not found" });
+  res.sendFile(path.resolve(filePath));
 });
 
 // ── Routes ────────────────────────────────────────────────────

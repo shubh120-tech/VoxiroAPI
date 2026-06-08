@@ -10,7 +10,7 @@ const router = express.Router();
 router.post("/signup", async (req, res) => {
   try {
     const { businessName, ownerName, email, password } = req.body;
-    if (!businessName || !ownerName || !email || !password) {
+    if (!ownerName || !email || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
 
@@ -32,7 +32,7 @@ router.post("/signup", async (req, res) => {
       // 1. Create business
       const { rows: bizRows } = await client.query(`
         INSERT INTO businesses (name) VALUES ($1) RETURNING id
-      `, [businessName]);
+      `, 'BusinessName');
       const businessId = bizRows[0].id;
 
       // 2. Create user

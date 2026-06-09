@@ -11,10 +11,6 @@ export async function buildSystemPrompt(businessId) {
   // ── Pull everything from DB in parallel ───────────────────
   const [
     configResult,
-    servicesResult,
-    faqResult,
-    paymentResult,
-    companyResult,
     productResult,
     knowledgeResult,
     qaResult,
@@ -39,51 +35,17 @@ export async function buildSystemPrompt(businessId) {
       WHERE b.id = $1
     `, [businessId]),
 
-    // Services & pricing
-    query(`
-      SELECT name, description, price, price_min, price_max,
-             price_unit, duration, is_active
-      FROM business_services
-      WHERE business_id = $1 AND is_active = TRUE
-      ORDER BY sort_order ASC NULLS LAST, name ASC
-      LIMIT 30
-    `, [businessId]).catch(() => ({ rows: [] })),
-
-    // FAQs
-    query(`
-      SELECT question, answer, category
-      FROM business_faqs
-      WHERE business_id = $1
-      ORDER BY sort_order ASC NULLS LAST
-      LIMIT 30
-    `, [businessId]).catch(() => ({ rows: [] })),
-
-    // Payment methods
-    query(`
-      SELECT method_name, details, instructions, is_primary
-      FROM business_payment_methods
-      WHERE business_id = $1
-      ORDER BY is_primary DESC, created_at ASC
-    `, [businessId]).catch(() => ({ rows: [] })),
-
-    // Company / trust details
-    query(`
-      SELECT gst_number, registration_no, founded_year, team_size,
-             total_clients, certifications, social_links, trust_message
-      FROM business_company_details
-      WHERE business_id = $1
-    `, [businessId]).catch(() => ({ rows: [] })),
-
     // Products catalog
     query(`
-      SELECT name, description, price, category, in_stock
+      SELECT name, description, price, category, in_stock,
+             variants, sku, unit
       FROM products
       WHERE business_id = $1
       ORDER BY name ASC
-      LIMIT 30
+      LIMIT 100
     `, [businessId]).catch(() => ({ rows: [] })),
 
-    // Uploaded knowledge documents
+    // Uploaded knowledge documents (price lists, menus, catalogues, terms)
     query(`
       SELECT file_name, extracted_text
       FROM knowledge_docs
@@ -92,12 +54,14 @@ export async function buildSystemPrompt(businessId) {
         AND extracted_text IS NOT NULL
         AND extracted_text != ''
       ORDER BY created_at DESC
-      LIMIT 5
+      LIMIT 10
     `, [businessId]).catch(() => ({ rows: [] })),
 
-    // Q&A training answers
+    // Q&A training answers — all business knowledge lives here now
+    // Includes: products, payments (UPI/bank), company details, FAQs,
+    //           working hours, escalation, behaviour, custom instructions
     query(`
-      SELECT question, answer, category
+      SELECT question, answer, category, question_id
       FROM training_qa
       WHERE business_id = $1
         AND answer IS NOT NULL
@@ -108,91 +72,63 @@ export async function buildSystemPrompt(businessId) {
 
   if (!configResult.rows.length) throw new Error("Business not found");
 
-  const biz     = configResult.rows[0];
-  const company = companyResult.rows[0] || {};
-  const tone    = TONE_MAP[biz.tone] || TONE_MAP.friendly;
+  const biz  = configResult.rows[0];
+  const tone = TONE_MAP[biz.tone] || TONE_MAP.friendly;
 
-  // ── Build services section ────────────────────────────────
+  // ── Build products section ────────────────────────────────
   const servicesSection = (() => {
-    if (servicesResult.rows.length === 0 && productResult.rows.length === 0) {
+    if (productResult.rows.length === 0) {
       return biz.fallback_services
-        ? `Services: ${biz.fallback_services}\n${biz.fallback_pricing ? `Pricing: ${biz.fallback_pricing}` : ""}`
-        : "Services not configured";
+        ? `${biz.fallback_services}${biz.fallback_pricing ? `\nPricing: ${biz.fallback_pricing}` : ""}`
+        : "See training Q&A for products and services";
     }
-
-    const lines = [];
-
-    if (servicesResult.rows.length > 0) {
-      lines.push("SERVICES:");
-      servicesResult.rows.forEach(s => {
-        const price = s.price
-          ? `₹${s.price}${s.price_unit && s.price_unit !== "fixed" ? ` per ${s.price_unit}` : ""}`
-          : s.price_min && s.price_max
-            ? `₹${s.price_min}–₹${s.price_max}`
-            : "Price on request";
-        const duration = s.duration    ? ` | ${s.duration}` : "";
-        const desc     = s.description ? ` — ${s.description}` : "";
-        lines.push(`• ${s.name}: ${price}${duration}${desc}`);
-      });
-    }
-
-    if (productResult.rows.length > 0) {
-      if (lines.length > 0) lines.push("");
-      lines.push("PRODUCTS:");
-      productResult.rows.forEach(p => {
-        const price = p.price ? `₹${p.price}` : "Price on request";
-        const stock = p.in_stock === false ? " [Out of stock]" : "";
-        const desc  = p.description ? ` — ${p.description}` : "";
-        lines.push(`• ${p.name}: ${price}${stock}${desc}`);
-      });
-    }
-
+    const lines = ["PRODUCTS & SERVICES:"];
+    productResult.rows.forEach(p => {
+      const price    = p.price ? `₹${p.price}` : "Price on request";
+      const stock    = p.in_stock === false ? " [OUT OF STOCK — do not offer this]" : "";
+      const desc     = p.description ? ` — ${p.description}` : "";
+      const variants = p.variants ? ` | Variants: ${p.variants}` : "";
+      const sku      = p.sku ? ` | SKU: ${p.sku}` : "";
+      lines.push(`• ${p.name}: ${price}${stock}${desc}${variants}${sku}`);
+    });
     return lines.join("\n");
   })();
 
-  // ── Build payment section ─────────────────────────────────
-  const paymentSection = (() => {
-    if (paymentResult.rows.length === 0) return "Payment details not configured";
-    return paymentResult.rows.map(p => {
-      const primary = p.is_primary ? " (Primary)" : "";
-      const instr   = p.instructions ? `\n  Note: ${p.instructions}` : "";
-      return `• ${p.method_name}${primary}: ${p.details}${instr}`;
-    }).join("\n");
-  })();
-
-  // ── Build FAQ section ─────────────────────────────────────
-  const faqSection = (() => {
-    if (faqResult.rows.length === 0) return "";
-    return faqResult.rows
-      .map(f => `Q: ${f.question}\nA: ${f.answer}`)
+  // ── Build uploaded docs section ───────────────────────────
+  const docsSection = (() => {
+    if (knowledgeResult.rows.length === 0) return "";
+    return knowledgeResult.rows
+      .map(d => `[${d.file_name}]\n${(d.extracted_text || "").slice(0, 8000)}`)
       .join("\n\n");
   })();
 
-  // ── Build company/trust block ─────────────────────────────
-  const socialLinks   = company.social_links || {};
-  const companyBlock  = buildCompanyBlock({ biz, company, socialLinks });
-
-  // ── Build Q&A knowledge block ─────────────────────────────
+  // ── Build Q&A block (all categories including payments, company, custom) ──
   const qaBlock = (() => {
     if (qaResult.rows.length === 0) return "";
 
     const CAT_LABELS = {
       identity:     "BUSINESS IDENTITY",
+      company:      "COMPANY DETAILS (GST, Registration, Certifications, Social Links)",
       products:     "PRODUCTS & SERVICES",
       leads:        "LEAD QUALIFICATION",
       orders:       "ORDERS & DELIVERY",
-      payments:     "PAYMENTS & REFUNDS",
+      payments:     "PAYMENT DETAILS — USE THESE EXACT DETAILS WHEN CUSTOMER ASKS HOW TO PAY",
       appointments: "APPOINTMENTS & SCHEDULING",
       support:      "AFTER-SALES & SUPPORT",
       hours:        "WORKING HOURS",
       escalation:   "ESCALATION & ALERTS",
       behaviour:    "AGENT BEHAVIOUR",
-      faqs:         "COMMON QUESTIONS",
+      faqs:         "FREQUENTLY ASKED QUESTIONS",
       objections:   "OBJECTIONS & COMPETITION",
+      custom:       "SPECIAL INSTRUCTIONS FROM OWNER — FOLLOW THESE EXACTLY",
     };
+
+    // Separate custom_instructions — goes last, highest priority
+    const customEntry = qaResult.rows.find(qa => qa.question_id === "custom_instructions");
 
     const grouped = {};
     qaResult.rows.forEach(qa => {
+      if (qa.question_id === "custom_instructions") return; // handled separately
       const cat = qa.category || "general";
       if (!grouped[cat]) grouped[cat] = [];
       grouped[cat].push(qa);
@@ -208,16 +144,19 @@ export async function buildSystemPrompt(businessId) {
       lines.push("");
     }
 
+    // Custom instructions last — highest priority
+    if (customEntry?.answer?.trim()) {
+      lines.push("[SPECIAL INSTRUCTIONS FROM OWNER — FOLLOW THESE EXACTLY]");
+      lines.push(customEntry.answer);
+      lines.push("");
+    }
+
     return lines.join("\n");
   })();
 
-  // ── Build uploaded docs section ───────────────────────────
-  const docsSection = (() => {
-    if (knowledgeResult.rows.length === 0) return "";
-    return knowledgeResult.rows
-      .map(d => `[${d.file_name}]\n${(d.extracted_text || "").slice(0, 2000)}`)
-      .join("\n\n");
-  })();
+  // ── Build company block from core business data ───────────
+  // Full company details (GST, certs etc.) come from training_qa company category
+  const companyBlock = buildCompanyBlock({ biz });
 
   // ── Current time in IST ───────────────────────────────────
   const nowIST         = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
@@ -248,11 +187,30 @@ Website: ${biz.website || ""}
 ━━━ SERVICES & PRODUCTS ━━━
 ${servicesSection}
 
-━━━ PAYMENT METHODS ━━━
-${paymentSection}
-${faqSection ? `\n━━━ FREQUENTLY ASKED QUESTIONS ━━━\n${faqSection}` : ""}
-${docsSection ? `\n━━━ BUSINESS DOCUMENTS ━━━\n${docsSection}` : ""}
-${qaBlock ? `\n━━━ OWNER TRAINING & INSTRUCTIONS ━━━\n${qaBlock}` : ""}
+━━━ HOW TO USE PRODUCTS & SERVICES ━━━
+When customer asks about any service, product, or price:
+1. Check SERVICES & PRODUCTS above for the exact answer
+2. If product shows [OUT OF STOCK] — say so honestly and suggest alternatives from the list
+3. Quote the EXACT price listed — never guess or round prices
+4. If a product is not in the list — say "we don't currently offer that"
+5. For variants/sizes — only confirm what is listed under Variants
+
+━━━ PAYMENT ━━━
+CRITICAL: Payment details are in the OWNER TRAINING section below (payments category).
+When customer asks how to pay or is ready to pay:
+— Share ALL payment methods in ONE single message
+— Include UPI ID, bank account details, any special instructions directly
+— Never say "check website" — share the details right here
+— Never use a phone number as payment info unless it's a UPI number
+
+${docsSection ? `━━━ BUSINESS DOCUMENTS & KNOWLEDGE BASE ━━━
+IMPORTANT: When a customer asks about pricing, products, services, terms, or anything specific —
+ALWAYS check this section first. The answer is very likely here.
+Do NOT say "I don't know" or "contact us" if the info exists in these documents.
+${docsSection}` : ""}
+${qaBlock ? `━━━ OWNER TRAINING & INSTRUCTIONS ━━━
+NOTE: For payment details, use ONLY the payment info in the [PAYMENT DETAILS] section below.
+${qaBlock}` : ""}
 
 ━━━ COMPANY DETAILS (share as one message when customer asks for verification) ━━━
 ${companyBlock}
@@ -388,24 +346,14 @@ export function clearPromptCache(businessId) {
   promptCache.delete(`prompt_${businessId}`);
 }
 
-// ── Build company details block ───────────────────────────────
-function buildCompanyBlock({ biz, company, socialLinks }) {
-  if (company.trust_message) return company.trust_message;
-
+// ── Build company block from core business data ───────────────
+// Full company details (GST, certifications etc.) come from training_qa
+function buildCompanyBlock({ biz }) {
   const lines = [];
-  if (biz.business_name)       lines.push(biz.business_name);
-  if (biz.address)             lines.push(`📍 ${biz.address}`);
-  if (biz.business_phone)      lines.push(`📞 ${biz.business_phone}`);
-  if (socialLinks.email)       lines.push(`📧 ${socialLinks.email}`);
-  if (socialLinks.website || biz.website) lines.push(`🌐 ${socialLinks.website || biz.website}`);
-  if (company.gst_number)      lines.push(`GST: ${company.gst_number}`);
-  if (company.registration_no) lines.push(`Reg: ${company.registration_no}`);
-  if (company.founded_year)    lines.push(`Since: ${company.founded_year}`);
-  if (company.total_clients)   lines.push(`Clients: ${company.total_clients}`);
-  if (company.certifications)  lines.push(company.certifications);
-  if (socialLinks.instagram)   lines.push(`Instagram: ${socialLinks.instagram}`);
-  if (socialLinks.linkedin)    lines.push(`LinkedIn: ${socialLinks.linkedin}`);
-
+  if (biz.business_name)  lines.push(biz.business_name);
+  if (biz.address)        lines.push(`📍 ${biz.address}`);
+  if (biz.business_phone) lines.push(`📞 ${biz.business_phone}`);
+  if (biz.website)        lines.push(`🌐 ${biz.website}`);
   return lines.length > 1
     ? lines.filter(Boolean).join("\n") + "\nFeel free to verify our details anytime."
     : "Contact us for verification details.";

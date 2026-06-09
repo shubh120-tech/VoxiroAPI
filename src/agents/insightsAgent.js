@@ -144,7 +144,7 @@ Rules:
     max_tokens: 1500,
     messages:   [{ role: "user", content: prompt }],
   });
-  await logAIUsage(businessId, "agent_training", INSIGHTS_MODEL, response.usage);
+  await logAIUsage(businessId, "insights_analysis", INSIGHTS_MODEL, response.usage);
 
   const text    = response.content[0]?.text?.trim() || "{}";
   const cleaned = text.replace(/```json|```/g, "").trim();
@@ -208,7 +208,7 @@ Do not use bullet points. Write as a single paragraph.`;
     max_tokens: 300,
     messages:   [{ role: "user", content: prompt }],
   });
-  await logAIUsage(businessId, "agent_training", INSIGHTS_MODEL, response.usage);
+  await logAIUsage(businessId, "insights_analysis", INSIGHTS_MODEL, response.usage);
 
   return response.content[0]?.text?.trim() || "";
 }

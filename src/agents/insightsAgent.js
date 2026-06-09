@@ -1,14 +1,16 @@
 import Anthropic    from "@anthropic-ai/sdk";
 import { query }    from "../db/postgres.js";
+import { logAIUsage } from "../utils/aiUsageLogger.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const INSIGHTS_MODEL = "claude-haiku-4-5-20251001";
 
 // ── Main analysis function ────────────────────────────────────
 export async function analyzeConversations(businessId, runId) {
   console.log(`🧠 Starting insights analysis for business ${businessId}`);
 
   try {
-    // Fetch all conversations with messages
     const { rows: conversations } = await query(`
       SELECT
         c.id, c.customer_name, c.customer_phone,
@@ -34,14 +36,12 @@ export async function analyzeConversations(businessId, runId) {
       LIMIT 500
     `, [businessId]);
 
-    // Get business info for context
     const { rows: bizRows } = await query(
       "SELECT name, category FROM businesses WHERE id = $1",
       [businessId]
     );
     const biz = bizRows[0] || {};
 
-    // Get existing products for gap detection
     const { rows: products } = await query(`
       SELECT name FROM store_products WHERE business_id = $1
       UNION
@@ -49,7 +49,6 @@ export async function analyzeConversations(businessId, runId) {
     `, [businessId]);
     const productNames = products.map(p => p.name).join(", ");
 
-    // Run analysis in batches of 50
     const BATCH = 50;
     const allResults = {
       product_demand: {},
@@ -62,19 +61,16 @@ export async function analyzeConversations(businessId, runId) {
     };
 
     for (let i = 0; i < conversations.length; i += BATCH) {
-      const batch = conversations.slice(i, i + BATCH);
-      const result = await analyzeBatch(batch, biz, productNames);
+      const batch  = conversations.slice(i, i + BATCH);
+      const result = await analyzeBatch(batch, biz, productNames, businessId);
       mergeBatchResult(allResults, result);
       console.log(`✅ Analyzed batch ${Math.floor(i/BATCH)+1}/${Math.ceil(conversations.length/BATCH)}`);
     }
 
-    // Generate AI summary
-    const summary = await generateSummary(allResults, biz);
+    const summary = await generateSummary(allResults, biz, businessId);
 
-    // Save all insights
     await saveInsights(businessId, runId, allResults, summary);
 
-    // Update run status
     await query(`
       UPDATE insight_runs
       SET status = 'completed',
@@ -96,7 +92,7 @@ export async function analyzeConversations(businessId, runId) {
 }
 
 // ── Analyze a batch of conversations ─────────────────────────
-async function analyzeBatch(conversations, biz, knownProducts) {
+async function analyzeBatch(conversations, biz, knownProducts, businessId) {
   const summaries = conversations.map(c => {
     const msgs     = c.messages || [];
     const customer = msgs.filter(m => m.role === "customer").map(m => m.text).join(" | ");
@@ -107,7 +103,7 @@ async function analyzeBatch(conversations, biz, knownProducts) {
       details:      c.collected_details || {},
       customer_msg: customer.slice(0, 400),
       agent_msg:    agent.slice(0, 200),
-      hour:         new Date(c.created_at).getUTCHours() + 5, // approximate IST
+      hour:         new Date(c.created_at).getUTCHours() + 5,
     };
   });
 
@@ -144,10 +140,11 @@ Rules:
 - Be specific, no generic terms`;
 
   const response = await anthropic.messages.create({
-    model:      "claude-haiku-4-5-20251001",
+    model:      INSIGHTS_MODEL,
     max_tokens: 1500,
     messages:   [{ role: "user", content: prompt }],
   });
+  await logAIUsage(businessId, "agent_training", INSIGHTS_MODEL, response.usage);
 
   const text    = response.content[0]?.text?.trim() || "{}";
   const cleaned = text.replace(/```json|```/g, "").trim();
@@ -162,55 +159,36 @@ Rules:
 
 // ── Merge batch results ───────────────────────────────────────
 function mergeBatchResult(all, batch) {
-  // Merge product demand
   for (const p of (batch.product_demand || [])) {
     const key = p.name?.toLowerCase();
     if (!key) continue;
-    if (!all.product_demand[key]) {
-      all.product_demand[key] = { name: p.name, mentions: 0, converted: 0 };
-    }
-    all.product_demand[key].mentions  += p.mentions || 1;
+    if (!all.product_demand[key]) all.product_demand[key] = { name: p.name, mentions: 0, converted: 0 };
+    all.product_demand[key].mentions  += p.mentions  || 1;
     all.product_demand[key].converted += p.converted || 0;
   }
-
-  // Merge lost reasons
   for (const r of (batch.lost_reasons || [])) {
     const key = r.reason;
-    if (!all.lost_reasons[key]) {
-      all.lost_reasons[key] = { reason: key, count: 0, examples: [] };
-    }
+    if (!all.lost_reasons[key]) all.lost_reasons[key] = { reason: key, count: 0, examples: [] };
     all.lost_reasons[key].count += r.count || 1;
     if (r.examples?.length) all.lost_reasons[key].examples.push(...r.examples.slice(0, 1));
   }
-
-  // Merge demand gaps
   for (const g of (batch.demand_gaps || [])) {
     const key = g.product?.toLowerCase();
     if (!key) continue;
-    if (!all.demand_gaps[key]) {
-      all.demand_gaps[key] = { product: g.product, count: 0 };
-    }
+    if (!all.demand_gaps[key]) all.demand_gaps[key] = { product: g.product, count: 0 };
     all.demand_gaps[key].count += g.count || 1;
   }
-
-  // Merge peak hours
   const hours = batch.peak_hours || Array(24).fill(0);
-  for (let h = 0; h < 24; h++) {
-    all.peak_hours[h] += hours[h] || 0;
-  }
-
+  for (let h = 0; h < 24; h++) all.peak_hours[h] += hours[h] || 0;
   all.converted += batch.converted_count || 0;
   all.leads     += batch.lead_count      || 0;
 }
 
 // ── Generate AI summary paragraph ────────────────────────────
-async function generateSummary(results, biz) {
-  const topProducts = Object.values(results.product_demand)
-    .sort((a, b) => b.mentions - a.mentions).slice(0, 3);
-  const topLostReason = Object.values(results.lost_reasons)
-    .sort((a, b) => b.count - a.count)[0];
-  const topGap = Object.values(results.demand_gaps)
-    .sort((a, b) => b.count - a.count)[0];
+async function generateSummary(results, biz, businessId) {
+  const topProducts   = Object.values(results.product_demand).sort((a,b) => b.mentions - a.mentions).slice(0, 3);
+  const topLostReason = Object.values(results.lost_reasons).sort((a,b) => b.count - a.count)[0];
+  const topGap        = Object.values(results.demand_gaps).sort((a,b) => b.count - a.count)[0];
 
   const prompt = `Write a 3-4 sentence business insight summary for ${biz.name || "a business"} in simple English. Be specific and actionable.
 
@@ -226,10 +204,11 @@ Write in a helpful, friendly tone. Mention specific actions the owner can take.
 Do not use bullet points. Write as a single paragraph.`;
 
   const response = await anthropic.messages.create({
-    model:      "claude-haiku-4-5-20251001",
+    model:      INSIGHTS_MODEL,
     max_tokens: 300,
     messages:   [{ role: "user", content: prompt }],
   });
+  await logAIUsage(businessId, "agent_training", INSIGHTS_MODEL, response.usage);
 
   return response.content[0]?.text?.trim() || "";
 }
@@ -237,41 +216,13 @@ Do not use bullet points. Write as a single paragraph.`;
 // ── Save insights to DB ───────────────────────────────────────
 async function saveInsights(businessId, runId, results, summary) {
   const types = [
-    {
-      type: "product_demand",
-      data: Object.values(results.product_demand)
-        .sort((a, b) => b.mentions - a.mentions).slice(0, 10),
-    },
-    {
-      type: "lost_reasons",
-      data: Object.values(results.lost_reasons)
-        .sort((a, b) => b.count - a.count),
-    },
-    {
-      type: "demand_gaps",
-      data: Object.values(results.demand_gaps)
-        .sort((a, b) => b.count - a.count).slice(0, 10),
-    },
-    {
-      type: "peak_hours",
-      data: { hours: results.peak_hours },
-    },
-    {
-      type: "conversion",
-      data: {
-        total:     results.total,
-        leads:     results.leads,
-        converted: results.converted,
-        lead_rate:     results.total > 0 ? Math.round((results.leads / results.total) * 100) : 0,
-        convert_rate:  results.leads > 0 ? Math.round((results.converted / results.leads) * 100) : 0,
-      },
-    },
-    {
-      type: "ai_summary",
-      data: { text: summary },
-    },
+    { type: "product_demand", data: Object.values(results.product_demand).sort((a,b) => b.mentions - a.mentions).slice(0, 10) },
+    { type: "lost_reasons",   data: Object.values(results.lost_reasons).sort((a,b) => b.count - a.count) },
+    { type: "demand_gaps",    data: Object.values(results.demand_gaps).sort((a,b) => b.count - a.count).slice(0, 10) },
+    { type: "peak_hours",     data: { hours: results.peak_hours } },
+    { type: "conversion",     data: { total: results.total, leads: results.leads, converted: results.converted, lead_rate: results.total > 0 ? Math.round((results.leads / results.total) * 100) : 0, convert_rate: results.leads > 0 ? Math.round((results.converted / results.leads) * 100) : 0 } },
+    { type: "ai_summary",     data: { text: summary } },
   ];
-
   for (const insight of types) {
     await query(`
       INSERT INTO insights (business_id, run_id, type, data)

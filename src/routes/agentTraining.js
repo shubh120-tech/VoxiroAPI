@@ -3,6 +3,7 @@ import Anthropic  from "@anthropic-ai/sdk";
 import { query }  from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 import { generateBusinessPrompt } from "../agents/generatePrompt.js";
+import { logAIUsage } from "../utils/aiUsageLogger.js";
 
 const router   = express.Router();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -27,11 +28,10 @@ router.get("/training/prompt", async (req, res) => {
 // ── Generate prompt from business data ────────────────────────
 router.post("/training/generate", async (req, res) => {
   try {
-    // Set longer timeout for this route
     req.setTimeout(60000);
     res.setTimeout(60000);
-
     const prompt = await generateBusinessPrompt(bId(req));
+    // logAIUsage is already called inside generateBusinessPrompt
     res.json({ success: true, prompt });
   } catch (err) {
     console.error("Prompt generate error:", err.message);
@@ -45,7 +45,6 @@ router.post("/training/fix", async (req, res) => {
     const { problem, exampleConversation } = req.body;
     if (!problem?.trim()) return res.status(400).json({ message: "Describe the problem" });
 
-    // Get current prompt
     const { rows } = await query(
       "SELECT system_prompt FROM agent_configs WHERE business_id = $1",
       [bId(req)]
@@ -53,7 +52,6 @@ router.post("/training/fix", async (req, res) => {
     const currentPrompt = rows[0]?.system_prompt || "";
     if (!currentPrompt) return res.status(400).json({ message: "No prompt configured yet" });
 
-    // Build meta-prompt for Claude Sonnet
     const metaPrompt = `You are an expert WhatsApp sales agent prompt engineer.
 
 A business owner has a problem with their AI sales agent's behavior.
@@ -79,19 +77,18 @@ RULES:
 - Keep the same language and style as the original
 - Return ONLY the fixed prompt text, nothing else — no explanation, no preamble`;
 
-    // Call Claude Sonnet (smarter for this task)
+    const fixModel = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-20250514";
     const response = await anthropic.messages.create({
-      model:      "claude-sonnet-4-20250514",
+      model:      fixModel,
       max_tokens: 4000,
       messages:   [{ role: "user", content: metaPrompt }],
     });
+    await logAIUsage(bId(req), "agent_training", fixModel, response.usage);
 
     const fixedPrompt = response.content[0]?.text?.trim() || "";
     if (!fixedPrompt) return res.status(500).json({ message: "AI could not generate a fix" });
 
-    // Build diff for display
     const diff = buildDiff(currentPrompt, fixedPrompt);
-
     res.json({ fixedPrompt, diff, currentPrompt });
 
   } catch (err) {
@@ -106,30 +103,22 @@ router.post("/training/approve", async (req, res) => {
     const { fixedPrompt, changeNote } = req.body;
     if (!fixedPrompt?.trim()) return res.status(400).json({ message: "No prompt to save" });
 
-    // Save current prompt to history first
     const { rows: current } = await query(
       "SELECT system_prompt FROM agent_configs WHERE business_id = $1",
       [bId(req)]
     );
-
     if (current[0]?.system_prompt) {
       await query(`
         INSERT INTO prompt_history (business_id, prompt, change_note, changed_by)
         VALUES ($1, $2, $3, 'ai')
       `, [bId(req), current[0].system_prompt, changeNote || "AI fix applied"]);
     }
-
-    // Save new prompt
     await query(`
-      UPDATE agent_configs
-      SET system_prompt = $1, updated_at = NOW()
+      UPDATE agent_configs SET system_prompt = $1, updated_at = NOW()
       WHERE business_id = $2
     `, [fixedPrompt, bId(req)]);
 
-    // Clear prompt cache so agent picks up new prompt immediately
-    // The cache will rebuild on next message
     res.json({ success: true, message: "Prompt updated — agent will use new rules immediately" });
-
   } catch (err) {
     res.status(500).json({ message: "Failed to save prompt" });
   }
@@ -145,14 +134,12 @@ router.post("/training/save", async (req, res) => {
       "SELECT system_prompt FROM agent_configs WHERE business_id = $1",
       [bId(req)]
     );
-
     if (current[0]?.system_prompt) {
       await query(`
         INSERT INTO prompt_history (business_id, prompt, change_note, changed_by)
         VALUES ($1, $2, $3, 'owner')
       `, [bId(req), current[0].system_prompt, changeNote || "Manual edit"]);
     }
-
     await query(`
       UPDATE agent_configs SET system_prompt = $1, updated_at = NOW()
       WHERE business_id = $2
@@ -170,7 +157,6 @@ router.post("/training/test", async (req, res) => {
     const { message, history } = req.body;
     if (!message?.trim()) return res.status(400).json({ message: "Message required" });
 
-    // Get current prompt
     const { rows } = await query(
       "SELECT system_prompt, agent_name FROM agent_configs WHERE business_id = $1",
       [bId(req)]
@@ -178,19 +164,16 @@ router.post("/training/test", async (req, res) => {
     const systemPrompt = rows[0]?.system_prompt || "";
     if (!systemPrompt) return res.status(400).json({ message: "No prompt configured" });
 
-    // Build conversation history
-    const messages = [
-      ...(history || []),
-      { role: "user", content: message },
-    ];
+    const messages = [...(history || []), { role: "user", content: message }];
 
-    // Call agent with current prompt — no tools in test mode
+    const testModel = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
     const response = await anthropic.messages.create({
-      model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
+      model:      testModel,
       max_tokens: 500,
       system:     systemPrompt,
       messages,
     });
+    await logAIUsage(bId(req), "agent_training", testModel, response.usage);
 
     const reply = response.content[0]?.text?.trim() || "";
     res.json({ reply, usage: response.usage });
@@ -209,8 +192,7 @@ router.get("/training/history", async (req, res) => {
              LEFT(prompt, 100) AS prompt_preview
       FROM prompt_history
       WHERE business_id = $1
-      ORDER BY created_at DESC
-      LIMIT 20
+      ORDER BY created_at DESC LIMIT 20
     `, [bId(req)]);
     res.json({ history: rows });
   } catch (err) {
@@ -227,7 +209,6 @@ router.post("/training/rollback/:id", async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ message: "Version not found" });
 
-    // Save current as history
     const { rows: current } = await query(
       "SELECT system_prompt FROM agent_configs WHERE business_id = $1",
       [bId(req)]
@@ -238,8 +219,6 @@ router.post("/training/rollback/:id", async (req, res) => {
         VALUES ($1, $2, 'Rolled back to previous version', 'owner')
       `, [bId(req), current[0].system_prompt]);
     }
-
-    // Restore old prompt
     await query(`
       UPDATE agent_configs SET system_prompt = $1, updated_at = NOW()
       WHERE business_id = $2
@@ -251,12 +230,48 @@ router.post("/training/rollback/:id", async (req, res) => {
   }
 });
 
+// ── Get Q&A answers ───────────────────────────────────────────
+router.get("/training/qa", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT question_id, question, answer, category, is_required FROM training_qa WHERE business_id = $1 ORDER BY category, question_id",
+      [bId(req)]
+    );
+    res.json({ answers: rows });
+  } catch (err) {
+    console.error("Load Q&A error:", err.message);
+    res.status(500).json({ message: "Failed to load training answers" });
+  }
+});
+
+// ── Save Q&A answers ──────────────────────────────────────────
+router.post("/training/qa", async (req, res) => {
+  try {
+    const { answers } = req.body;
+    if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be an array" });
+
+    for (const a of answers) {
+      if (!a.question_id) continue;
+      await query(`
+        INSERT INTO training_qa
+          (business_id, question_id, question, answer, category, is_required, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+        ON CONFLICT (business_id, question_id)
+        DO UPDATE SET answer = $4, updated_at = NOW()
+      `, [bId(req), a.question_id, a.question || "", a.answer || "", a.category || "general", a.is_required || false]);
+    }
+    res.json({ success: true, saved: answers.length });
+  } catch (err) {
+    console.error("Save Q&A error:", err.message);
+    res.status(500).json({ message: "Failed to save training answers: " + err.message });
+  }
+});
+
 // ── Build simple diff ─────────────────────────────────────────
 function buildDiff(original, fixed) {
   const origLines  = original.split("\n");
   const fixedLines = fixed.split("\n");
   const diff       = [];
-
   const maxLen = Math.max(origLines.length, fixedLines.length);
   for (let i = 0; i < maxLen; i++) {
     const origLine  = origLines[i] ?? "";
@@ -273,57 +288,5 @@ function buildDiff(original, fixed) {
   }
   return diff;
 }
-
-// ═══════════════════════════════════════════════════════════
-//  ADD THESE ROUTES TO agentTraining.js
-//  (add before the export default router line)
-// ═══════════════════════════════════════════════════════════
-
-// ── GET /training/qa — load saved answers ────────────────────
-router.get("/training/qa", async (req, res) => {
-  try {
-    const { rows } = await query(
-      "SELECT question_id, question, answer, category, is_required FROM training_qa WHERE business_id = $1 ORDER BY category, question_id",
-      [bId(req)]
-    );
-    res.json({ answers: rows });
-  } catch (err) {
-    console.error("Load Q&A error:", err.message);
-    res.status(500).json({ message: "Failed to load training answers" });
-  }
-});
-
-// ── POST /training/qa — save answers ─────────────────────────
-router.post("/training/qa", async (req, res) => {
-  try {
-    const { answers } = req.body;
-    if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be an array" });
-
-    for (const a of answers) {
-      if (!a.question_id) continue;
-      await query(`
-        INSERT INTO training_qa
-          (business_id, question_id, question, answer, category, is_required, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-        ON CONFLICT (business_id, question_id)
-        DO UPDATE SET
-          answer     = $4,
-          updated_at = NOW()
-      `, [
-        bId(req),
-        a.question_id,
-        a.question    || "",
-        a.answer      || "",
-        a.category    || "general",
-        a.is_required || false,
-      ]);
-    }
-
-    res.json({ success: true, saved: answers.length });
-  } catch (err) {
-    console.error("Save Q&A error:", err.message);
-    res.status(500).json({ message: "Failed to save training answers: " + err.message });
-  }
-});
 
 export default router;

@@ -465,4 +465,101 @@ router.get("/analytics/overview", async (req, res) => {
   }
 });
 
+// ── AI Usage Analytics ────────────────────────────────────────
+
+router.get("/analytics/ai-usage", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT * FROM admin_ai_usage_summary
+      ORDER BY total_cost_usd DESC
+    `);
+    res.json({ businesses: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load AI usage: " + err.message });
+  }
+});
+
+router.get("/analytics/ai-usage/daily", async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days) || 30, 90);
+    const { rows } = await query(`
+      SELECT
+        DATE(created_at AT TIME ZONE 'Asia/Kolkata') AS date,
+        SUM(total_tokens)  AS total_tokens,
+        SUM(cost_usd)      AS cost_usd,
+        COUNT(*)           AS total_calls,
+        SUM(total_tokens) FILTER (WHERE feature = 'agent_reply')         AS agent_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'prompt_generation')   AS prompt_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'contact_extraction')  AS extraction_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'template_generation') AS template_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'agent_training')      AS training_tokens
+      FROM ai_usage_logs
+      WHERE created_at >= NOW() - INTERVAL '1 day' * $1
+      GROUP BY DATE(created_at AT TIME ZONE 'Asia/Kolkata')
+      ORDER BY date DESC
+    `, [days]);
+    res.json({ daily: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load daily AI usage" });
+  }
+});
+
+router.get("/analytics/ai-usage/business/:id", async (req, res) => {
+  try {
+    const [summary, daily, byFeature] = await Promise.all([
+      query(`SELECT * FROM admin_ai_usage_summary WHERE business_id = $1`, [req.params.id]),
+      query(`
+        SELECT
+          DATE(created_at AT TIME ZONE 'Asia/Kolkata') AS date,
+          SUM(total_tokens) AS tokens,
+          SUM(cost_usd)     AS cost_usd,
+          COUNT(*)          AS calls
+        FROM ai_usage_logs
+        WHERE business_id = $1 AND created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(created_at AT TIME ZONE 'Asia/Kolkata')
+        ORDER BY date DESC
+      `, [req.params.id]),
+      query(`
+        SELECT
+          feature,
+          SUM(total_tokens) AS tokens,
+          SUM(cost_usd)     AS cost_usd,
+          COUNT(*)          AS calls,
+          ROUND(AVG(total_tokens)) AS avg_tokens_per_call
+        FROM ai_usage_logs
+        WHERE business_id = $1
+        GROUP BY feature
+        ORDER BY cost_usd DESC
+      `, [req.params.id]),
+    ]);
+    res.json({ summary: summary.rows[0] || {}, daily: daily.rows, byFeature: byFeature.rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load business AI usage" });
+  }
+});
+
+// ── Billing history per business ──────────────────────────────
+router.get("/businesses/:id/billing", async (req, res) => {
+  try {
+    const [sub, payments] = await Promise.all([
+      query(`
+        SELECT s.*, p.name AS plan_name, p.display_name AS plan_display_name,
+               p.price_monthly, p.message_limit
+        FROM subscriptions s
+        JOIN plans p ON p.id = s.plan_id
+        WHERE s.business_id = $1
+        ORDER BY s.created_at DESC LIMIT 1
+      `, [req.params.id]),
+      query(`
+        SELECT * FROM payments
+        WHERE business_id = $1
+        ORDER BY created_at DESC LIMIT 24
+      `, [req.params.id]).catch(() => ({ rows: [] })),
+    ]);
+    res.json({ subscription: sub.rows[0] || null, payments: payments.rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load billing: " + err.message });
+  }
+});
+
 export default router;

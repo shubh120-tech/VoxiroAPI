@@ -6,6 +6,7 @@ import path      from "path";
 import fs        from "fs";
 import { query } from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
+import { logAIUsage }    from "../utils/aiUsageLogger.js";
 
 const router = express.Router();
 
@@ -185,10 +186,12 @@ router.post("/broadcast/contacts/extract", async (req, res) => {
   try {
     const { rawText } = req.body;
     if (!rawText?.trim()) return res.status(400).json({ message: "No text provided" });
+    const extractModel = "claude-haiku-4-5-20251001";
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001", max_tokens: 2000,
+      model: extractModel, max_tokens: 2000,
       messages: [{ role: "user", content: `Extract all contact information from this text. Return ONLY a valid JSON array.\n\nEach object: { phone, name, email, notes }\nNormalize Indian numbers to +91XXXXXXXXXX format.\nSkip entries with no valid phone.\n\nText:\n${rawText.slice(0, 5000)}` }],
     });
+    await logAIUsage(req.user.business_id, "contact_extraction", extractModel, response.usage);
     const text = response.content[0]?.text || "[]";
     let contacts;
     try { contacts = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch { contacts = []; }
@@ -287,11 +290,13 @@ Return ONLY valid JSON with no explanation, no markdown backticks:
   "warnings": []
 }`;
 
+    const templateModel = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-5";
     const response = await anthropic.messages.create({
-      model:      process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-5",
+      model:      templateModel,
       max_tokens: 1000,
       messages:   [{ role: "user", content: userPrompt }],
     });
+    await logAIUsage(req.user.business_id, "template_generation", templateModel, response.usage);
 
     const text  = response.content[0]?.text || "";
     const clean = text.replace(/```json|```/g, "").trim();

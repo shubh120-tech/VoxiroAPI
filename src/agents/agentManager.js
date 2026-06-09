@@ -322,8 +322,9 @@ async function callClaudeWithCache({
   systemPrompt, dynamicContext, messages, businessId, conversationId, customerPhone, customerName,
 }) {
   try {
+    const agentModel = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
     let response = await anthropic.messages.create({
-      model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
+      model:      agentModel,
       max_tokens: 400,
       system: [
         {
@@ -349,6 +350,8 @@ async function callClaudeWithCache({
     if (usage?.cache_read_input_tokens > 0) {
       console.log(`💰 Cache hit: ${usage.cache_read_input_tokens} tokens cached (saved $${((usage.cache_read_input_tokens * 0.9) / 1000000).toFixed(6)})`);
     }
+    // Log AI usage for agent reply
+    await logAIUsage(businessId, "agent_reply", agentModel, usage);
 
     // ── Handle tool calls ─────────────────────────────────────
     while (response.stop_reason === "tool_use") {
@@ -374,7 +377,7 @@ async function callClaudeWithCache({
       ];
 
       response = await anthropic.messages.create({
-        model:      process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001",
+        model:      agentModel,
         max_tokens: 400,
         system: [
           {
@@ -386,6 +389,7 @@ async function callClaudeWithCache({
         tools:    TOOLS,
         messages,
       });
+      await logAIUsage(businessId, "agent_reply", agentModel, response.usage);
     }
 
     const textReply = response.content

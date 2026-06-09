@@ -30,65 +30,6 @@ const getRazorpay = () => {
 const USD_TO_INR = 84;
 
 // ── Public: Get all active plans ──────────────────────────────
-router.post("/billing/select-free-plan", async (req, res) => {
-  try {
-    const { plan_id } = req.body;
-    const bId = req.user.business_id;
- 
-    const { rows: planRows } = await query(
-      "SELECT * FROM plans WHERE id = $1 AND is_active = TRUE",
-      [plan_id]
-    );
-    if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
- 
-    const plan = planRows[0];
- 
-    // Only allow free or trial plans through this endpoint
-    if (plan.price_monthly > 0 && plan.trial_days === 0) {
-      return res.status(400).json({ message: "Paid plans require payment. Use /billing/create-order instead." });
-    }
- 
-    const now      = new Date();
-    const trialEnd = plan.trial_days > 0
-      ? new Date(now.getTime() + plan.trial_days * 24 * 60 * 60 * 1000)
-      : null;
-    const cycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
- 
-    await query(`
-      INSERT INTO subscriptions
-        (business_id, plan_id, status, billing_cycle_start, billing_cycle_end,
-         trial_ends_at, messages_used, is_active)
-      VALUES ($1, $2, $3, $4, $5, $6, 0, TRUE)
-      ON CONFLICT (business_id) DO UPDATE SET
-        plan_id             = $2,
-        status              = $3,
-        billing_cycle_start = $4,
-        billing_cycle_end   = $5,
-        trial_ends_at       = $6,
-        messages_used       = 0,
-        is_active           = TRUE,
-        updated_at          = NOW()
-    `, [
-      bId, plan.id,
-      plan.trial_days > 0 ? "trialing" : "active",
-      now, cycleEnd,
-      trialEnd,
-    ]);
- 
-    // Mark onboarding complete
-    await query(
-      "UPDATE users SET onboarding_completed = TRUE WHERE id = $1",
-      [req.user.id]
-    ).catch(() => {});
- 
-    console.log(`✅ Free/trial plan activated: ${plan.name} for business ${bId}`);
-    res.json({ success: true, status: plan.trial_days > 0 ? "trialing" : "active" });
-  } catch (err) {
-    console.error("Free plan activation error:", err.message);
-    res.status(500).json({ message: "Failed to activate plan: " + err.message });
-  }
-});
-
 router.get("/plans/public", async (req, res) => {
   try {
     const { rows } = await query(`
@@ -99,7 +40,8 @@ router.get("/plans/public", async (req, res) => {
         price_monthly,
         message_limit,
         doc_limit,
-        COALESCE(trial_days, 0) AS trial_days,
+        COALESCE(token_limit, 0)  AS token_limit,
+        COALESCE(trial_days, 0)   AS trial_days,
         is_active
       FROM plans
       WHERE is_active = TRUE
@@ -133,13 +75,14 @@ router.get("/billing/current", async (req, res) => {
         CASE WHEN s.trial_ends_at > NOW() THEN 'trialing'
              WHEN s.is_active = TRUE THEN 'active'
              ELSE 'inactive' END AS status,
-        p.name::text     AS plan_name,
-        p.display_name   AS plan_display_name,
+        p.name::text              AS plan_name,
+        p.display_name            AS plan_display_name,
         p.price_monthly,
         p.message_limit,
         p.doc_limit,
-        COALESCE(p.trial_days, 0) AS trial_days,
-        b.name           AS business_name,
+        COALESCE(p.token_limit, 0) AS token_limit,
+        COALESCE(p.trial_days, 0)  AS trial_days,
+        b.name                     AS business_name,
         b.address,
         u.owner_name,
         u.email
@@ -164,18 +107,32 @@ router.get("/billing/current", async (req, res) => {
 
     const sub = subRows[0];
 
-    // Get actual message usage this month
-    const { rows: usageRows } = await query(`
-      SELECT COUNT(*) AS cnt FROM messages
-      WHERE business_id = $1 AND role = 'agent'
-        AND created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'
-    `, [bId]);
+    // Get actual message usage + token usage this month
+    const [usageRows, tokenRows] = await Promise.all([
+      query(`
+        SELECT COUNT(*) AS cnt FROM messages
+        WHERE business_id = $1 AND role = 'agent'
+          AND created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'
+      `, [bId]),
+      query(`
+        SELECT COALESCE(SUM(total_tokens), 0) AS tokens_used
+        FROM ai_usage_logs
+        WHERE business_id = $1
+          AND created_at >= date_trunc('month', NOW())
+      `, [bId]).catch(() => ({ rows: [{ tokens_used: 0 }] })),
+    ]);
 
-    const actualUsed = parseInt(usageRows[0]?.cnt) || 0;
+    const actualUsed  = parseInt(usageRows[0]?.cnt)            || 0;
+    const tokensUsed  = parseInt(tokenRows[0]?.tokens_used)    || 0;
+    const tokenLimit  = parseInt(sub.token_limit)              || 0;
+    const tokenPct    = tokenLimit > 0 ? Math.round((tokensUsed / tokenLimit) * 100) : 0;
 
     res.json({
       ...sub,
       messages_used: actualUsed,
+      tokens_used:   tokensUsed,
+      token_limit:   tokenLimit,
+      token_pct:     tokenPct,
     });
   } catch (err) {
     console.error("Billing current error:", err.message);

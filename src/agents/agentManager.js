@@ -68,6 +68,36 @@ function getMaxHistory(conversationLength) {
   return 20;
 }
 
+// ── Check if business has exceeded monthly token limit ───────
+async function checkTokenLimit(businessId) {
+  try {
+    const { rows } = await query(`
+      SELECT
+        COALESCE(p.token_limit, 0)                                                       AS token_limit,
+        COALESCE(SUM(u.total_tokens), 0)                                                 AS tokens_used
+      FROM businesses b
+      LEFT JOIN subscriptions s ON s.business_id = b.id
+      LEFT JOIN plans p ON p.id = s.plan_id
+      LEFT JOIN ai_usage_logs u ON u.business_id = b.id
+        AND u.created_at >= date_trunc('month', NOW())
+      WHERE b.id = $1
+      GROUP BY p.token_limit
+    `, [businessId]);
+
+    const row        = rows[0] || {};
+    const limit      = parseInt(row.token_limit)  || 0;
+    const used       = parseInt(row.tokens_used)   || 0;
+
+    // If no limit set (0) — no restriction
+    if (limit === 0) return { exceeded: false, used, limit };
+
+    return { exceeded: used >= limit, used, limit, pct: Math.round((used / limit) * 100) };
+  } catch (err) {
+    console.warn("Token limit check failed:", err.message);
+    return { exceeded: false }; // fail open — don't block agent if check fails
+  }
+}
+
 /**
  * Main entry point — called when WhatsApp message arrives.
  */
@@ -122,6 +152,18 @@ export async function handleIncomingMessage({
         await saveMessage({ conversationId, businessId, role: "agent", content: holding });
         return [holding];
       }
+    }
+
+    // ── Check token limit ────────────────────────────────────
+    const tokenCheck = await checkTokenLimit(businessId);
+    if (tokenCheck.exceeded) {
+      console.log(`🚫 Token limit exceeded for business ${businessId} — blocking agent reply`);
+      const limitMsg = "Our AI assistant is temporarily paused as the monthly usage limit has been reached. Please contact the business owner to upgrade the plan. We apologise for the inconvenience.";
+      if (phoneNumberId && accessToken) {
+        await sendWhatsAppMessages({ phoneNumberId, accessToken, to: customerPhone, messages: [limitMsg] });
+      }
+      await saveMessage({ conversationId, businessId, role: "agent", content: limitMsg });
+      return [limitMsg];
     }
 
     // ── Get system prompt (cached) ────────────────────────────

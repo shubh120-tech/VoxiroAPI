@@ -405,31 +405,40 @@ router.get("/support", async (req, res) => {
   try {
     const { page = 1, limit = 30, status, priority, search } = req.query;
     const offset = (page - 1) * limit;
-    let sql = `
-      SELECT
-        t.*,
-        b.name        AS business_name,
-        u.owner_name  AS created_by_name,
-        u.email       AS owner_email,
-        a.name        AS assigned_to_name,
-        (SELECT COUNT(*) FROM help_ticket_comments c WHERE c.ticket_id = t.id)::int AS comment_count,
-        (SELECT COUNT(*) FROM help_ticket_attachments att WHERE att.ticket_id = t.id)::int AS attachment_count
+    const params = [];
+    let where = "WHERE 1=1";
+    if (status)   { params.push(status);        where += ` AND t.status   = $${params.length}`; }
+    if (priority) { params.push(priority);       where += ` AND t.priority = $${params.length}`; }
+    if (search)   { params.push(`%${search}%`); where += ` AND (t.subject ILIKE $${params.length} OR b.name ILIKE $${params.length})`; }
+
+    const base = `
       FROM help_tickets t
       JOIN businesses b ON b.id = t.business_id
       LEFT JOIN users u  ON u.id = t.created_by AND u.role = 'owner'
       LEFT JOIN admins a ON a.id = t.assigned_to
-      WHERE 1=1
+      ${where}
     `;
-    const params = [];
-    if (status)  { params.push(status);          sql += ` AND t.status   = $${params.length}`; }
-    if (priority){ params.push(priority);         sql += ` AND t.priority = $${params.length}`; }
-    if (search)  { params.push(`%${search}%`);   sql += ` AND (t.subject ILIKE $${params.length} OR b.name ILIKE $${params.length})`; }
-    const countSql = sql.replace(/SELECT[\s\S]+?FROM/, "SELECT COUNT(*) FROM");
-    sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, t.created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
-    params.push(limit, offset);
 
-    const [data, count] = await Promise.all([query(sql, params), query(countSql, params.slice(0, -2))]);
-    res.json({ tickets: data.rows, total: parseInt(count.rows[0].count) });
+    const countResult = await query(`SELECT COUNT(*) ${base}`, params);
+    const total = parseInt(countResult.rows[0].count);
+
+    params.push(limit, offset);
+    const { rows } = await query(`
+      SELECT
+        t.*,
+        b.name       AS business_name,
+        u.owner_name AS created_by_name,
+        u.email      AS owner_email,
+        a.name       AS assigned_to_name,
+        (SELECT COUNT(*) FROM help_ticket_comments   c   WHERE c.ticket_id   = t.id)::int AS comment_count,
+        (SELECT COUNT(*) FROM help_ticket_attachments att WHERE att.ticket_id = t.id)::int AS attachment_count
+      ${base}
+      ORDER BY CASE t.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+               t.created_at DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}
+    `, params);
+
+    res.json({ tickets: rows, total });
   } catch (err) {
     res.status(500).json({ message: "Failed to load tickets: " + err.message });
   }

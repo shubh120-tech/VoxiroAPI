@@ -250,6 +250,25 @@ router.get("/billing/current", async (req, res) => {
     const tokenPct         = tokenLimit > 0 ? Math.round((tokensUsed / tokenLimit) * 100) : 0;
     const totalTokensEver  = parseInt(allTimeRows[0]?.total_tokens_ever) || 0;
     const totalCostEver    = parseFloat(allTimeRows[0]?.total_cost_ever) || 0;
+console.error("AI usage: " +tokensUsed + " Total: "+tokenPct);
+
+    console.log("AI usage:", {
+  ...sub,
+  messages_used: actualUsed,
+  tokens_used: tokensUsed,
+  token_limit: tokenLimit,
+  token_pct: tokenPct,
+
+  agent_tokens: parseInt(t.agent_tokens) || 0,
+  prompt_tokens: parseInt(t.prompt_tokens) || 0,
+  training_tokens: parseInt(t.training_tokens) || 0,
+  template_tokens: parseInt(t.template_tokens) || 0,
+  insights_tokens: parseInt(t.insights_tokens) || 0,
+
+  total_tokens_ever: totalTokensEver,
+  total_cost_ever: totalCostEver,
+  total_cost_inr: Math.round(totalCostEver * 84),
+}); 
 
     res.json({
       ...sub,
@@ -268,7 +287,6 @@ router.get("/billing/current", async (req, res) => {
       total_cost_ever:    totalCostEver,
       total_cost_inr:     Math.round(totalCostEver * 84),
     });
-    console.error("AI usage: " +tokensUsed + " Total: "+token_pct);
   } catch (err) {
     console.error("Billing current error:", err.message);
     res.status(500).json({ message: "Failed to load billing info" });

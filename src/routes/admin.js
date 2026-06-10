@@ -667,6 +667,12 @@ router.get("/businesses/:id/billing", async (req, res) => {
 
 // ── Admin Plans CRUD ──────────────────────────────────────────
 
+// ── ADD THESE ROUTES TO src/routes/admin.js ──────────────────
+// Paste BEFORE the `export default router;` line at the bottom
+// These routes are protected by the admin auth middleware already on the router
+
+// ── Admin Plans CRUD ──────────────────────────────────────────
+
 router.get("/plans", async (req, res) => {
   try {
     const { rows } = await query(`
@@ -756,6 +762,7 @@ router.put("/plans/:id", async (req, res) => {
 
 router.delete("/plans/:id", async (req, res) => {
   try {
+    // Check active subscriptions
     const { rows: subs } = await query(
       "SELECT COUNT(*) AS cnt FROM subscriptions WHERE plan_id = $1::uuid AND is_active = TRUE",
       [req.params.id]
@@ -765,6 +772,19 @@ router.delete("/plans/:id", async (req, res) => {
         message: `Cannot delete — ${subs[0].cnt} active subscription(s) use this plan. Deactivate it instead.`
       });
     }
+
+    // Null out businesses.plan_id FK before deleting
+    await query(
+      "UPDATE businesses SET plan_id = NULL WHERE plan_id = $1::uuid",
+      [req.params.id]
+    ).catch(() => {});
+
+    // Null out subscriptions FK (inactive ones)
+    await query(
+      "UPDATE subscriptions SET plan_id = NULL WHERE plan_id = $1::uuid",
+      [req.params.id]
+    ).catch(() => {});
+
     await query("DELETE FROM plans WHERE id = $1::uuid", [req.params.id]);
     res.json({ success: true });
   } catch (err) {

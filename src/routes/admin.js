@@ -38,6 +38,7 @@ router.post("/auth/login", async (req, res) => {
 });
 
 // All routes below require admin auth
+console.log("✅ Admin routes v2 loaded — help_tickets");
 router.use(adminAuthMiddleware);
 
 // ── Analytics ─────────────────────────────────────────────────

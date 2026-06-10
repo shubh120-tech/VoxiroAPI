@@ -679,7 +679,7 @@ router.get("/plans", async (req, res) => {
       SELECT
         id::text, name::text, display_name, is_active,
         price_monthly,
-        COALESCE(amount_inr, ROUND(price_monthly * 84))  AS amount_inr,
+        COALESCE(amount_inr, price_monthly)               AS amount_inr,
         COALESCE(discount_pct, 0)                         AS discount_pct,
         COALESCE(offer_text, '')                          AS offer_text,
         COALESCE(token_limit, 0)                          AS token_limit,
@@ -688,7 +688,7 @@ router.get("/plans", async (req, res) => {
         COALESCE(trial_days, 0)                           AS trial_days,
         created_at
       FROM plans
-      ORDER BY COALESCE(amount_inr, price_monthly * 84) ASC
+      ORDER BY COALESCE(amount_inr, price_monthly) ASC
     `);
     res.json({ plans: rows });
   } catch (err) {
@@ -700,7 +700,7 @@ router.get("/plans", async (req, res) => {
 router.post("/plans", async (req, res) => {
   try {
     const {
-      name, display_name, price_monthly = 0,
+      name, display_name,
       amount_inr = 0, discount_pct = 0, offer_text = "",
       token_limit = 0, message_limit = 0, doc_limit = 10,
       trial_days = 0, is_active = true,
@@ -719,7 +719,7 @@ router.post("/plans", async (req, res) => {
     `, [
       name,
       display_name,
-      amount_inr / 84,    // price_monthly kept in sync
+      parseInt(amount_inr) || 0,  // price_monthly = amount_inr (INR only)
       parseInt(amount_inr) || 0,
       Math.min(100, Math.max(0, parseInt(discount_pct) || 0)),
       offer_text || "",
@@ -769,7 +769,7 @@ router.put("/plans/:id", async (req, res) => {
     `, [
       String(b.display_name || ""),
       amtInr,
-      finalAmt / 84,      // keep price_monthly in sync (used by Razorpay)
+      finalAmt,           // price_monthly = amount_inr (INR only)
       discPct,
       String(b.offer_text || ""),
       tokenLimit,

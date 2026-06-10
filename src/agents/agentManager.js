@@ -16,6 +16,7 @@ import {
 } from "./tools/orderAppointmentTools.js";
 import { sendWhatsAppMessages,  splitIntoMessages          } from "../whatsapp/sender.js";
 import { query } from "../db/postgres.js";
+import { logAIUsage } from "../utils/aiUsageLogger.js";
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 

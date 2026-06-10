@@ -254,9 +254,9 @@ router.get("/billing/current", async (req, res) => {
     res.json({
       ...sub,
       messages_used:      actualUsed,
-      tokens_used:        totalTokensEver,
+      tokens_used:        tokensUsed,
       token_limit:        tokenLimit,
-      token_pct:          totalTokensEver,
+      token_pct:          tokenPct,
       // Per-feature this month
       agent_tokens:       parseInt(t.agent_tokens)    || 0,
       prompt_tokens:      parseInt(t.prompt_tokens)   || 0,
@@ -268,6 +268,7 @@ router.get("/billing/current", async (req, res) => {
       total_cost_ever:    totalCostEver,
       total_cost_inr:     Math.round(totalCostEver * 84),
     });
+    console.error("AI usage: " +res.toString());
   } catch (err) {
     console.error("Billing current error:", err.message);
     res.status(500).json({ message: "Failed to load billing info" });

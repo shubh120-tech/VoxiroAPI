@@ -696,7 +696,7 @@ router.get("/plans", async (req, res) => {
     res.status(500).json({ message: "Failed to load plans: " + err.message });
   }
 });
-
+ 
 router.post("/plans", async (req, res) => {
   try {
     const {
@@ -705,51 +705,54 @@ router.post("/plans", async (req, res) => {
       token_limit = 0, message_limit = 0, doc_limit = 10,
       trial_days = 0, is_active = true,
     } = req.body;
-
+ 
     if (!name || !display_name) {
       return res.status(400).json({ message: "name and display_name are required" });
     }
-
+ 
     const { rows } = await query(`
       INSERT INTO plans
         (name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
          token_limit, message_limit, doc_limit, trial_days, is_active, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
       RETURNING id::text
-    `, [name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
-        token_limit, message_limit, doc_limit, trial_days, is_active]);
-
+    `, [
+      name,
+      display_name,
+      amount_inr / 84,    // price_monthly kept in sync
+      parseInt(amount_inr) || 0,
+      Math.min(100, Math.max(0, parseInt(discount_pct) || 0)),
+      offer_text || "",
+      parseInt(token_limit) || 0,
+      parseInt(message_limit) || 0,
+      parseInt(doc_limit) || 5,
+      parseInt(trial_days) || 0,
+      is_active ?? true,
+    ]);
+ 
     res.json({ success: true, id: rows[0].id });
   } catch (err) {
     console.error("Create plan error:", err.message);
     res.status(500).json({ message: "Failed to create plan: " + err.message });
   }
 });
-
+ 
 router.put("/plans/:id", async (req, res) => {
   try {
-    const {
-      display_name, price_monthly,
-      amount_inr, discount_pct, offer_text,
-      token_limit, message_limit, doc_limit,
-      trial_days, is_active,
-    } = req.body;
-
-    // Build SET clause only for fields that were sent
-    const body = req.body;
-    const sets = [];
-    const vals = [];
-    let i = 1;
-
-    // Coerce types — token_limit may arrive as string from frontend
-    const amtInr     = parseInt(body.amount_inr)    || 0;
-    const discPct    = parseInt(body.discount_pct)  || 0;
-    const tokenLimit = parseInt(body.token_limit)   || 0;
-    const msgLimit   = parseInt(body.message_limit) || 0;
-    const docLimit   = parseInt(body.doc_limit)     || 5;
-    const trialDays  = parseInt(body.trial_days)    || 0;
-
-    await query(`
+    const b = req.body;
+ 
+    // All values in INR — no USD conversion needed
+    const amtInr     = parseInt(b.amount_inr)    || 0;
+    const discPct    = Math.min(100, Math.max(0, parseInt(b.discount_pct) || 0));
+    const finalAmt   = discPct > 0 ? Math.round(amtInr * (1 - discPct / 100)) : amtInr;
+    const tokenLimit = parseInt(b.token_limit)   || 0;
+    const msgLimit   = parseInt(b.message_limit) || 0;
+    const docLimit   = parseInt(b.doc_limit)     || 5;
+    const trialDays  = parseInt(b.trial_days)    || 0;
+ 
+    console.log(`Updating plan ${req.params.id}:`, { amtInr, discPct, finalAmt, tokenLimit });
+ 
+    const result = await query(`
       UPDATE plans SET
         display_name  = $1,
         amount_inr    = $2,
@@ -762,27 +765,33 @@ router.put("/plans/:id", async (req, res) => {
         trial_days    = $9,
         is_active     = $10
       WHERE id = $11::uuid
+      RETURNING id
     `, [
-      body.display_name,
+      String(b.display_name || ""),
       amtInr,
-      amtInr / 84,
+      finalAmt / 84,      // keep price_monthly in sync (used by Razorpay)
       discPct,
-      body.offer_text || "",
+      String(b.offer_text || ""),
       tokenLimit,
       msgLimit,
       docLimit,
       trialDays,
-      body.is_active ?? true,
+      b.is_active ?? true,
       req.params.id,
     ]);
-
-    res.json({ success: true });
+ 
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: "Plan not found" });
+    }
+ 
+    console.log(`✅ Plan ${req.params.id} updated successfully`);
+    res.json({ success: true, final_amount_inr: finalAmt });
   } catch (err) {
-    console.error("Update plan error:", err.message);
+    console.error("Update plan error:", err.message, err.stack);
     res.status(500).json({ message: "Failed to update plan: " + err.message });
   }
 });
-
+ 
 router.delete("/plans/:id", async (req, res) => {
   try {
     // Check active subscriptions
@@ -795,19 +804,19 @@ router.delete("/plans/:id", async (req, res) => {
         message: `Cannot delete — ${subs[0].cnt} active subscription(s) use this plan. Deactivate it instead.`
       });
     }
-
+ 
     // Null out businesses.plan_id FK before deleting
     await query(
       "UPDATE businesses SET plan_id = NULL WHERE plan_id = $1::uuid",
       [req.params.id]
     ).catch(() => {});
-
+ 
     // Null out subscriptions FK (inactive ones)
     await query(
       "UPDATE subscriptions SET plan_id = NULL WHERE plan_id = $1::uuid",
       [req.params.id]
     ).catch(() => {});
-
+ 
     await query("DELETE FROM plans WHERE id = $1::uuid", [req.params.id]);
     res.json({ success: true });
   } catch (err) {

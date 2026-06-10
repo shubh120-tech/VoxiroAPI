@@ -282,13 +282,20 @@ router.post("/billing/create-order", async (req, res) => {
 
     // Validate plan
     const { rows: planRows } = await query(
-      "SELECT id::text, name::text, display_name, price_monthly, message_limit, doc_limit, COALESCE(trial_days,0) AS trial_days FROM plans WHERE id = $1::uuid AND is_active = TRUE",
+      `SELECT id::text, name::text, display_name, price_monthly,
+              COALESCE(amount_inr, ROUND(price_monthly*84)) AS amount_inr,
+              COALESCE(discount_pct, 0) AS discount_pct,
+              message_limit, doc_limit, COALESCE(trial_days,0) AS trial_days
+       FROM plans WHERE id = $1::uuid AND is_active = TRUE`,
       [plan_id]
     );
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
 
     const plan      = planRows[0];
-    const amountINR = Math.round(plan.price_monthly * USD_TO_INR);
+    // Use amount_inr directly (after discount if applicable)
+    const baseAmt    = parseInt(plan.amount_inr) || Math.round((plan.price_monthly || 0) * USD_TO_INR);
+    const discPct    = parseInt(plan.discount_pct) || 0;
+    const amountINR  = discPct > 0 ? Math.round(baseAmt * (1 - discPct / 100)) : baseAmt;
 
     if (amountINR <= 0) {
       return res.status(400).json({ message: "Cannot create order for free plan" });
@@ -379,14 +386,23 @@ router.post("/billing/verify-payment", async (req, res) => {
     }
 
     // Get plan
-    const { rows: planRows } = await query("SELECT id::text, name::text, display_name, price_monthly, message_limit FROM plans WHERE id = $1::uuid", [plan_id]);
+    const { rows: planRows } = await query(
+      `SELECT id::text, name::text, display_name, price_monthly,
+              COALESCE(amount_inr, ROUND(price_monthly*84)) AS amount_inr,
+              COALESCE(discount_pct, 0) AS discount_pct,
+              message_limit
+       FROM plans WHERE id = $1::uuid`,
+      [plan_id]
+    );
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
     const plan = planRows[0];
 
     const now             = new Date();
     const billingCycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
     const invoiceNumber   = `INV-${Date.now().toString().slice(-8)}`;
-    const amountINR       = Math.round(plan.price_monthly * USD_TO_INR);
+    const baseAmt2  = parseInt(plan.amount_inr) || Math.round((plan.price_monthly || 0) * USD_TO_INR);
+    const discPct2  = parseInt(plan.discount_pct) || 0;
+    const amountINR = discPct2 > 0 ? Math.round(baseAmt2 * (1 - discPct2 / 100)) : baseAmt2;
 
     // Update payment record to paid
     await query(`

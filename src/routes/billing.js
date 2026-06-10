@@ -268,7 +268,7 @@ router.get("/billing/current", async (req, res) => {
       total_cost_ever:    totalCostEver,
       total_cost_inr:     Math.round(totalCostEver * 84),
     });
-    console.error("AI usage: " +res);
+    console.error("AI usage: " +tokensUsed + " Total: "+token_pct);
   } catch (err) {
     console.error("Billing current error:", err.message);
     res.status(500).json({ message: "Failed to load billing info" });

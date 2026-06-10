@@ -57,6 +57,110 @@ router.get("/plans/public", async (req, res) => {
 // All routes below require auth
 router.use(authMiddleware);
 
+// ── POST /billing/select-free-plan — activate free/trial plan ─
+router.post("/billing/select-free-plan", async (req, res) => {
+  try {
+    const { plan_id } = req.body;
+    const bId = req.user.business_id;
+
+    const { rows: planRows } = await query(
+      "SELECT * FROM plans WHERE id = $1 AND is_active = TRUE", [plan_id]
+    );
+    if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
+
+    const plan = planRows[0];
+
+    if (plan.price_monthly > 0 && (plan.trial_days === 0 || !plan.trial_days)) {
+      return res.status(400).json({ message: "Paid plans require payment. Use /billing/create-order instead." });
+    }
+
+    const now      = new Date();
+    const trialEnd = plan.trial_days > 0
+      ? new Date(now.getTime() + plan.trial_days * 24 * 60 * 60 * 1000)
+      : null;
+    const cycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const status   = plan.trial_days > 0 ? "trialing" : "active";
+
+    await query(`
+      INSERT INTO subscriptions
+        (business_id, plan_id, status, billing_cycle_start, billing_cycle_end,
+         trial_ends_at, messages_used, is_active)
+      VALUES ($1, $2, $3, $4, $5, $6, 0, TRUE)
+      ON CONFLICT (business_id) DO UPDATE SET
+        plan_id             = $2,
+        status              = $3,
+        billing_cycle_start = $4,
+        billing_cycle_end   = $5,
+        trial_ends_at       = $6,
+        messages_used       = 0,
+        is_active           = TRUE,
+        updated_at          = NOW()
+    `, [bId, plan.id, status, now, cycleEnd, trialEnd]);
+
+    // Mark onboarding complete
+    await query(
+      "UPDATE users SET onboarding_completed = TRUE, updated_at = NOW() WHERE id = $1",
+      [req.user.id]
+    ).catch(() => {});
+
+    console.log(`✅ Free/trial plan activated: ${plan.name} for business ${bId}`);
+    res.json({ success: true, status });
+  } catch (err) {
+    console.error("Free plan activation error:", err.message);
+    res.status(500).json({ message: "Failed to activate plan: " + err.message });
+  }
+});
+
+// ── POST /onboarding/select-plan — alias used by Onboarding.jsx ─
+router.post("/onboarding/select-plan", async (req, res) => {
+  try {
+    const { plan_id } = req.body;
+    const bId = req.user.business_id;
+
+    const { rows: planRows } = await query(
+      "SELECT * FROM plans WHERE id = $1 AND is_active = TRUE", [plan_id]
+    );
+    if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
+
+    const plan     = planRows[0];
+    const now      = new Date();
+    const trialEnd = plan.trial_days > 0
+      ? new Date(now.getTime() + plan.trial_days * 24 * 60 * 60 * 1000)
+      : null;
+    const cycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const status   = plan.price_monthly === 0
+      ? "active"
+      : plan.trial_days > 0 ? "trialing" : "active";
+
+    await query(`
+      INSERT INTO subscriptions
+        (business_id, plan_id, status, billing_cycle_start, billing_cycle_end,
+         trial_ends_at, messages_used, is_active)
+      VALUES ($1, $2, $3, $4, $5, $6, 0, TRUE)
+      ON CONFLICT (business_id) DO UPDATE SET
+        plan_id             = $2,
+        status              = $3,
+        billing_cycle_start = $4,
+        billing_cycle_end   = $5,
+        trial_ends_at       = $6,
+        messages_used       = 0,
+        is_active           = TRUE,
+        updated_at          = NOW()
+    `, [bId, plan.id, status, now, cycleEnd, trialEnd]);
+
+    await query(
+      "UPDATE users SET onboarding_completed = TRUE, updated_at = NOW() WHERE id = $1",
+      [req.user.id]
+    ).catch(() => {});
+
+    console.log(`✅ Onboarding plan selected: ${plan.name} for business ${bId}`);
+    res.json({ success: true, status, plan_name: plan.name });
+  } catch (err) {
+    console.error("Onboarding plan select error:", err.message);
+    res.status(500).json({ message: "Failed to select plan: " + err.message });
+  }
+});
+
 // ── GET /billing/current — current plan + subscription info ───
 router.get("/billing/current", async (req, res) => {
   try {

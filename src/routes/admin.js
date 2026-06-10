@@ -529,4 +529,128 @@ router.delete("/plans/:id", async (req, res) => {
   }
 });
 
+router.get("/support", async (req, res) => {
+  try {
+    const { page = 1, limit = 30, status, priority, search } = req.query;
+    const offset = (page - 1) * limit;
+    let sql = `
+      SELECT
+        t.*,
+        b.name        AS business_name,
+        u.owner_name  AS created_by_name,
+        u.email       AS owner_email,
+        a.name        AS assigned_to_name,
+        (SELECT COUNT(*) FROM support_ticket_comments c WHERE c.ticket_id = t.id)::int AS comment_count,
+        (SELECT COUNT(*) FROM support_ticket_attachments att WHERE att.ticket_id = t.id)::int AS attachment_count
+      FROM support_tickets t
+      JOIN businesses b ON b.id = t.business_id
+      LEFT JOIN users u  ON u.id = t.created_by AND u.role = 'owner'
+      LEFT JOIN admins a ON a.id = t.assigned_to
+      WHERE 1=1
+    `;
+    const params = [];
+    if (status)  { params.push(status);          sql += ` AND t.status   = $${params.length}`; }
+    if (priority){ params.push(priority);         sql += ` AND t.priority = $${params.length}`; }
+    if (search)  { params.push(`%${search}%`);   sql += ` AND (t.subject ILIKE $${params.length} OR b.name ILIKE $${params.length})`; }
+    const countSql = sql.replace(/SELECT[\s\S]+?FROM/, "SELECT COUNT(*) FROM");
+    sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, t.created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
+    params.push(limit, offset);
+ 
+    const [data, count] = await Promise.all([query(sql, params), query(countSql, params.slice(0, -2))]);
+    res.json({ tickets: data.rows, total: parseInt(count.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load tickets: " + err.message });
+  }
+});
+ 
+// ── GET /admin/support/:id ────────────────────────────────────────
+router.get("/support/:id", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT t.*, b.name AS business_name, u.owner_name AS created_by_name, u.email AS owner_email, a.name AS assigned_to_name
+      FROM support_tickets t
+      JOIN businesses b ON b.id = t.business_id
+      LEFT JOIN users u  ON u.id = t.created_by
+      LEFT JOIN admins a ON a.id = t.assigned_to
+      WHERE t.id = $1
+    `, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ message: "Ticket not found" });
+ 
+    const [comments, attachments, statusLog] = await Promise.all([
+      query(`SELECT * FROM support_ticket_comments WHERE ticket_id=$1 ORDER BY created_at ASC`, [req.params.id]),
+      query(`SELECT * FROM support_ticket_attachments WHERE ticket_id=$1 ORDER BY created_at ASC`, [req.params.id]),
+      query(`SELECT * FROM support_ticket_status_log WHERE ticket_id=$1 ORDER BY created_at ASC`, [req.params.id]),
+    ]);
+ 
+    res.json({ ticket: rows[0], comments: comments.rows, attachments: attachments.rows, statusLog: statusLog.rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load ticket: " + err.message });
+  }
+});
+ 
+// ── PATCH /admin/support/:id/status ──────────────────────────────
+router.patch("/support/:id/status", async (req, res) => {
+  try {
+    const { status, note } = req.body;
+    const VALID = ["open", "in_progress", "waiting", "resolved", "closed"];
+    if (!VALID.includes(status)) return res.status(400).json({ message: "Invalid status" });
+ 
+    const { rows: t } = await query("SELECT status FROM support_tickets WHERE id=$1", [req.params.id]);
+    if (!t.length) return res.status(404).json({ message: "Ticket not found" });
+ 
+    const updates = { status, updated_at: "NOW()" };
+    if (status === "resolved") {
+      await query(`UPDATE support_tickets SET status=$1, resolved_by=$2, resolved_at=NOW(), updated_at=NOW() WHERE id=$3`,
+        [status, req.admin.id, req.params.id]);
+    } else {
+      await query(`UPDATE support_tickets SET status=$1, updated_at=NOW() WHERE id=$2`, [status, req.params.id]);
+    }
+ 
+    await query(`
+      INSERT INTO support_ticket_status_log (ticket_id, changed_by, changer_type, changer_name, old_status, new_status, note)
+      VALUES ($1,$2,'admin',$3,$4,$5,$6)
+    `, [req.params.id, req.admin.id, req.admin.name || "Admin", t[0].status, status, note || null]);
+ 
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update status: " + err.message });
+  }
+});
+ 
+// ── POST /admin/support/:id/comments ─────────────────────────────
+router.post("/support/:id/comments", async (req, res) => {
+  try {
+    const { message, is_internal = false, attachments = [] } = req.body;
+    if (!message?.trim()) return res.status(400).json({ message: "Message required" });
+ 
+    const { rows } = await query(`
+      INSERT INTO support_ticket_comments (ticket_id, author_id, author_type, author_name, message, is_internal)
+      VALUES ($1,$2,'admin',$3,$4,$5) RETURNING id
+    `, [req.params.id, req.admin.id, req.admin.name || "Support Team", message.trim(), is_internal]);
+ 
+    for (const att of attachments) {
+      await query(`
+        INSERT INTO support_ticket_attachments (ticket_id, comment_id, uploaded_by, uploader_type, file_name, file_url, file_size, mime_type)
+        VALUES ($1,$2,$3,'admin',$4,$5,$6,$7)
+      `, [req.params.id, rows[0].id, req.admin.id, att.file_name, att.file_url, att.file_size || 0, att.mime_type || "application/octet-stream"]);
+    }
+ 
+    await query("UPDATE support_tickets SET updated_at=NOW() WHERE id=$1", [req.params.id]);
+    res.json({ success: true, id: rows[0].id });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to add comment: " + err.message });
+  }
+});
+ 
+// ── PATCH /admin/support/:id/assign ──────────────────────────────
+router.patch("/support/:id/assign", async (req, res) => {
+  try {
+    const { admin_id } = req.body;
+    await query("UPDATE support_tickets SET assigned_to=$1, updated_at=NOW() WHERE id=$2", [admin_id || null, req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to assign ticket: " + err.message });
+  }
+});
+
 export default router;

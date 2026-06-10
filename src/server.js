@@ -32,6 +32,7 @@ import billingRouter from "./routes/billing.js";
 import agentBehaviorRouter from "./routes/agentBehavior.js";
 import { startEscalationCron } from "./crons/escalationCron.js";
 import reportsRouter     from "./routes/reports.js";
+import supportRouter from './routes/support.js';
 
 
 
@@ -199,7 +200,7 @@ app.use("/api",        catalogRouter);
 app.use("/api",        shopifyOAuthRouter);
 app.use("/api", agentBehaviorRouter);
 app.use("/api",        reportsRouter);
-
+app.use("/api/support", supportRouter)
 
 // ── 404 Handler ───────────────────────────────────────────────
 app.use((req, res) => {

@@ -256,7 +256,7 @@ router.get("/billing/current", async (req, res) => {
       messages_used:      actualUsed,
       tokens_used:        tokensUsed,
       token_limit:        tokenLimit,
-      token_pct:          tokenPct,
+      token_pct:          totalTokensEver,
       // Per-feature this month
       agent_tokens:       parseInt(t.agent_tokens)    || 0,
       prompt_tokens:      parseInt(t.prompt_tokens)   || 0,

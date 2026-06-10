@@ -661,6 +661,12 @@ router.get("/businesses/:id/billing", async (req, res) => {
 
 // ── Admin Plans CRUD ──────────────────────────────────────────
 
+// ── ADD THESE ROUTES TO src/routes/admin.js ──────────────────
+// Paste BEFORE the `export default router;` line at the bottom
+// These routes are protected by the admin auth middleware already on the router
+
+// ── Admin Plans CRUD ──────────────────────────────────────────
+
 router.get("/plans", async (req, res) => {
   try {
     const { rows } = await query(`
@@ -725,15 +731,15 @@ router.put("/plans/:id", async (req, res) => {
 
     await query(`
       UPDATE plans SET
-        display_name  = COALESCE($1, display_name),
-        price_monthly = COALESCE($2, price_monthly),
-        amount_inr    = COALESCE($3, amount_inr),
-        discount_pct  = COALESCE($4, discount_pct),
-        offer_text    = COALESCE($5, offer_text),
-        token_limit   = COALESCE($6, token_limit),
-        message_limit = COALESCE($7, message_limit),
-        doc_limit     = COALESCE($8, doc_limit),
-        trial_days    = COALESCE($9, trial_days),
+        display_name  = COALESCE($1,  display_name),
+        price_monthly = COALESCE($2,  price_monthly),
+        amount_inr    = COALESCE($3,  amount_inr),
+        discount_pct  = COALESCE($4,  discount_pct),
+        offer_text    = COALESCE($5,  offer_text),
+        token_limit   = COALESCE($6,  token_limit),
+        message_limit = COALESCE($7,  message_limit),
+        doc_limit     = COALESCE($8,  doc_limit),
+        trial_days    = COALESCE($9,  trial_days),
         is_active     = COALESCE($10, is_active),
         updated_at    = NOW()
       WHERE id = $11::uuid
@@ -750,7 +756,6 @@ router.put("/plans/:id", async (req, res) => {
 
 router.delete("/plans/:id", async (req, res) => {
   try {
-    // Check if any active subscriptions use this plan
     const { rows: subs } = await query(
       "SELECT COUNT(*) AS cnt FROM subscriptions WHERE plan_id = $1::uuid AND is_active = TRUE",
       [req.params.id]
@@ -760,7 +765,6 @@ router.delete("/plans/:id", async (req, res) => {
         message: `Cannot delete — ${subs[0].cnt} active subscription(s) use this plan. Deactivate it instead.`
       });
     }
-
     await query("DELETE FROM plans WHERE id = $1::uuid", [req.params.id]);
     res.json({ success: true });
   } catch (err) {

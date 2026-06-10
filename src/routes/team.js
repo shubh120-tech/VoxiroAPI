@@ -516,4 +516,27 @@ router.post("/team/change-password", async (req, res) => {
   }
 });
 
+router.get("/me", async (req, res) => {
+  try {
+    if (req.user.type !== "team_member") {
+      return res.json({ permissions: null, type: "owner" });
+    }
+    const { rows } = await query(
+      `SELECT tm.permissions, tm.role, tm.status, tm.name, tm.email
+       FROM team_members tm WHERE tm.id = $1 AND tm.business_id = $2`,
+      [req.user.id, req.user.business_id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "Member not found" });
+ 
+    let permissions = rows[0].permissions || {};
+    if (typeof permissions === "string") {
+      try { permissions = JSON.parse(permissions); } catch { permissions = {}; }
+    }
+ 
+    res.json({ permissions, role: rows[0].role, status: rows[0].status });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch permissions: " + err.message });
+  }
+});
+
 export default router;

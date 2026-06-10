@@ -696,7 +696,7 @@ router.get("/plans", async (req, res) => {
     res.status(500).json({ message: "Failed to load plans: " + err.message });
   }
 });
- 
+
 router.post("/plans", async (req, res) => {
   try {
     const {
@@ -705,11 +705,11 @@ router.post("/plans", async (req, res) => {
       token_limit = 0, message_limit = 0, doc_limit = 10,
       trial_days = 0, is_active = true,
     } = req.body;
- 
+
     if (!name || !display_name) {
       return res.status(400).json({ message: "name and display_name are required" });
     }
- 
+
     const { rows } = await query(`
       INSERT INTO plans
         (name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
@@ -718,14 +718,14 @@ router.post("/plans", async (req, res) => {
       RETURNING id::text
     `, [name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
         token_limit, message_limit, doc_limit, trial_days, is_active]);
- 
+
     res.json({ success: true, id: rows[0].id });
   } catch (err) {
     console.error("Create plan error:", err.message);
     res.status(500).json({ message: "Failed to create plan: " + err.message });
   }
 });
- 
+
 router.put("/plans/:id", async (req, res) => {
   try {
     const {
@@ -734,52 +734,55 @@ router.put("/plans/:id", async (req, res) => {
       token_limit, message_limit, doc_limit,
       trial_days, is_active,
     } = req.body;
- 
+
     // Build SET clause only for fields that were sent
     const body = req.body;
     const sets = [];
     const vals = [];
     let i = 1;
- 
-    const fields = {
-      display_name:  body.display_name,
-      price_monthly: body.amount_inr != null ? body.amount_inr / 84 : body.price_monthly,
-      amount_inr:    body.amount_inr,
-      discount_pct:  body.discount_pct,
-      offer_text:    body.offer_text,
-      token_limit:   body.token_limit,
-      message_limit: body.message_limit,
-      doc_limit:     body.doc_limit,
-      trial_days:    body.trial_days,
-      is_active:     body.is_active,
-    };
- 
-    for (const [col, val] of Object.entries(fields)) {
-      if (val !== undefined) {
-        sets.push(`${col} = $${i++}`);
-        vals.push(val);
-      }
-    }
- 
-    if (sets.length === 0) {
-      return res.status(400).json({ message: "No fields to update" });
-    }
- 
-    sets.push(`updated_at = NOW()`);
-    vals.push(req.params.id);
- 
-    await query(
-      `UPDATE plans SET ${sets.join(", ")} WHERE id = $${i}::uuid`,
-      vals
-    );
- 
+
+    // Coerce types — token_limit may arrive as string from frontend
+    const amtInr     = parseInt(body.amount_inr)    || 0;
+    const discPct    = parseInt(body.discount_pct)  || 0;
+    const tokenLimit = parseInt(body.token_limit)   || 0;
+    const msgLimit   = parseInt(body.message_limit) || 0;
+    const docLimit   = parseInt(body.doc_limit)     || 5;
+    const trialDays  = parseInt(body.trial_days)    || 0;
+
+    await query(`
+      UPDATE plans SET
+        display_name  = $1,
+        amount_inr    = $2,
+        price_monthly = $3,
+        discount_pct  = $4,
+        offer_text    = $5,
+        token_limit   = $6,
+        message_limit = $7,
+        doc_limit     = $8,
+        trial_days    = $9,
+        is_active     = $10
+      WHERE id = $11::uuid
+    `, [
+      body.display_name,
+      amtInr,
+      amtInr / 84,
+      discPct,
+      body.offer_text || "",
+      tokenLimit,
+      msgLimit,
+      docLimit,
+      trialDays,
+      body.is_active ?? true,
+      req.params.id,
+    ]);
+
     res.json({ success: true });
   } catch (err) {
     console.error("Update plan error:", err.message);
     res.status(500).json({ message: "Failed to update plan: " + err.message });
   }
 });
- 
+
 router.delete("/plans/:id", async (req, res) => {
   try {
     // Check active subscriptions
@@ -792,19 +795,19 @@ router.delete("/plans/:id", async (req, res) => {
         message: `Cannot delete — ${subs[0].cnt} active subscription(s) use this plan. Deactivate it instead.`
       });
     }
- 
+
     // Null out businesses.plan_id FK before deleting
     await query(
       "UPDATE businesses SET plan_id = NULL WHERE plan_id = $1::uuid",
       [req.params.id]
     ).catch(() => {});
- 
+
     // Null out subscriptions FK (inactive ones)
     await query(
       "UPDATE subscriptions SET plan_id = NULL WHERE plan_id = $1::uuid",
       [req.params.id]
     ).catch(() => {});
- 
+
     await query("DELETE FROM plans WHERE id = $1::uuid", [req.params.id]);
     res.json({ success: true });
   } catch (err) {

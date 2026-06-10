@@ -40,12 +40,15 @@ router.get("/plans/public", async (req, res) => {
         price_monthly,
         message_limit,
         doc_limit,
-        COALESCE(token_limit, 0)  AS token_limit,
-        COALESCE(trial_days, 0)   AS trial_days,
+        COALESCE(token_limit, 0)                               AS token_limit,
+        COALESCE(trial_days, 0)                                AS trial_days,
+        COALESCE(amount_inr, ROUND(price_monthly * 84))        AS amount_inr,
+        COALESCE(discount_pct, 0)                              AS discount_pct,
+        COALESCE(offer_text, '')                               AS offer_text,
         is_active
       FROM plans
       WHERE is_active = TRUE
-      ORDER BY price_monthly ASC
+      ORDER BY COALESCE(amount_inr, price_monthly * 84) ASC
     `);
     res.json({ plans: rows });
   } catch (err) {

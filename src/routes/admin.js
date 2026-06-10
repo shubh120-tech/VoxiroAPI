@@ -562,4 +562,211 @@ router.get("/businesses/:id/billing", async (req, res) => {
   }
 });
 
+// ── AI Usage Analytics ────────────────────────────────────────
+
+router.get("/analytics/ai-usage", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT * FROM admin_ai_usage_summary
+      ORDER BY total_cost_usd DESC
+    `);
+    res.json({ businesses: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load AI usage: " + err.message });
+  }
+});
+
+router.get("/analytics/ai-usage/daily", async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days) || 30, 90);
+    const { rows } = await query(`
+      SELECT
+        DATE(created_at AT TIME ZONE 'Asia/Kolkata') AS date,
+        SUM(total_tokens)  AS total_tokens,
+        SUM(cost_usd)      AS cost_usd,
+        COUNT(*)           AS total_calls,
+        SUM(total_tokens) FILTER (WHERE feature = 'agent_reply')         AS agent_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'prompt_generation')   AS prompt_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'contact_extraction')  AS extraction_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'template_generation') AS template_tokens,
+        SUM(total_tokens) FILTER (WHERE feature = 'agent_training')      AS training_tokens
+      FROM ai_usage_logs
+      WHERE created_at >= NOW() - INTERVAL '1 day' * $1
+      GROUP BY DATE(created_at AT TIME ZONE 'Asia/Kolkata')
+      ORDER BY date DESC
+    `, [days]);
+    res.json({ daily: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load daily AI usage" });
+  }
+});
+
+router.get("/analytics/ai-usage/business/:id", async (req, res) => {
+  try {
+    const [summary, daily, byFeature] = await Promise.all([
+      query(`SELECT * FROM admin_ai_usage_summary WHERE business_id = $1`, [req.params.id]),
+      query(`
+        SELECT
+          DATE(created_at AT TIME ZONE 'Asia/Kolkata') AS date,
+          SUM(total_tokens) AS tokens,
+          SUM(cost_usd)     AS cost_usd,
+          COUNT(*)          AS calls
+        FROM ai_usage_logs
+        WHERE business_id = $1 AND created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(created_at AT TIME ZONE 'Asia/Kolkata')
+        ORDER BY date DESC
+      `, [req.params.id]),
+      query(`
+        SELECT
+          feature,
+          SUM(total_tokens) AS tokens,
+          SUM(cost_usd)     AS cost_usd,
+          COUNT(*)          AS calls,
+          ROUND(AVG(total_tokens)) AS avg_tokens_per_call
+        FROM ai_usage_logs
+        WHERE business_id = $1
+        GROUP BY feature
+        ORDER BY cost_usd DESC
+      `, [req.params.id]),
+    ]);
+    res.json({ summary: summary.rows[0] || {}, daily: daily.rows, byFeature: byFeature.rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load business AI usage" });
+  }
+});
+
+// ── Billing history per business ──────────────────────────────
+router.get("/businesses/:id/billing", async (req, res) => {
+  try {
+    const [sub, payments] = await Promise.all([
+      query(`
+        SELECT s.*, p.name AS plan_name, p.display_name AS plan_display_name,
+               p.price_monthly, p.message_limit
+        FROM subscriptions s
+        JOIN plans p ON p.id = s.plan_id
+        WHERE s.business_id = $1
+        ORDER BY s.created_at DESC LIMIT 1
+      `, [req.params.id]),
+      query(`
+        SELECT * FROM payments
+        WHERE business_id = $1
+        ORDER BY created_at DESC LIMIT 24
+      `, [req.params.id]).catch(() => ({ rows: [] })),
+    ]);
+    res.json({ subscription: sub.rows[0] || null, payments: payments.rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load billing: " + err.message });
+  }
+});
+
+// ── Admin Plans CRUD ──────────────────────────────────────────
+
+router.get("/plans", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT
+        id::text, name::text, display_name, is_active,
+        price_monthly,
+        COALESCE(amount_inr, ROUND(price_monthly * 84))  AS amount_inr,
+        COALESCE(discount_pct, 0)                         AS discount_pct,
+        COALESCE(offer_text, '')                          AS offer_text,
+        COALESCE(token_limit, 0)                          AS token_limit,
+        COALESCE(message_limit, 0)                        AS message_limit,
+        COALESCE(doc_limit, 5)                            AS doc_limit,
+        COALESCE(trial_days, 0)                           AS trial_days,
+        created_at
+      FROM plans
+      ORDER BY COALESCE(amount_inr, price_monthly * 84) ASC
+    `);
+    res.json({ plans: rows });
+  } catch (err) {
+    console.error("Admin plans fetch error:", err.message);
+    res.status(500).json({ message: "Failed to load plans: " + err.message });
+  }
+});
+
+router.post("/plans", async (req, res) => {
+  try {
+    const {
+      name, display_name, price_monthly = 0,
+      amount_inr = 0, discount_pct = 0, offer_text = "",
+      token_limit = 0, message_limit = 0, doc_limit = 10,
+      trial_days = 0, is_active = true,
+    } = req.body;
+
+    if (!name || !display_name) {
+      return res.status(400).json({ message: "name and display_name are required" });
+    }
+
+    const { rows } = await query(`
+      INSERT INTO plans
+        (name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
+         token_limit, message_limit, doc_limit, trial_days, is_active, created_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+      RETURNING id::text
+    `, [name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
+        token_limit, message_limit, doc_limit, trial_days, is_active]);
+
+    res.json({ success: true, id: rows[0].id });
+  } catch (err) {
+    console.error("Create plan error:", err.message);
+    res.status(500).json({ message: "Failed to create plan: " + err.message });
+  }
+});
+
+router.put("/plans/:id", async (req, res) => {
+  try {
+    const {
+      display_name, price_monthly,
+      amount_inr, discount_pct, offer_text,
+      token_limit, message_limit, doc_limit,
+      trial_days, is_active,
+    } = req.body;
+
+    await query(`
+      UPDATE plans SET
+        display_name  = COALESCE($1, display_name),
+        price_monthly = COALESCE($2, price_monthly),
+        amount_inr    = COALESCE($3, amount_inr),
+        discount_pct  = COALESCE($4, discount_pct),
+        offer_text    = COALESCE($5, offer_text),
+        token_limit   = COALESCE($6, token_limit),
+        message_limit = COALESCE($7, message_limit),
+        doc_limit     = COALESCE($8, doc_limit),
+        trial_days    = COALESCE($9, trial_days),
+        is_active     = COALESCE($10, is_active),
+        updated_at    = NOW()
+      WHERE id = $11::uuid
+    `, [display_name, price_monthly, amount_inr, discount_pct, offer_text,
+        token_limit, message_limit, doc_limit, trial_days, is_active,
+        req.params.id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Update plan error:", err.message);
+    res.status(500).json({ message: "Failed to update plan: " + err.message });
+  }
+});
+
+router.delete("/plans/:id", async (req, res) => {
+  try {
+    // Check if any active subscriptions use this plan
+    const { rows: subs } = await query(
+      "SELECT COUNT(*) AS cnt FROM subscriptions WHERE plan_id = $1::uuid AND is_active = TRUE",
+      [req.params.id]
+    );
+    if (parseInt(subs[0]?.cnt) > 0) {
+      return res.status(400).json({
+        message: `Cannot delete — ${subs[0].cnt} active subscription(s) use this plan. Deactivate it instead.`
+      });
+    }
+
+    await query("DELETE FROM plans WHERE id = $1::uuid", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete plan error:", err.message);
+    res.status(500).json({ message: "Failed to delete plan: " + err.message });
+  }
+});
+
 export default router;

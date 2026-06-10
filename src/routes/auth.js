@@ -54,17 +54,6 @@ router.post("/signup", async (req, res) => {
 
       const userId = userRows[0].id;
 
-      // 3. Seed starter plan
-      const { rows: planRows } = await client.query(
-        "SELECT id FROM plans WHERE name = 'starter'"
-      );
-
-      await client.query(
-        `INSERT INTO subscriptions (business_id, plan_id)
-         VALUES ($1, $2)`,
-        [businessId, planRows[0].id]
-      );
-
       // 4. Agent config
       await client.query(
         `INSERT INTO agent_configs (business_id, agent_name)

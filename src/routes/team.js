@@ -145,7 +145,7 @@ router.post("/team/login", async (req, res) => {
         type:        "team_member",
       },
       process.env.JWT_SECRET,
-      { expiresIn: "30d" }
+      { expiresIn: "24h" }
     );
 
     res.json({

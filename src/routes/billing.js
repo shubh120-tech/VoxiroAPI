@@ -36,18 +36,18 @@ router.get("/plans/public", async (req, res) => {
         id::text,
         name::text,
         display_name,
-        price_monthly,
+        price_inr,
         message_limit,
         doc_limit,
         COALESCE(token_limit, 0)                               AS token_limit,
         COALESCE(trial_days, 0)                                AS trial_days,
-        COALESCE(amount_inr, price_monthly)                     AS amount_inr,
+        COALESCE(amount_inr, price_inr)                     AS amount_inr,
         COALESCE(discount_pct, 0)                              AS discount_pct,
         COALESCE(offer_text, '')                               AS offer_text,
         is_active
       FROM plans
       WHERE is_active = TRUE
-      ORDER BY COALESCE(amount_inr, price_monthly) ASC
+      ORDER BY COALESCE(amount_inr, price_inr) ASC
     `);
     res.json({ plans: rows });
   } catch (err) {
@@ -72,8 +72,14 @@ router.post("/billing/select-free-plan", async (req, res) => {
 
     const plan = planRows[0];
 
-    if ((plan.amount_inr || plan.price_monthly || 0) > 0 && (plan.trial_days === 0 || !plan.trial_days)) {
-      return res.status(400).json({ message: "Paid plans require payment. Use /billing/create-order instead." });
+    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
+    const trialDays  = parseInt(plan.trial_days) || 0;
+    const isFree     = planAmt === 0;
+    const hasTrial   = trialDays > 0;
+
+    // Block if paid plan with no trial — must go through Razorpay
+    if (!isFree && !hasTrial) {
+      return res.status(400).json({ message: "This is a paid plan. Please complete payment to activate." });
     }
 
     const now      = new Date();
@@ -123,15 +129,23 @@ router.post("/onboarding/select-plan", async (req, res) => {
     );
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
 
-    const plan     = planRows[0];
+    const plan       = planRows[0];
+    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
+    const trialDays  = parseInt(plan.trial_days) || 0;
+    const isFree     = planAmt === 0;
+    const hasTrial   = trialDays > 0;
+
+    // Block paid plans with no trial — must pay via Razorpay
+    if (!isFree && !hasTrial) {
+      return res.status(400).json({ message: "This is a paid plan. Please complete payment to activate." });
+    }
+
     const now      = new Date();
-    const trialEnd = plan.trial_days > 0
-      ? new Date(now.getTime() + plan.trial_days * 24 * 60 * 60 * 1000)
+    const trialEnd = hasTrial
+      ? new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000)
       : null;
     const cycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const status   = (plan.amount_inr || plan.price_monthly || 0) === 0
-      ? "active"
-      : plan.trial_days > 0 ? "trialing" : "active";
+    const status   = isFree ? "active" : hasTrial ? "trialing" : "active";
 
     await query(`
       INSERT INTO subscriptions
@@ -161,6 +175,19 @@ router.post("/onboarding/select-plan", async (req, res) => {
   }
 });
 
+// ── POST /onboarding/complete — mark onboarding done ─────────
+router.post("/onboarding/complete", async (req, res) => {
+  try {
+    await query(
+      "UPDATE users SET onboarding_completed = TRUE, updated_at = NOW() WHERE id = $1",
+      [req.user.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to complete onboarding: " + err.message });
+  }
+});
+
 // ── GET /billing/current — current plan + subscription info ───
 router.get("/billing/current", async (req, res) => {
   try {
@@ -181,7 +208,7 @@ router.get("/billing/current", async (req, res) => {
              ELSE 'inactive' END AS status,
         p.name::text              AS plan_name,
         p.display_name            AS plan_display_name,
-        p.price_monthly,
+        p.price_inr,
         p.message_limit,
         p.doc_limit,
         COALESCE(p.token_limit, 0) AS token_limit,
@@ -308,7 +335,7 @@ router.post("/billing/create-order", async (req, res) => {
     // Validate plan
     const { rows: planRows } = await query(
       `SELECT id::text, name::text, display_name,
-              COALESCE(amount_inr, price_monthly) AS amount_inr,
+              COALESCE(amount_inr, price_inr) AS amount_inr,
               COALESCE(discount_pct, 0)           AS discount_pct,
               message_limit, doc_limit, COALESCE(trial_days,0) AS trial_days
        FROM plans WHERE id = $1::uuid AND is_active = TRUE`,
@@ -318,7 +345,7 @@ router.post("/billing/create-order", async (req, res) => {
 
     const plan      = planRows[0];
     // Use amount_inr directly (after discount if applicable)
-    const baseAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
+    const baseAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
     const discPct    = parseInt(plan.discount_pct) || 0;
     const amountINR  = discPct > 0 ? Math.round(baseAmt * (1 - discPct / 100)) : baseAmt;
 
@@ -413,7 +440,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     // Get plan
     const { rows: planRows } = await query(
       `SELECT id::text, name::text, display_name,
-              COALESCE(amount_inr, price_monthly) AS amount_inr,
+              COALESCE(amount_inr, price_inr) AS amount_inr,
               COALESCE(discount_pct, 0)           AS discount_pct,
               message_limit
        FROM plans WHERE id = $1::uuid`,
@@ -425,7 +452,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     const now             = new Date();
     const billingCycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
     const invoiceNumber   = `INV-${Date.now().toString().slice(-8)}`;
-    const baseAmt2  = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
+    const baseAmt2  = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
     const discPct2  = parseInt(plan.discount_pct) || 0;
     const amountINR = discPct2 > 0 ? Math.round(baseAmt2 * (1 - discPct2 / 100)) : baseAmt2;
 

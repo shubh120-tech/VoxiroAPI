@@ -85,19 +85,18 @@ router.post("/billing/select-free-plan", async (req, res) => {
 
     await query(`
       INSERT INTO subscriptions
-        (business_id, plan_id, status, billing_cycle_start, billing_cycle_end,
+        (business_id, plan_id, billing_cycle_start, billing_cycle_end,
          trial_ends_at, messages_used, is_active)
-      VALUES ($1, $2, $3, $4, $5, $6, 0, TRUE)
+      VALUES ($1, $2, $3, $4, $5, 0, TRUE)
       ON CONFLICT (business_id) DO UPDATE SET
         plan_id             = $2,
-        status              = $3,
-        billing_cycle_start = $4,
-        billing_cycle_end   = $5,
-        trial_ends_at       = $6,
+        billing_cycle_start = $3,
+        billing_cycle_end   = $4,
+        trial_ends_at       = $5,
         messages_used       = 0,
         is_active           = TRUE,
         updated_at          = NOW()
-    `, [bId, plan.id, status, now, cycleEnd, trialEnd]);
+    `, [bId, plan.id, now, cycleEnd, trialEnd]);
 
     // Mark onboarding complete
     await query(
@@ -136,19 +135,18 @@ router.post("/onboarding/select-plan", async (req, res) => {
 
     await query(`
       INSERT INTO subscriptions
-        (business_id, plan_id, status, billing_cycle_start, billing_cycle_end,
+        (business_id, plan_id, billing_cycle_start, billing_cycle_end,
          trial_ends_at, messages_used, is_active)
-      VALUES ($1, $2, $3, $4, $5, $6, 0, TRUE)
+      VALUES ($1, $2, $3, $4, $5, 0, TRUE)
       ON CONFLICT (business_id) DO UPDATE SET
         plan_id             = $2,
-        status              = $3,
-        billing_cycle_start = $4,
-        billing_cycle_end   = $5,
-        trial_ends_at       = $6,
+        billing_cycle_start = $3,
+        billing_cycle_end   = $4,
+        trial_ends_at       = $5,
         messages_used       = 0,
         is_active           = TRUE,
         updated_at          = NOW()
-    `, [bId, plan.id, status, now, cycleEnd, trialEnd]);
+    `, [bId, plan.id, now, cycleEnd, trialEnd]);
 
     await query(
       "UPDATE users SET onboarding_completed = TRUE, updated_at = NOW() WHERE id = $1",
@@ -201,24 +199,25 @@ router.get("/billing/current", async (req, res) => {
     `, [bId]);
 
     if (!subRows.length) {
+      // No subscription — return empty state
       return res.json({
-        plan_name: null,
+        plan_name:         null,
         plan_display_name: "No Plan",
-        status: "none",
-        messages_used: 0,
-        message_limit: 0,
+        status:            "none",
+        messages_used:     0,
+        message_limit:     0,
       });
     }
 
     const sub = subRows[0];
 
-    const [usageRes, tokenRes, allTimeRes] = await Promise.all([
+    // Get actual message usage + token usage this month
+    const [usageRows, tokenRows, allTimeRows] = await Promise.all([
       query(`
         SELECT COUNT(*) AS cnt FROM messages
         WHERE business_id = $1 AND role = 'agent'
           AND created_at >= date_trunc('month', NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'
       `, [bId]),
-
       query(`
         SELECT
           COALESCE(SUM(total_tokens), 0)                                              AS tokens_used,
@@ -232,76 +231,47 @@ router.get("/billing/current", async (req, res) => {
           AND created_at >= date_trunc('month', NOW())
       `, [bId]).catch(() => ({ rows: [{}] })),
 
+      // All-time total
       query(`
         SELECT
           COALESCE(SUM(total_tokens), 0) AS total_tokens_ever,
           COALESCE(SUM(cost_usd), 0)     AS total_cost_ever
         FROM ai_usage_logs
         WHERE business_id = $1
-      `, [bId]).catch(() => ({
-        rows: [{ total_tokens_ever: 0, total_cost_ever: 0 }]
-      })),
+      `, [bId]).catch(() => ({ rows: [{ total_tokens_ever: 0, total_cost_ever: 0 }] })),
     ]);
 
-    // ✅ FIXED: use .rows[0]
-    const actualUsed      = parseInt(usageRes.rows?.[0]?.cnt) || 0;
+    const actualUsed       = parseInt(usageRows[0]?.cnt)                 || 0;
+    const t                = tokenRows[0] || {};
+    const tokensUsed       = parseInt(t.tokens_used)                     || 0;
+    const tokenLimit       = parseInt(sub.token_limit)                   || 0;
+    const tokenPct         = tokenLimit > 0 ? Math.round((tokensUsed / tokenLimit) * 100) : 0;
+    const totalTokensEver  = parseInt(allTimeRows[0]?.total_tokens_ever) || 0;
+    const totalCostEver    = parseFloat(allTimeRows[0]?.total_cost_ever) || 0;
 
-    const t               = tokenRes.rows?.[0] || {};
-    const tokensUsed      = parseInt(t.tokens_used) || 0;
-    const tokenLimit      = parseInt(sub.token_limit) || 0;
-    const tokenPct        = tokenLimit > 0
-                              ? Math.round((tokensUsed / tokenLimit) * 100)
-                              : 0;
-
-    const totalTokensEver = parseInt(allTimeRes.rows?.[0]?.total_tokens_ever) || 0;
-    const totalCostEver   = parseFloat(allTimeRes.rows?.[0]?.total_cost_ever) || 0;
-
-    // ✅ Debug logs
-    console.log("tokensUsed:", tokensUsed, "tokenPct:", tokenPct);
-    console.log("token row:", t);
-
-    console.log("AI usage:", {
-      ...sub,
-      messages_used: actualUsed,
-      tokens_used: tokensUsed,
-      token_limit: tokenLimit,
-      token_pct: tokenPct,
-
-      agent_tokens: parseInt(t.agent_tokens) || 0,
-      prompt_tokens: parseInt(t.prompt_tokens) || 0,
-      training_tokens: parseInt(t.training_tokens) || 0,
-      template_tokens: parseInt(t.template_tokens) || 0,
-      insights_tokens: parseInt(t.insights_tokens) || 0,
-
-      total_tokens_ever: totalTokensEver,
-      total_cost_ever: totalCostEver,
-      total_cost_inr: Math.round(totalCostEver * 84),
-    });
-
-    // ✅ Response
     res.json({
       ...sub,
-      messages_used: actualUsed,
-      tokens_used: tokensUsed,
-      token_limit: tokenLimit,
-      token_pct: tokenPct,
-
-      agent_tokens: parseInt(t.agent_tokens) || 0,
-      prompt_tokens: parseInt(t.prompt_tokens) || 0,
-      training_tokens: parseInt(t.training_tokens) || 0,
-      template_tokens: parseInt(t.template_tokens) || 0,
-      insights_tokens: parseInt(t.insights_tokens) || 0,
-
-      total_tokens_ever: totalTokensEver,
-      total_cost_ever: totalCostEver,
-      total_cost_inr: Math.round(totalCostEver * 84),
+      messages_used:      actualUsed,
+      tokens_used:        tokensUsed,
+      token_limit:        tokenLimit,
+      token_pct:          tokenPct,
+      // Per-feature this month
+      agent_tokens:       parseInt(t.agent_tokens)    || 0,
+      prompt_tokens:      parseInt(t.prompt_tokens)   || 0,
+      training_tokens:    parseInt(t.training_tokens) || 0,
+      template_tokens:    parseInt(t.template_tokens) || 0,
+      insights_tokens:    parseInt(t.insights_tokens) || 0,
+      // All-time
+      total_tokens_ever:  totalTokensEver,
+      total_cost_ever:    totalCostEver,
+      total_cost_inr:     Math.round(totalCostEver * 84),
     });
-
   } catch (err) {
     console.error("Billing current error:", err.message);
     res.status(500).json({ message: "Failed to load billing info" });
   }
 });
+
 // ── GET /billing/payments — payment history ───────────────────
 router.get("/billing/payments", async (req, res) => {
   try {
@@ -462,7 +432,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     // Update payment record to paid
     await query(`
       UPDATE payment_history
-      SET status              = 'paid',
+      SET is_active           = TRUE,
           razorpay_payment_id = $1,
           razorpay_signature  = $2,
           invoice_number      = $3,
@@ -559,8 +529,8 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
       // Update payment record
       await query(`
         UPDATE payment_history
-        SET status = 'paid', razorpay_payment_id = $1, paid_at = NOW(), updated_at = NOW()
-        WHERE razorpay_order_id = $2 AND status = 'pending'
+        SET razorpay_payment_id = $1, paid_at = NOW(), is_active = TRUE, updated_at = NOW()
+        WHERE razorpay_order_id = $2
       `, [paymentId, orderId]);
 
       console.log(`✅ Webhook: payment captured ${paymentId}`);
@@ -569,7 +539,7 @@ router.post("/billing/webhook", express.raw({ type: "application/json" }), async
     if (event.event === "payment.failed" && payload) {
       await query(`
         UPDATE payment_history
-        SET status = 'failed', updated_at = NOW()
+        SET is_active = FALSE, updated_at = NOW()
         WHERE razorpay_order_id = $1
       `, [payload.order_id]);
 

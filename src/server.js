@@ -43,13 +43,26 @@ const PORT = process.env.PORT || 5000;
 app.set("trust proxy", 1);
 
 // ── CORS ──────────────────────────────────────────────────────
+const ALLOWED_ORIGINS = [
+  "https://yougant.com",
+  "https://www.yougant.com",
+  process.env.FRONTEND_URL,         // from env for staging/preview
+  process.env.NODE_ENV !== "production" ? "http://localhost:5173" : null,
+  process.env.NODE_ENV !== "production" ? "http://localhost:3000" : null,
+].filter(Boolean);
+ 
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  }
   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  res.header("Vary", "Origin");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
+ 
 
 // ── Security ──────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: false }));

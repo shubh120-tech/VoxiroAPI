@@ -191,7 +191,7 @@ router.get("/businesses/:id", async (req, res) => {
       FROM admin_business_usage bv
       JOIN users u ON u.business_id = bv.business_id AND u.role = 'owner'
       LEFT JOIN agent_configs ac ON ac.business_id = bv.business_id
-	    sLEFT JOIN Businesses b ON b.id = bv.business_id
+	    LEFT JOIN Businesses b ON b.id = bv.business_id
       LEFT JOIN whatsapp_configs wc ON wc.business_id = bv.business_id
       WHERE bv.business_id = $1
     `, [req.params.id]);

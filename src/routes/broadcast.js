@@ -516,7 +516,9 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
     // Body component
     const bodyComponent = { type: "BODY", text: metaBody };
     if (varNames.length > 0) {
-      bodyComponent.example = { body_text: [varNames.map((_, i) => `example_${i + 1}`)] };
+      bodyComponent.example = { 
+      body_text: varNames.map((_, i) => `example_${i + 1}`) 
+      };
     }
     components.push(bodyComponent);
 
@@ -527,7 +529,7 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
     const metaName = sanitizeTemplateName(template.name);
     const metaRes  = await axios.post(
       `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
-      { name: metaName, category: template.category || "MARKETING", language: template.language || "en", components },
+      { name: metaName, category: template.category || "MARKETING", language: template.language || "en_US", components },
       { headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" } }
     );
 

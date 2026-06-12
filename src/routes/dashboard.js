@@ -8,13 +8,13 @@ const router = express.Router();
 router.get("/plans/public", async (req, res) => {
   try {
     const { rows } = await query(`
-      SELECT id, name, display_name, price_monthly,
+      SELECT id, name, display_name, price_inr,
              message_limit, doc_limit,
              COALESCE(trial_days, 0) AS trial_days,
              features
       FROM plans
       WHERE is_active = TRUE
-      ORDER BY price_monthly ASC
+      ORDER BY price_inr ASC
     `);
     res.json({ plans: rows });
   } catch (err) {
@@ -660,7 +660,7 @@ router.get("/settings", async (req, res) => {
     let billing = {};
     try {
       const sub = await query(`
-        SELECT s.*, p.name AS plan_name, p.price_monthly, p.message_limit
+        SELECT s.*, p.name AS plan_name, p.price_inr, p.message_limit
         FROM subscriptions s
         JOIN plans p ON p.id = s.plan_id
         WHERE s.business_id = $1
@@ -670,7 +670,7 @@ router.get("/settings", async (req, res) => {
     } catch {
       try {
         const plan = await query(`
-          SELECT p.name AS plan_name, p.price_monthly, p.message_limit
+          SELECT p.name AS plan_name, p.price_inr, p.message_limit
           FROM businesses b
           JOIN plans p ON p.id = b.plan_id
           WHERE b.id = $1

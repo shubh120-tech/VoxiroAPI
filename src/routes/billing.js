@@ -72,7 +72,7 @@ router.post("/billing/select-free-plan", async (req, res) => {
 
     const plan = planRows[0];
 
-    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
+    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
     const trialDays  = parseInt(plan.trial_days) || 0;
     const isFree     = planAmt === 0;
     const hasTrial   = trialDays > 0;
@@ -130,7 +130,7 @@ router.post("/onboarding/select-plan", async (req, res) => {
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
 
     const plan       = planRows[0];
-    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
+    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
     const trialDays  = parseInt(plan.trial_days) || 0;
     const isFree     = planAmt === 0;
     const hasTrial   = trialDays > 0;
@@ -440,7 +440,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     // Get plan
     const { rows: planRows } = await query(
       `SELECT id::text, name::text, display_name,
-              COALESCE(amount_inr, price_monthly) AS amount_inr,
+              COALESCE(amount_inr, price_inr) AS amount_inr,
               COALESCE(discount_pct, 0)           AS discount_pct,
               message_limit
        FROM plans WHERE id = $1::uuid`,
@@ -452,7 +452,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     const now             = new Date();
     const billingCycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
     const invoiceNumber   = `INV-${Date.now().toString().slice(-8)}`;
-    const baseAmt2  = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
+    const baseAmt2  = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
     const discPct2  = parseInt(plan.discount_pct) || 0;
     const amountINR = discPct2 > 0 ? Math.round(baseAmt2 * (1 - discPct2 / 100)) : baseAmt2;
 

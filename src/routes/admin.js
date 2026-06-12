@@ -55,7 +55,7 @@ router.get("/analytics/overview", async (req, res) => {
         COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW())) AS messages_this_month
         FROM messages`),
       query(`SELECT COUNT(*) AS total_leads FROM leads WHERE created_at >= date_trunc('month', NOW())`),
-      query(`SELECT COALESCE(SUM(COALESCE(p.amount_inr, p.price_monthly)), 0) AS monthly_revenue
+      query(`SELECT COALESCE(SUM(COALESCE(p.amount_inr, p.price_inr)), 0) AS monthly_revenue
              FROM businesses b JOIN plans p ON p.id = b.plan_id WHERE b.is_active = TRUE`),
     ]);
 
@@ -356,7 +356,7 @@ router.get("/businesses/:id/billing", async (req, res) => {
     const [sub, payments] = await Promise.all([
       query(`
         SELECT s.*, p.name AS plan_name, p.display_name AS plan_display_name,
-               COALESCE(p.amount_inr, p.price_monthly) AS amount_inr, p.message_limit
+               COALESCE(p.amount_inr, p.price_inr) AS amount_inr, p.message_limit
         FROM subscriptions s JOIN plans p ON p.id = s.plan_id
         WHERE s.business_id = $1 ORDER BY s.created_at DESC LIMIT 1
       `, [req.params.id]),

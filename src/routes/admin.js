@@ -186,11 +186,12 @@ router.get("/businesses/:id", async (req, res) => {
   try {
     const { rows } = await query(`
       SELECT bv.*, u.owner_name, u.email,
-             ac.tone, ac.language, ac.agent_name,
+             ac.tone, ac.language, ac.agent_name, b.phone,
              wc.whatsapp_number, wc.is_verified AS whatsapp_verified
       FROM admin_business_usage bv
       JOIN users u ON u.business_id = bv.business_id AND u.role = 'owner'
       LEFT JOIN agent_configs ac ON ac.business_id = bv.business_id
+	    sLEFT JOIN Businesses b ON b.id = bv.business_id
       LEFT JOIN whatsapp_configs wc ON wc.business_id = bv.business_id
       WHERE bv.business_id = $1
     `, [req.params.id]);

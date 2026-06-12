@@ -457,217 +457,93 @@ router.post("/broadcast/templates/:id/sync", async (req, res) => {
 // ── Submit template to Meta (handles text, image, video headers) ──
 router.post("/broadcast/templates/:id/submit", async (req, res) => {
   try {
-    const { rows: tRows } = await query(
-      "SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",
-      [req.params.id, bId(req)]
-    );
-    if (!tRows.length) {
-      return res.status(404).json({ message: "Template not found" });
-    }
-
+    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
+    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
     const template = tRows[0];
 
-    const { rows: wc } = await query(
-      "SELECT * FROM whatsapp_configs WHERE business_id=$1",
-      [bId(req)]
-    );
+    const { rows: wc } = await query("SELECT * FROM whatsapp_configs WHERE business_id=$1", [bId(req)]);
+    if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
+    const { access_token, waba_id, phone_number_id } = wc[0];
+    if (!access_token) return res.status(400).json({ message: "Access token missing" });
 
-    if (!wc.length) {
-      return res.status(400).json({ message: "WhatsApp not configured" });
-    }
-
-    const { access_token, waba_id } = wc[0];
-
-    if (!access_token) {
-      return res.status(400).json({ message: "Access token missing" });
-    }
-
-    // ✅ Resolve WABA ID
+    // Resolve WABA ID if missing
     let finalWabaId = waba_id;
-
     if (!finalWabaId) {
       try {
-        const wabaRes = await axios.get(
-          `${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`,
-          { headers: { Authorization: `Bearer ${access_token}` } }
-        );
-
+        const wabaRes = await axios.get(`${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`, { headers: { Authorization: `Bearer ${access_token}` } });
         finalWabaId = wabaRes.data?.data?.[0]?.id;
-
-        if (finalWabaId) {
-          await query(
-            "UPDATE whatsapp_configs SET waba_id=$1 WHERE business_id=$2",
-            [finalWabaId, bId(req)]
-          );
-        }
-      } catch (err) {
-        console.warn("Could not fetch WABA ID:", err.message);
-      }
+        if (finalWabaId) await query("UPDATE whatsapp_configs SET waba_id=$1 WHERE business_id=$2", [finalWabaId, bId(req)]);
+      } catch (err) { console.warn("Could not fetch WABA ID:", err.message); }
     }
+    if (!finalWabaId) return res.status(400).json({ message: "WABA ID not found. Please re-save WhatsApp credentials." });
 
-    if (!finalWabaId) {
-      return res.status(400).json({
-        message: "WABA ID not found. Please re-save WhatsApp credentials."
-      });
-    }
+    // Convert named vars ({{name}}) → numbered ({{1}}) for Meta
+    const varNames  = [];
+    const metaBody  = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
+      if (/^\d+$/.test(name)) { if (!varNames.includes(name)) varNames.push(name); return match; }
+      if (!varNames.includes(name)) varNames.push(name);
+      return `{{${varNames.indexOf(name) + 1}}}`;
+    });
 
-    // ✅ Convert named variables → numbered
-    const varNames = [];
-
-    const metaBody = (template.body || "").replace(
-      /\{\{(\w+)\}\}/g,
-      (match, name) => {
-        if (/^\d+$/.test(name)) {
-          if (!varNames.includes(name)) varNames.push(name);
-          return match;
-        }
-        if (!varNames.includes(name)) varNames.push(name);
-        return `{{${varNames.indexOf(name) + 1}}}`;
-      }
-    );
-
-    // ✅ Clean body (Meta strict validation)
-    const cleanBody = metaBody
-      .replace(/—/g, "-")
-      .replace(/₹/g, "Rs.")
-      .replace(/[🎯⏰💬]/g, "");
-
+    // ── Build components array ────────────────────────────────
     const components = [];
+    const headerType = template.header_type || (template.header_text ? "text" : "none");
 
-    const headerType =
-      template.header_type || (template.header_text ? "text" : "none");
-
-    // ✅ HEADER FIX (IMPORTANT)
     if (headerType === "image" && template.header_media_url) {
+      // Image header — Meta needs a public URL to fetch during review
       components.push({
-        type: "HEADER",
-        format: "IMAGE",
-        example: {
-          header_url: [template.header_media_url] // ✅ FIXED (was header_handle ❌)
-        }
+        type:    "HEADER",
+        format:  "IMAGE",
+        example: { header_handle: [template.header_media_url] },
       });
     } else if (headerType === "video" && template.header_media_url) {
+      // Video header
       components.push({
-        type: "HEADER",
-        format: "VIDEO",
-        example: {
-          header_url: [template.header_media_url]
-        }
+        type:    "HEADER",
+        format:  "VIDEO",
+        example: { header_handle: [template.header_media_url] },
       });
     } else if (headerType === "text" && template.header_text) {
-      const metaHeaderText = template.header_text.replace(
-        /\{\{(\w+)\}\}/g,
-        (match, name) => {
-          if (/^\d+$/.test(name)) return match;
-          if (!varNames.includes(name)) varNames.push(name);
-          return `{{${varNames.indexOf(name) + 1}}}`;
-        }
-      );
-
-      // ✅ ALWAYS include example (Meta strict)
-      components.push({
-        type: "HEADER",
-        format: "TEXT",
-        text: metaHeaderText,
-        example: {
-          header_text: ["Sample Header"]
-        }
+      // Text header — convert named vars too
+      const metaHeaderText = template.header_text.replace(/\{\{(\w+)\}\}/g, (match, name) => {
+        if (/^\d+$/.test(name)) return match;
+        if (!varNames.includes(name)) varNames.push(name);
+        return `{{${varNames.indexOf(name) + 1}}}`;
       });
+      components.push({ type: "HEADER", format: "TEXT", text: metaHeaderText });
     }
 
-    // ✅ BODY
-    const bodyComponent = {
-      type: "BODY",
-      text: cleanBody
-    };
-
+    // Body component
+    const bodyComponent = { type: "BODY", text: metaBody };
     if (varNames.length > 0) {
-      bodyComponent.example = {
-        body_text: varNames.map((_, i) => `example_${i + 1}`) // ✅ FIXED
-      };
+      bodyComponent.example = { body_text: [varNames.map((_, i) => `example_${i + 1}`)] };
     }
-
     components.push(bodyComponent);
 
-    // ✅ FOOTER
     if (template.footer_text) {
-      components.push({
-        type: "FOOTER",
-        text: template.footer_text.replace("unsubscribe", "opt out") // safer
-      });
+      components.push({ type: "FOOTER", text: template.footer_text });
     }
 
-    // ✅ FORCE VALID LANGUAGE
-    const language =
-      template.language === "en"
-        ? "en_US"
-        : template.language || "en_US";
-
     const metaName = sanitizeTemplateName(template.name);
-
-    const payload = {
-      name: metaName,
-      category: template.category || "MARKETING",
-      language,
-      components
-    };
-
-    // 🔍 Debug (VERY useful)
-    console.log("FINAL PAYLOAD:");
-    console.log(JSON.stringify(payload, null, 2));
-
-    const metaRes = await axios.post(
+    const metaRes  = await axios.post(
       `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${access_token}`,
-          "Content-Type": "application/json"
-        }
-      }
+      { name: metaName, category: template.category || "MARKETING", language: template.language || "en_US", components },
+      { headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" } }
     );
 
     await query(
-      `UPDATE whatsapp_templates 
-       SET meta_status='pending', meta_template_id=$1, name=$2, variables=$3, updated_at=NOW() 
-       WHERE id=$4`,
-      [
-        metaRes.data?.id?.toString(),
-        metaName,
-        JSON.stringify(varNames),
-        req.params.id
-      ]
+      `UPDATE whatsapp_templates SET meta_status='pending', meta_template_id=$1, name=$2, variables=$3, updated_at=NOW() WHERE id=$4`,
+      [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]
     );
 
-    res.json({
-      success: true,
-      metaTemplateId: metaRes.data?.id
-    });
+    res.json({ success: true, metaTemplateId: metaRes.data?.id });
   } catch (err) {
-    console.log("META ERROR:", JSON.stringify(err.response?.data, null, 2));
-
-    const errMsg =
-      err.response?.data?.error?.message || err.message;
-    const errCode =
-      err.response?.data?.error?.code;
-
+    const errMsg  = err.response?.data?.error?.message || err.message;
+    const errCode = err.response?.data?.error?.code;
     let userMessage = errMsg;
-
-    if (errCode === 100) {
-      userMessage =
-        "Invalid template format. Please check variables, examples, and content.";
-    }
-
-    if (errCode === 190) {
-      userMessage =
-        "Access token expired. Please update your WhatsApp token.";
-    }
-
-    if (errCode === 200) {
-      userMessage =
-        "Permission denied. Ensure whatsapp_business_management permission.";
-    }
-
+    if (errCode === 100) userMessage = "Invalid template format. Check your template body and variables.";
+    if (errCode === 190) userMessage = "Access token expired. Please update your WhatsApp token in Settings.";
+    if (errCode === 200) userMessage = "Permission denied. Make sure your token has whatsapp_business_management permission.";
     res.status(500).json({ message: userMessage });
   }
 });

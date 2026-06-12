@@ -1300,8 +1300,8 @@ router.post("/follow-ups", async (req, res) => {
     if (!customer_phone?.trim()) return res.status(400).json({ message: "Customer phone required" });
     if (!message?.trim())        return res.status(400).json({ message: "Message required" });
     const { rows } = await query(`
-      INSERT INTO follow_ups (business_id, customer_phone, message, scheduled_at, status, created_at)
-      VALUES ($1,$2,$3,$4,'pending',NOW()) RETURNING id`,
+      INSERT INTO follow_ups (business_id, customer_phone, message, scheduled_at, sent, created_at)
+      VALUES ($1,$2,$3,$4,false,NOW()) RETURNING id`,
       [req.user.business_id, customer_phone, message, scheduled_at || null]
     );
     res.json({ success: true, id: rows[0].id });
@@ -1313,9 +1313,9 @@ router.put("/follow-ups/:id", async (req, res) => {
   try {
     const { customer_phone, message, scheduled_at, status } = req.body;
     await query(`
-      UPDATE follow_ups SET customer_phone=$1, message=$2, scheduled_at=$3, status=$4
+      UPDATE follow_ups SET customer_phone=$1, message=$2, scheduled_at=$3, sent=$4
       WHERE id=$5 AND business_id=$6`,
-      [customer_phone, message, scheduled_at||null, status||"pending", req.params.id, req.user.business_id]
+      [customer_phone, message, scheduled_at||null, status||true, req.params.id, req.user.business_id]
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -1325,7 +1325,7 @@ router.put("/follow-ups/:id", async (req, res) => {
 router.patch("/follow-ups/:id/cancel", async (req, res) => {
   try {
     await query(
-      "UPDATE follow_ups SET status='cancelled' WHERE id=$1 AND business_id=$2 AND status='pending'",
+      "UPDATE follow_ups SET reason='cancelled' WHERE id=$1 AND business_id=$2 AND send=false",
       [req.params.id, req.user.business_id]
     );
     res.json({ success: true });

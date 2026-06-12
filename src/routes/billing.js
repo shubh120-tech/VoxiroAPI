@@ -466,7 +466,8 @@ router.post("/billing/verify-payment", async (req, res) => {
           paid_at             = NOW(),
           period_start        = NOW(),
           period_end          = $4,
-          updated_at          = NOW()
+          updated_at          = NOW(),
+          status              = 'paid'
       WHERE razorpay_order_id = $5 AND business_id = $6::uuid
     `, [
       razorpay_payment_id,

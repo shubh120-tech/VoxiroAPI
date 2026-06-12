@@ -640,4 +640,71 @@ router.delete("/plans/:id", async (req, res) => {
   }
 });
 
+// ── Admin Team Management ────────────────────────────────────
+router.get("/team", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT id, name, email, role, is_active, last_login_at, created_at,
+             COALESCE(permissions, '[]'::jsonb) AS permissions
+      FROM admins
+      ORDER BY created_at DESC
+    `);
+    res.json({ admins: rows });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load admin team: " + err.message });
+  }
+});
+
+router.post("/team", async (req, res) => {
+  try {
+    const { name, email, password, role = "support", permissions = [] } = req.body;
+    if (!name || !email || !password) return res.status(400).json({ message: "Name, email and password required" });
+    if (password.length < 8) return res.status(400).json({ message: "Password must be at least 8 characters" });
+
+    const bcrypt = await import("bcrypt");
+    const hash   = await bcrypt.default.hash(password, 10);
+
+    const { rows } = await query(`
+      INSERT INTO admins (name, email, password_hash, role, is_active, permissions, created_at)
+      VALUES ($1, $2, $3, $4, TRUE, $5::jsonb, NOW())
+      RETURNING id
+    `, [name, email, hash, role, JSON.stringify(permissions)]);
+
+    await query(`INSERT INTO admin_audit_logs (admin_id, action, target_type, target_id, details) VALUES ($1,'create_admin','admin',$2,$3)`,
+      [req.admin.id, rows[0].id, JSON.stringify({ name, email, role })]).catch(() => {});
+
+    res.json({ success: true, id: rows[0].id });
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ message: "Email already exists" });
+    res.status(500).json({ message: "Failed to create admin: " + err.message });
+  }
+});
+
+router.put("/team/:id", async (req, res) => {
+  try {
+    const { role, permissions, is_active } = req.body;
+    await query(`
+      UPDATE admins SET role=$1, permissions=$2::jsonb, is_active=$3, updated_at=NOW()
+      WHERE id=$4
+    `, [role, JSON.stringify(permissions || []), is_active ?? true, req.params.id]);
+
+    await query(`INSERT INTO admin_audit_logs (admin_id,action,target_type,target_id,details) VALUES ($1,'update_admin','admin',$2,$3)`,
+      [req.admin.id, req.params.id, JSON.stringify({ role, is_active })]).catch(() => {});
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update admin: " + err.message });
+  }
+});
+
+router.patch("/team/:id/toggle", async (req, res) => {
+  try {
+    const { is_active } = req.body;
+    await query("UPDATE admins SET is_active=$1, updated_at=NOW() WHERE id=$2", [is_active, req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to toggle admin: " + err.message });
+  }
+});
+
 export default router;

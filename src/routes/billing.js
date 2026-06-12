@@ -36,18 +36,18 @@ router.get("/plans/public", async (req, res) => {
         id::text,
         name::text,
         display_name,
-        price_inr,
+        price_monthly,
         message_limit,
         doc_limit,
         COALESCE(token_limit, 0)                               AS token_limit,
         COALESCE(trial_days, 0)                                AS trial_days,
-        COALESCE(amount_inr, price_inr)                     AS amount_inr,
+        COALESCE(amount_inr, price_monthly)                     AS amount_inr,
         COALESCE(discount_pct, 0)                              AS discount_pct,
         COALESCE(offer_text, '')                               AS offer_text,
         is_active
       FROM plans
       WHERE is_active = TRUE
-      ORDER BY COALESCE(amount_inr, price_inr) ASC
+      ORDER BY COALESCE(amount_inr, price_monthly) ASC
     `);
     res.json({ plans: rows });
   } catch (err) {
@@ -72,7 +72,7 @@ router.post("/billing/select-free-plan", async (req, res) => {
 
     const plan = planRows[0];
 
-    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
+    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
     const trialDays  = parseInt(plan.trial_days) || 0;
     const isFree     = planAmt === 0;
     const hasTrial   = trialDays > 0;
@@ -130,7 +130,7 @@ router.post("/onboarding/select-plan", async (req, res) => {
     if (!planRows.length) return res.status(404).json({ message: "Plan not found" });
 
     const plan       = planRows[0];
-    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
+    const planAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
     const trialDays  = parseInt(plan.trial_days) || 0;
     const isFree     = planAmt === 0;
     const hasTrial   = trialDays > 0;
@@ -208,7 +208,7 @@ router.get("/billing/current", async (req, res) => {
              ELSE 'inactive' END AS status,
         p.name::text              AS plan_name,
         p.display_name            AS plan_display_name,
-        p.price_inr,
+        p.price_monthly,
         p.message_limit,
         p.doc_limit,
         COALESCE(p.token_limit, 0) AS token_limit,
@@ -335,7 +335,7 @@ router.post("/billing/create-order", async (req, res) => {
     // Validate plan
     const { rows: planRows } = await query(
       `SELECT id::text, name::text, display_name,
-              COALESCE(amount_inr, price_inr) AS amount_inr,
+              COALESCE(amount_inr, price_monthly) AS amount_inr,
               COALESCE(discount_pct, 0)           AS discount_pct,
               message_limit, doc_limit, COALESCE(trial_days,0) AS trial_days
        FROM plans WHERE id = $1::uuid AND is_active = TRUE`,
@@ -345,7 +345,7 @@ router.post("/billing/create-order", async (req, res) => {
 
     const plan      = planRows[0];
     // Use amount_inr directly (after discount if applicable)
-    const baseAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
+    const baseAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
     const discPct    = parseInt(plan.discount_pct) || 0;
     const amountINR  = discPct > 0 ? Math.round(baseAmt * (1 - discPct / 100)) : baseAmt;
 
@@ -440,7 +440,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     // Get plan
     const { rows: planRows } = await query(
       `SELECT id::text, name::text, display_name,
-              COALESCE(amount_inr, price_inr) AS amount_inr,
+              COALESCE(amount_inr, price_monthly) AS amount_inr,
               COALESCE(discount_pct, 0)           AS discount_pct,
               message_limit
        FROM plans WHERE id = $1::uuid`,
@@ -452,7 +452,7 @@ router.post("/billing/verify-payment", async (req, res) => {
     const now             = new Date();
     const billingCycleEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
     const invoiceNumber   = `INV-${Date.now().toString().slice(-8)}`;
-    const baseAmt2  = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
+    const baseAmt2  = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
     const discPct2  = parseInt(plan.discount_pct) || 0;
     const amountINR = discPct2 > 0 ? Math.round(baseAmt2 * (1 - discPct2 / 100)) : baseAmt2;
 

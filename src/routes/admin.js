@@ -542,8 +542,8 @@ router.get("/plans", async (req, res) => {
     const { rows } = await query(`
       SELECT
         id::text, name::text, display_name, is_active,
-        price_monthly,
-        COALESCE(amount_inr, price_monthly)  AS amount_inr,
+        price_inr,
+        COALESCE(amount_inr, price_inr)  AS amount_inr,
         COALESCE(discount_pct, 0)            AS discount_pct,
         COALESCE(offer_text, '')             AS offer_text,
         COALESCE(token_limit, 0)             AS token_limit,
@@ -552,7 +552,7 @@ router.get("/plans", async (req, res) => {
         COALESCE(trial_days, 0)              AS trial_days,
         created_at
       FROM plans
-      ORDER BY COALESCE(amount_inr, price_monthly) ASC
+      ORDER BY COALESCE(amount_inr, price_inr) ASC
     `);
     res.json({ plans: rows });
   } catch (err) {
@@ -567,7 +567,7 @@ router.post("/plans", async (req, res) => {
     if (!name || !display_name) return res.status(400).json({ message: "name and display_name are required" });
     const amt = parseInt(amount_inr) || 0;
     const { rows } = await query(`
-      INSERT INTO plans (name, display_name, price_monthly, amount_inr, discount_pct, offer_text,
+      INSERT INTO plans (name, display_name, price_inr, amount_inr, discount_pct, offer_text,
                          token_limit, message_limit, doc_limit, trial_days, is_active, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW()) RETURNING id::text
     `, [name, display_name, amt, amt,
@@ -591,7 +591,7 @@ router.put("/plans/:id", async (req, res) => {
       UPDATE plans SET
         display_name  = $1,
         amount_inr    = $2,
-        price_monthly = $3,
+        price_inr = $3,
         discount_pct  = $4,
         offer_text    = $5,
         token_limit   = $6,

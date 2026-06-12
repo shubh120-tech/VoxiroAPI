@@ -335,7 +335,7 @@ router.post("/billing/create-order", async (req, res) => {
     // Validate plan
     const { rows: planRows } = await query(
       `SELECT id::text, name::text, display_name,
-              COALESCE(amount_inr, price_monthly) AS amount_inr,
+              COALESCE(amount_inr, price_inr) AS amount_inr,
               COALESCE(discount_pct, 0)           AS discount_pct,
               message_limit, doc_limit, COALESCE(trial_days,0) AS trial_days
        FROM plans WHERE id = $1::uuid AND is_active = TRUE`,
@@ -345,7 +345,7 @@ router.post("/billing/create-order", async (req, res) => {
 
     const plan      = planRows[0];
     // Use amount_inr directly (after discount if applicable)
-    const baseAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_monthly) || 0;
+    const baseAmt    = parseInt(plan.amount_inr) || parseInt(plan.price_inr) || 0;
     const discPct    = parseInt(plan.discount_pct) || 0;
     const amountINR  = discPct > 0 ? Math.round(baseAmt * (1 - discPct / 100)) : baseAmt;
 

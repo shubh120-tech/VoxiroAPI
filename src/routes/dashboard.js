@@ -814,7 +814,7 @@ router.delete("/knowledge/:id", async (req, res) => {
 });
 
 // ── Follow-ups ───────────────────────────────────────────────
-router.get("/followups", async (req, res) => {
+router.get("/follow-ups", async (req, res) => {
   try {
     const isTeam = req.user.type === "team_member";
 

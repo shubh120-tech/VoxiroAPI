@@ -421,6 +421,35 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
     }
     if (!finalWabaId) return res.status(400).json({ message:"WABA ID not found. Re-save WhatsApp credentials in Settings." });
 
+    // Quick upfront check: image/video header requires META_APP_ID
+    const headerType = (template.header_type || "none").toLowerCase();
+    if ((headerType === "image" || headerType === "video") && template.header_media_url && !template.header_media_url.startsWith("meta_handle:")) {
+      if (!process.env.META_APP_ID) {
+        return res.status(400).json({ message:"META_APP_ID env var not set on the server — required to upload image/video headers to Meta. Add it in Railway environment variables, or remove the image header and submit as text-only." });
+      }
+    }
+
+    // Mark as "pending" immediately so UI updates right away even if
+    // the Meta round-trip (media upload especially) takes a while.
+    await query("UPDATE whatsapp_templates SET meta_status='pending', updated_at=NOW() WHERE id=$1",[template.id]);
+
+    // Respond to client immediately — actual Meta submission continues in background
+    res.json({ success:true, status:"pending", message:"Submitting to Meta..." });
+
+    // ── Background: build payload and submit to Meta ────────────
+    submitTemplateToMeta(template, access_token, finalWabaId).catch(err => {
+      console.error("Background submit failed:", err.message);
+    });
+
+  } catch (err) {
+    console.error("Submit route error:",err.message);
+    if (!res.headersSent) res.status(500).json({ message:err.message });
+  }
+});
+
+// ── Background worker: builds the Meta payload and submits ─────
+async function submitTemplateToMeta(template, access_token, finalWabaId) {
+  try {
     // Convert named vars to numbered (Meta requires {{1}} not {{name}})
     const varNames = [];
     const metaBody = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
@@ -429,7 +458,6 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       return `{{${varNames.indexOf(name) + 1}}}`;
     });
 
-    // ── Build components ──────────────────────────────────────
     const components = [];
     const headerType = (template.header_type || "none").toLowerCase();
 
@@ -447,31 +475,30 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       components.push(headerComp);
 
     } else if ((headerType === "image" || headerType === "video") && template.header_media_url) {
-      // Upload the media to Meta's resumable upload API to get a file handle.
-      // Correct endpoint: /{app_id}/uploads (NOT /{waba_id}/uploads)
       let mediaHandle = null;
-      try {
-        const appId = process.env.META_APP_ID;
-        if (!appId) {
-          console.warn("⚠️ META_APP_ID env var not set — cannot upload media to Meta");
-        } else {
-          // Download our locally-hosted file
+
+      if (template.header_media_url.startsWith("meta_handle:")) {
+        mediaHandle = template.header_media_url.replace("meta_handle:","");
+        console.log(`✅ Using stored Meta handle: ${mediaHandle.slice(0,30)}...`);
+      } else {
+        try {
+          const appId = process.env.META_APP_ID;
+          if (!appId) throw new Error("META_APP_ID not set");
+
           const fileRes    = await axios.get(template.header_media_url, { responseType:"arraybuffer" });
           const fileBuffer = Buffer.from(fileRes.data);
           const mimeType   = fileRes.headers["content-type"] || (headerType === "image" ? "image/jpeg" : "video/mp4");
           const ext        = mimeType.split("/")[1] || (headerType === "image" ? "jpg" : "mp4");
           const fileName   = `template_media_${Date.now()}.${ext}`;
 
-          // Step 1: Create upload session on the APP, not the WABA
           const sessionRes = await axios.post(
             `${META_BASE}/${META_VERSION}/${appId}/uploads`,
             null,
-            { params:{ file_name:fileName, file_length:fileBuffer.length, file_type:mimeType, access_token:access_token } }
+            { params:{ file_name:fileName, file_length:fileBuffer.length, file_type:mimeType, access_token } }
           );
           const uploadSessionId = sessionRes.data?.id;
           if (!uploadSessionId) throw new Error("No upload session ID returned from Meta");
 
-          // Step 2: Upload the bytes to the session
           const uploadRes = await axios.post(
             `${META_BASE}/${META_VERSION}/${uploadSessionId}`,
             fileBuffer,
@@ -479,25 +506,21 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
           );
           mediaHandle = uploadRes.data?.h;
           if (mediaHandle) console.log(`✅ Media uploaded to Meta, handle: ${mediaHandle.slice(0,30)}...`);
+        } catch (uploadErr) {
+          console.error("⚠️ Meta media upload failed:", uploadErr.response?.data || uploadErr.message);
         }
-      } catch (uploadErr) {
-        console.error("⚠️ Meta media upload failed:", uploadErr.response?.data || uploadErr.message);
       }
 
       if (mediaHandle) {
-        components.push({
-          type:    "HEADER",
-          format:  headerType.toUpperCase(),
-          example: { header_handle: [mediaHandle] },
-        });
+        components.push({ type:"HEADER", format:headerType.toUpperCase(), example:{ header_handle:[mediaHandle] } });
       } else {
-        return res.status(400).json({
-          message: `Could not upload ${headerType} to Meta. Make sure META_APP_ID is set in environment variables and the image URL (${template.header_media_url}) is publicly accessible. You can also remove the ${headerType} header and submit as text-only.`,
-        });
+        await query("UPDATE whatsapp_templates SET meta_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2",
+          [`Could not upload ${headerType} to Meta. Check META_APP_ID env var and that the media URL is publicly accessible.`, template.id]);
+        return;
       }
     }
 
-    // Body component with example values for each variable
+    // Body component with example values
     const bodyComp = { type:"BODY", text:metaBody };
     if (varNames.length > 0) {
       const samples = varNames.map(v => {
@@ -520,48 +543,33 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       components.push({ type:"FOOTER", text:template.footer_text });
     }
 
-    // ── Buttons ────────────────────────────────────────────────
-    const buttons = Array.isArray(template.buttons) ? template.buttons : [];
+    // Buttons
+    let buttons = template.buttons;
+    if (typeof buttons === "string") { try { buttons = JSON.parse(buttons); } catch { buttons = []; } }
+    buttons = Array.isArray(buttons) ? buttons : [];
+
     if (buttons.length > 0) {
       const buttonComponents = buttons.slice(0, 10).map(btn => {
-        if (btn.type === "QUICK_REPLY") {
-          return { type:"QUICK_REPLY", text:btn.text };
-        }
+        if (btn.type === "QUICK_REPLY")  return { type:"QUICK_REPLY", text:btn.text };
         if (btn.type === "URL") {
           const comp = { type:"URL", text:btn.text, url:btn.url };
-          // Dynamic URL with variable — needs example
-          if (/\{\{\d+\}\}/.test(btn.url)) {
-            comp.example = [btn.url.replace(/\{\{\d+\}\}/, "sample123")];
-          }
+          const urlVarMatches = (btn.url || "").match(/\{\{\d+\}\}/g) || [];
+          if (urlVarMatches.length > 0) comp.example = [btn.url.replace(/\{\{\d+\}\}/, "sample123")];
           return comp;
         }
-        if (btn.type === "PHONE_NUMBER") {
-          return { type:"PHONE_NUMBER", text:btn.text, phone_number:btn.phone_number };
-        }
-        if (btn.type === "COPY_CODE") {
-          return { type:"COPY_CODE", example:btn.example || "COPY123" };
-        }
+        if (btn.type === "PHONE_NUMBER") return { type:"PHONE_NUMBER", text:btn.text, phone_number:btn.phone_number };
+        if (btn.type === "COPY_CODE")    return { type:"COPY_CODE", example:btn.example || "COPY123" };
         return null;
       }).filter(Boolean);
 
-      if (buttonComponents.length > 0) {
-        components.push({ type:"BUTTONS", buttons:buttonComponents });
-      }
+      if (buttonComponents.length > 0) components.push({ type:"BUTTONS", buttons:buttonComponents });
     }
 
     const metaName = template.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/^[0-9]/,"t_");
-
-    // FIX: language must be a valid BCP-47 locale string
-    // "en" alone is NOT valid for Meta — must be "en_US"
-    const langMap = { en:"en_US", hi:"hi", en_US:"en_US", "en-US":"en_US", hi_IN:"hi", "hi-IN":"hi" };
+    const langMap  = { en:"en_US", hi:"hi", en_US:"en_US", "en-US":"en_US", hi_IN:"hi", "hi-IN":"hi" };
     const metaLang = langMap[template.language] || "en_US";
 
-    const payload = {
-      name:       metaName,
-      category:   template.category || "MARKETING",
-      language:   metaLang,
-      components,
-    };
+    const payload = { name:metaName, category:template.category || "MARKETING", language:metaLang, components };
 
     console.log("📤 Submitting to Meta WABA:", finalWabaId);
     console.log("📦 Payload:", JSON.stringify(payload, null, 2));
@@ -588,27 +596,28 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       if (metaCode === 200) userMsg = "Permission denied. Your token needs 'whatsapp_business_management' permission.";
       if (metaCode === 100) {
         userMsg = `Meta rejected the template. Error: ${metaMsg}`;
-        if (metaSubCode === 2388273) userMsg = "Invalid parameter — check Railway logs for the exact payload. Common causes: language code wrong, component format invalid, or template name already exists with different content.";
+        if (metaSubCode === 2388273) userMsg = "Invalid parameter — check component format, language code, or duplicate template name.";
         if (metaData) userMsg += ` | Detail: ${JSON.stringify(metaData)}`;
       }
       if (metaCode === 368) userMsg = "Account restricted. Check Meta Business Manager for policy violations.";
 
-      return res.status(500).json({ message:userMsg, meta_error:{ code:metaCode, subcode:metaSubCode, message:metaMsg, data:metaData } });
+      await query("UPDATE whatsapp_templates SET meta_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2",[userMsg, template.id]);
+      return;
     }
 
     await query(
       `UPDATE whatsapp_templates SET meta_status='pending',meta_template_id=$1,name=$2,variables=$3,updated_at=NOW() WHERE id=$4`,
-      [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]
+      [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), template.id]
     );
 
     console.log("✅ Template submitted successfully:", metaRes.data);
-    res.json({ success:true, metaTemplateId:metaRes.data?.id });
-
   } catch (err) {
-    console.error("Submit route error:",err.message);
-    res.status(500).json({ message:err.message });
+    console.error("submitTemplateToMeta error:", err.message);
+    await query("UPDATE whatsapp_templates SET meta_status='rejected', rejection_reason=$1, updated_at=NOW() WHERE id=$2",
+      [`Submission error: ${err.message}`, template.id]).catch(()=>{});
   }
-});
+}
+
 
 export async function handleTemplateStatusUpdate(value) {
   try {

@@ -254,65 +254,107 @@ router.post("/broadcast/templates/ai-generate", async (req, res) => {
   try {
     const { prompt, category, language } = req.body;
     if (!prompt?.trim()) return res.status(400).json({ message: "Prompt required" });
-
-    const META_POLICY = `
-Meta WhatsApp template rules (MUST follow or template gets rejected):
-- No spam words: FREE!!, WINNER, CLAIM NOW, ACT NOW, GUARANTEED, URGENT in all caps
-- No false urgency or misleading claims
-- No promises of guaranteed results
-- No phone numbers or raw URLs in body — use button components instead
-- Variables like {{name}} must be syntactically correct
-- Footer should have opt-out for marketing templates
-- Max 1024 characters for body, 60 for header/footer
-- Keep tone conversational and genuine — not pushy or salesy
-- Max 4-5 emojis total
+ 
+    const META_STRICT_POLICY = `
+You are an expert WhatsApp Business API template writer.
+ 
+CRITICAL META POLICY (2025) — FOLLOW EXACTLY OR TEMPLATE GETS REJECTED:
+ 
+HEADER RULES:
+- Text headers: NO emojis, NO bold (*), NO italic (_), NO special chars
+- Max 60 characters in header
+- Variables in headers must have sample values
+ 
+BODY RULES:
+- Max 1024 characters
+- Variables must be SEQUENTIAL: {{1}}, {{2}}, {{3}} — NEVER skip numbers
+- Variables must use EXACT double braces: {{1}} not {1} or {{{1}}}
+- NEVER start body with a variable {{1}} — add static text before it
+- NEVER end body with a variable {{1}} — add static text after it
+- Minimum 3x more words than variables (e.g. 2 variables needs 7+ words)
+- Max 2 consecutive newlines (\\n\\n maximum)
+- NO URL shorteners (bit.ly, tinyurl etc)
+- NO wa.me/ links
+- NO sensitive data requests (passwords, PINs, card numbers)
+- NO threatening language ("pay or face legal action")
+ 
+SPAM WORDS — NEVER USE:
+FREE!!, WINNER, CLAIM NOW, CLICK HERE, GUARANTEED, ACT NOW,
+URGENT, LAST CHANCE, DON'T MISS, HURRY, EXPIRES NOW, WIN BIG,
+ALL CAPS sentences, excessive exclamation marks!!
+ 
+FOOTER RULES:
+- Max 60 characters
+- NO variables {{1}} in footer
+- NO bold/italic formatting
+- For MARKETING: MUST include opt-out (Reply STOP to unsubscribe)
+ 
+CATEGORY:
+- MARKETING: promotions, follow-ups, re-engagement
+- UTILITY: order confirmations, appointment reminders, account updates
+ 
+EMOJIS: Max 3-5 in entire template, ZERO in header text
+ 
+GOOD EXAMPLE:
+Header: Order Confirmed
+Body: Hi {{1}}, your order #{{2}} has been confirmed and will be delivered by {{3}}. For any questions, just reply to this message.
+Footer: Reply STOP to unsubscribe
+Variables: ["1", "2", "3"]
+ 
+BAD EXAMPLE (multiple violations):
+Header: 🎉 YOUR ORDER!! (emoji in header, all caps)
+Body: {{1}} CLICK NOW TO CLAIM FREE OFFER!! (starts with variable, all caps spam)
+Footer: {{opt_out}} (variable in footer)
 `.trim();
-
-    const userPrompt = `You are an expert WhatsApp Business template writer who knows Meta policies deeply.
-
-${META_POLICY}
-
+ 
+    const userPrompt = `${META_STRICT_POLICY}
+ 
 Business request: "${prompt}"
 Category: ${category || "MARKETING"}
 Language: ${language === "hi" ? "Hindi" : "English"}
-
-Generate a WhatsApp template that will get APPROVED by Meta.
-Return ONLY valid JSON with no explanation, no markdown backticks:
-
+ 
+Generate a WhatsApp template that WILL get approved by Meta.
+Return ONLY valid JSON, no markdown, no explanation:
+ 
 {
-  "name": "snake_case_name_under_30_chars",
+  "name": "lowercase_underscore_name_max_40_chars",
   "category": "${category || "MARKETING"}",
-  "header_text": "short header text or empty string if not needed",
-  "body": "main message body, use {{name}} for personalization, max 1024 chars",
-  "footer_text": "Reply STOP to unsubscribe",
-  "variables": ["name"],
-  "meta_compliance_notes": "one line explaining why this passes Meta review",
+  "header_text": "max 60 chars, NO emojis, NO formatting — or empty string if not needed",
+  "body": "message body — start and end with static text, variables as {{1}} {{2}}, max 1024 chars",
+  "footer_text": "${category === "MARKETING" ? "Reply STOP to unsubscribe" : ""}",
+  "variables": ["1", "2"],
+  "meta_compliance_notes": "one sentence why this will pass Meta review",
   "warnings": []
 }`;
-
-    const templateModel = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-5";
+ 
+    const templateModel = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
     const response = await anthropic.messages.create({
       model:      templateModel,
       max_tokens: 1000,
       messages:   [{ role: "user", content: userPrompt }],
     });
     await logAIUsage(req.user.business_id, "template_generation", templateModel, response.usage);
-
+ 
     const text  = response.content[0]?.text || "";
     const clean = text.replace(/```json|```/g, "").trim();
-
+ 
     let parsed;
-    try {
-      parsed = JSON.parse(clean);
-    } catch {
-      return res.status(500).json({ message: "AI returned invalid response. Please try again." });
-    }
-
-    // Sanitize name to snake_case
+    try { parsed = JSON.parse(clean); }
+    catch { return res.status(500).json({ message: "AI returned invalid response. Please try again." }); }
+ 
+    // Sanitize name
     if (parsed.name) {
-      parsed.name = parsed.name.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 60);
+      parsed.name = parsed.name.toLowerCase()
+        .replace(/[^a-z0-9_]/g, "_")
+        .replace(/^[0-9]/, "t_")  // can't start with number
+        .slice(0, 60);
     }
-
+ 
+    // Post-process: remove emojis from header text if present
+    if (parsed.header_text) {
+      parsed.header_text = parsed.header_text.replace(/\p{Emoji}/gu, "").trim();
+    }
+ 
     res.json(parsed);
   } catch (err) {
     console.error("AI template generate error:", err.message);

@@ -1436,5 +1436,96 @@ router.delete("/complaints/:id", async (req, res) => {
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
+ 
+// Add to dashboard.js — complaint comments + attachments
 
+// ── GET /complaints/:id/comments ─────────────────────────────
+router.get("/complaints/:id/comments", async (req, res) => {
+  try {
+    const { rows } = await query(`
+      SELECT * FROM complaint_comments
+      WHERE complaint_id = $1
+      ORDER BY created_at ASC
+    `, [req.params.id]);
+    res.json({ comments: rows });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST /complaints/:id/comments — add comment ───────────────
+router.post("/complaints/:id/comments", async (req, res) => {
+  try {
+    const { content, attachments, author_role } = req.body;
+    if (!content?.trim()) return res.status(400).json({ message: "Comment content required" });
+
+    // Get author name from user
+    const { rows: userRows } = await query(
+      "SELECT name, type, role FROM users WHERE id = $1",
+      [req.user.id]
+    );
+    const user       = userRows[0];
+    const authorName = user?.name || "Team Member";
+    const authorRole = author_role || (user?.type === "owner" ? "owner" : user?.role || "team");
+
+    const { rows } = await query(`
+      INSERT INTO complaint_comments
+        (complaint_id, business_id, author_name, author_role, content, attachments)
+      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
+    `, [
+      req.params.id, req.user.business_id,
+      authorName, authorRole, content.trim(),
+      JSON.stringify(attachments || []),
+    ]);
+
+    // Update complaint updated_at
+    await query("UPDATE customer_complaints SET updated_at=NOW() WHERE id=$1", [req.params.id]);
+
+    res.status(201).json({ comment: rows[0] });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE /complaints/:id/comments/:commentId ────────────────
+router.delete("/complaints/:id/comments/:commentId", async (req, res) => {
+  try {
+    await query(
+      "DELETE FROM complaint_comments WHERE id=$1 AND complaint_id=$2",
+      [req.params.commentId, req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST /complaints/:id/attachments — upload file ────────────
+// Uses multer (same instance as broadcast.js)
+// Returns public URL stored in complaint attachments array
+router.post("/complaints/:id/attachments", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+
+    const publicUrl  = `${process.env.BACKEND_URL}/api/complaints/media/${req.file.filename}`;
+    const fileType   = req.file.mimetype.startsWith("image/") ? "image"
+                     : req.file.mimetype.startsWith("video/") ? "video"
+                     : "document";
+
+    // Append to complaint attachments
+    await query(`
+      UPDATE customer_complaints
+      SET attachments = COALESCE(attachments, '[]'::jsonb) || $1::jsonb,
+          updated_at  = NOW()
+      WHERE id = $2 AND business_id = $3
+    `, [
+      JSON.stringify([{ url: publicUrl, name: req.file.originalname, type: fileType, size: req.file.size }]),
+      req.params.id, req.user.business_id,
+    ]);
+
+    res.json({ url: publicUrl, name: req.file.originalname, type: fileType });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── Serve complaint media ─────────────────────────────────────
+router.get("/complaints/media/:filename", (req, res) => {
+  const filepath = path.join("/tmp/complaint_media", req.params.filename);
+  if (fs.existsSync(filepath)) res.sendFile(filepath);
+  else res.status(404).json({ message: "File not found" });
+});
+ 
 export default router;

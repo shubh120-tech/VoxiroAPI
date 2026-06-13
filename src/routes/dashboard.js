@@ -2,8 +2,14 @@ import express      from "express";
 import { query }    from "../db/postgres.js";
 import { authMiddleware } from "../middleware/auth.js";
 import { clearPromptCache } from "../agents/systemPrompt.js";
+import multer from "multer";
 
 const router = express.Router();
+
+const upload = multer({ storage: multer.diskStorage({
+  destination: (req, file, cb) => { const d="/tmp/complaint_media"; if(!fs.existsSync(d)) fs.mkdirSync(d,{recursive:true}); cb(null,d); },
+  filename: (req, file, cb) => cb(null, `${Date.now()}_${file.originalname}`)
+}), limits:{ fileSize: 16*1024*1024 } });
 
 router.get("/plans/public", async (req, res) => {
   try {

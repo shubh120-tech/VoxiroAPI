@@ -6,6 +6,7 @@ import { bookAppointmentTool,   executeBookAppointment    } from "./tools/bookAp
 import { checkAvailabilityTool, executeCheckAvailability  } from "./tools/checkAvailability.js";
 import { notifyOwnerTool,       executeNotifyOwner        } from "./tools/notifyOwner.js";
 import { scheduleFollowupTool,  executeScheduleFollowup   } from "./tools/scheduleFollowup.js";
+import { registerComplaintTool, executeRegisterComplaint } from "./tools/registerComplaint.js";
 import {
   updateAppointmentTool, executeUpdateAppointment,
   cancelAppointmentTool, executeCancelAppointment,
@@ -33,6 +34,7 @@ const TOOLS = [
   cancelOrderTool,
   updateFollowupTool,
   cancelFollowupTool,
+  registerComplaintTool,
 ];
 
 // ── Processing lock — prevents double replies ─────────────────
@@ -465,6 +467,7 @@ async function executeTool({ toolName, input, businessId, conversationId, custom
     case "cancel_order":        return executeCancelOrder(ctx);
     case "update_followup":     return executeUpdateFollowup(ctx);
     case "cancel_followup":     return executeCancelFollowup(ctx);
+    case "register_complaint": return executeRegisterComplaint(ctx);
     default:                    return { error: `Unknown tool: ${toolName}` };
   }
 }

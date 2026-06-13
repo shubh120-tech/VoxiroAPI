@@ -1324,4 +1324,117 @@ router.delete("/appointments/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// Add all these routes to dashboard.js
+
+// ── GET /complaints ───────────────────────────────────────────
+router.get("/complaints", async (req, res) => {
+  try {
+    const { status, search } = req.query;
+    let sql = `SELECT * FROM customer_complaints WHERE business_id = $1`;
+    const params = [req.user.business_id];
+
+    if (status && status !== "all") { params.push(status); sql += ` AND status = $${params.length}`; }
+    if (search) {
+      params.push(`%${search}%`);
+      sql += ` AND (customer_name ILIKE $${params.length} OR customer_phone ILIKE $${params.length} OR ticket_number ILIKE $${params.length} OR subject ILIKE $${params.length})`;
+    }
+    sql += ` ORDER BY created_at DESC LIMIT 100`;
+
+    const { rows } = await query(sql, params);
+
+    const { rows: statsRows } = await query(
+      `SELECT status, COUNT(*) AS count FROM customer_complaints WHERE business_id = $1 GROUP BY status`,
+      [req.user.business_id]
+    );
+
+    res.json({
+      complaints: rows,
+      stats: Object.fromEntries(statsRows.map(s => [s.status, parseInt(s.count)])),
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── POST /complaints — add manually ──────────────────────────
+router.post("/complaints", async (req, res) => {
+  try {
+    const {
+      customer_name, customer_phone, category, subject, description,
+      order_reference, purchase_date, preferred_resolution, priority,
+    } = req.body;
+    if (!customer_phone?.trim()) return res.status(400).json({ message: "Customer phone required" });
+    if (!subject?.trim())        return res.status(400).json({ message: "Subject required" });
+    if (!description?.trim())    return res.status(400).json({ message: "Description required" });
+
+    const { rows: seqRows } = await query("SELECT nextval('complaint_ticket_seq') AS num");
+    const ticketNumber = `YG-${String(seqRows[0].num).padStart(5, "0")}`;
+
+    const { rows } = await query(`
+      INSERT INTO customer_complaints
+        (business_id, ticket_number, customer_name, customer_phone, category,
+         subject, description, order_reference, purchase_date,
+         preferred_resolution, priority, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'open') RETURNING id, ticket_number
+    `, [
+      req.user.business_id, ticketNumber, customer_name||null, customer_phone,
+      category||"other", subject, description,
+      order_reference||null, purchase_date||null, preferred_resolution||null, priority||"medium",
+    ]);
+
+    res.status(201).json({ success: true, id: rows[0].id, ticket_number: rows[0].ticket_number });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PUT /complaints/:id — full update ────────────────────────
+router.put("/complaints/:id", async (req, res) => {
+  try {
+    const {
+      customer_name, customer_phone, category, subject, description,
+      order_reference, purchase_date, preferred_resolution, priority, status, resolution_notes,
+    } = req.body;
+    await query(`
+      UPDATE customer_complaints SET
+        customer_name=$1, customer_phone=$2, category=$3, subject=$4, description=$5,
+        order_reference=$6, purchase_date=$7, preferred_resolution=$8,
+        priority=$9, status=$10, resolution_notes=$11, updated_at=NOW()
+      WHERE id=$12 AND business_id=$13
+    `, [
+      customer_name||null, customer_phone, category||"other", subject, description,
+      order_reference||null, purchase_date||null, preferred_resolution||null,
+      priority||"medium", status||"open", resolution_notes||null,
+      req.params.id, req.user.business_id,
+    ]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── PATCH /complaints/:id/status ─────────────────────────────
+router.patch("/complaints/:id/status", async (req, res) => {
+  try {
+    const { status, resolution_notes } = req.body;
+    const sets   = [`status=$1`, `updated_at=NOW()`];
+    const params = [status];
+
+    if (resolution_notes !== undefined) { params.push(resolution_notes); sets.push(`resolution_notes=$${params.length}`); }
+    if (status === "resolved" || status === "closed") sets.push(`resolved_at=NOW()`);
+
+    params.push(req.params.id, req.user.business_id);
+    await query(
+      `UPDATE customer_complaints SET ${sets.join(", ")} WHERE id=$${params.length-1} AND business_id=$${params.length}`,
+      params
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE /complaints/:id ────────────────────────────────────
+router.delete("/complaints/:id", async (req, res) => {
+  try {
+    await query(
+      "DELETE FROM customer_complaints WHERE id=$1 AND business_id=$2",
+      [req.params.id, req.user.business_id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 export default router;

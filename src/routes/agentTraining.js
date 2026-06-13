@@ -289,4 +289,33 @@ function buildDiff(original, fixed) {
   return diff;
 }
 
+// GET /agent/features
+router.get("/agent/features", async (req, res) => {
+  try {
+    const { rows } = await query(
+      "SELECT enabled_features FROM agent_configs WHERE business_id = $1",
+      [req.user.business_id]
+    );
+    res.json({
+      enabled_features: rows[0]?.enabled_features || {
+        leads: true, orders: true, appointments: false, followups: true, complaints: false,
+      },
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// PUT /agent/features
+router.put("/agent/features", async (req, res) => {
+  try {
+    const { enabled_features } = req.body;
+    if (!enabled_features || typeof enabled_features !== "object")
+      return res.status(400).json({ message: "enabled_features required" });
+    await query(
+      "UPDATE agent_configs SET enabled_features=$1, updated_at=NOW() WHERE business_id=$2",
+      [JSON.stringify(enabled_features), req.user.business_id]
+    );
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 export default router;

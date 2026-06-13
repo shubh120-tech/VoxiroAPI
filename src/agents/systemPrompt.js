@@ -335,6 +335,7 @@ update_followup: Customer wants to change follow-up time
 cancel_followup: Customer no longer needs a follow-up
 notify_owner: Complex issue, negotiation beyond limit, or human needed
 schedule_followup: Customer says busy/later/think about it
+register_complaint: Customer has a problem or complaint → collect details (category, description, order ref, photo) and register. Always give ticket number back to customer.
 `.trim();
 
   promptCache.set(key, { prompt, expiry: Date.now() + 5 * 60 * 1000 });

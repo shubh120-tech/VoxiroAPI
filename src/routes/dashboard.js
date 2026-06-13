@@ -770,16 +770,37 @@ router.get("/complaints/:id/comments", async (req, res) => {
 router.post("/complaints/:id/comments", async (req, res) => {
   try {
     const { content, attachments, author_role } = req.body;
-    if (!content?.trim()) return res.status(400).json({ message:"Content required" });
-    const { rows: userRows } = await query("SELECT name,type,role FROM users WHERE id=$1",[req.user.id]);
-    const u          = userRows[0];
-    const authorName = u?.name || "Team Member";
-    const authorRole = author_role || (u?.type === "owner" ? "owner" : u?.role || "team");
-    const { rows } = await query(`INSERT INTO complaint_comments (complaint_id,business_id,author_name,author_role,content,attachments) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.params.id, req.user.business_id, authorName, authorRole, content.trim(), JSON.stringify(attachments||[])]);
-    await query("UPDATE customer_complaints SET updated_at=NOW() WHERE id=$1",[req.params.id]);
-    res.status(201).json({ comment:rows[0] });
-  } catch (err) { res.status(500).json({ message:err.message }); }
+    if (!content?.trim()) return res.status(400).json({ message: "Content required" });
+
+    let authorName = "Team Member";
+    let authorRole = author_role || "team";
+
+    if (req.user.type === "owner") {
+      // Owner — uses owner_name column in users table
+      const { rows: uRows } = await query(
+        "SELECT owner_name FROM users WHERE id = $1", [req.user.id]
+      );
+      authorName = uRows[0]?.owner_name || "Owner";
+      authorRole = author_role || "owner";
+    } else {
+      // Team member — name is in team_members table
+      const { rows: tRows } = await query(
+        "SELECT name, role FROM team_members WHERE id = $1", [req.user.id]
+      );
+      authorName = tRows[0]?.name || "Team Member";
+      authorRole = author_role || tRows[0]?.role || "team";
+    }
+
+    const { rows } = await query(
+      `INSERT INTO complaint_comments (complaint_id,business_id,author_name,author_role,content,attachments) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.params.id, req.user.business_id, authorName, authorRole, content.trim(), JSON.stringify(attachments || [])]
+    );
+    await query("UPDATE customer_complaints SET updated_at=NOW() WHERE id=$1", [req.params.id]);
+    res.status(201).json({ comment: rows[0] });
+  } catch (err) {
+    console.error("Add comment error:", err.message);
+    res.status(500).json({ message: err.message });
+  }
 });
 
 router.delete("/complaints/:id/comments/:commentId", async (req, res) => {
@@ -790,20 +811,38 @@ router.delete("/complaints/:id/comments/:commentId", async (req, res) => {
 });
 
 // ── Complaint Attachments ─────────────────────────────────────
-router.post("/complaints/:id/attachments", upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ message:"No file uploaded" });
-    const BACKEND_URL = process.env.BACKEND_URL || "https://voxiroapi-production.up.railway.app";
-    const publicUrl   = `${BACKEND_URL}/api/complaints/media/${req.file.filename}`;
-    const fileType    = req.file.mimetype.startsWith("image/") ? "image"
-                      : req.file.mimetype.startsWith("video/") ? "video"
-                      : "document";
-    const attachment  = { url:publicUrl, name:req.file.originalname, type:fileType, size:req.file.size };
-    await query(`UPDATE customer_complaints SET attachments=COALESCE(attachments,'[]'::jsonb)||$1::jsonb,updated_at=NOW() WHERE id=$2 AND business_id=$3`,
-      [JSON.stringify([attachment]), req.params.id, req.user.business_id]);
-    res.json(attachment);
-  } catch (err) { console.error("Complaint upload error:",err.message); res.status(500).json({ message:err.message }); }
-});
+router.post(
+  "/complaints/:id/attachments",
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+
+      const BACKEND_URL = process.env.BACKEND_URL || "https://voxiroapi-production.up.railway.app";
+      const publicUrl   = `${BACKEND_URL}/api/complaints/media/${req.file.filename}`;
+      const fileType    = req.file.mimetype.startsWith("image/") ? "image"
+                        : req.file.mimetype.startsWith("video/") ? "video"
+                        : "document";
+      const attachment  = {
+        url:  publicUrl,
+        name: req.file.originalname,
+        type: fileType,
+        size: req.file.size,
+      };
+
+      await query(
+        `UPDATE customer_complaints SET attachments=COALESCE(attachments,'[]'::jsonb)||$1::jsonb,updated_at=NOW() WHERE id=$2 AND business_id=$3`,
+        [JSON.stringify([attachment]), req.params.id, req.user.business_id]
+      );
+
+      console.log(`📎 Complaint attachment uploaded: ${req.file.filename} → ${req.params.id}`);
+      res.json(attachment);
+    } catch (err) {
+      console.error("Complaint upload error:", err.message);
+      res.status(500).json({ message: err.message });
+    }
+  }
+);
 
 router.get("/complaints/media/:filename", (req, res) => {
   const filepath = path.resolve("/tmp/complaint_media", req.params.filename);

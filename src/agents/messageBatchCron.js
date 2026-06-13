@@ -3,12 +3,12 @@ import { handleIncomingMessage } from "./agentManager.js";
 
 const BATCH_WAIT_SECONDS = 3;
 
-// In-memory lock
+// In-memory lock — backup only, DB-level lock below is the real guard
 const processingLock = new Set();
 
 export async function processMessageBatches() {
   try {
-    // ✅ ONLY SELECT (DO NOT mark processed here)
+    // ✅ ONLY SELECT rows that are NOT processed AND NOT currently being processed
     const { rows: readyCustomers } = await query(`
       SELECT
         customer_phone,
@@ -20,9 +20,11 @@ export async function processMessageBatches() {
         MAX(received_at) AS last_received,
         COUNT(*) AS message_count,
         ARRAY_AGG(message_text ORDER BY received_at ASC) AS messages,
-        ARRAY_AGG(wa_message_id ORDER BY received_at ASC) AS wa_message_ids
+        ARRAY_AGG(wa_message_id ORDER BY received_at ASC) AS wa_message_ids,
+        ARRAY_AGG(id ORDER BY received_at ASC) AS pending_ids
       FROM pending_messages
       WHERE processed = FALSE
+        AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '90 seconds')
         AND received_at < NOW() - INTERVAL '${BATCH_WAIT_SECONDS} seconds'
       GROUP BY customer_phone, business_id, conversation_id, customer_name, phone_number_id, access_token
       ORDER BY last_received ASC
@@ -36,20 +38,43 @@ export async function processMessageBatches() {
     for (const batch of readyCustomers) {
       const lockKey = `${batch.business_id}:${batch.customer_phone}`;
 
-      // Skip if already processing
+      // In-memory backup lock — skip if this process is already handling it
       if (processingLock.has(lockKey)) {
-        console.log(`🔒 Skipping ${batch.customer_phone} — already processing`);
+        console.log(`🔒 Skipping ${batch.customer_phone} — already processing (in-memory)`);
+        continue;
+      }
+
+      // ── DB-level lock: mark these specific rows as "in progress" ────
+      // This is the REAL guard. Even if the cron tick races or the
+      // in-memory lock is lost (process restart, long delay), these
+      // exact row IDs will not be selected again for 90 seconds.
+      const { rowCount } = await query(`
+        UPDATE pending_messages
+        SET processing_started_at = NOW()
+        WHERE id = ANY($1::uuid[])
+          AND processed = FALSE
+          AND (processing_started_at IS NULL OR processing_started_at < NOW() - INTERVAL '90 seconds')
+      `, [batch.pending_ids]);
+
+      // If 0 rows were updated, another tick already claimed this batch
+      if (rowCount === 0) {
+        console.log(`🔒 Skipping ${batch.customer_phone} — rows already claimed (DB lock)`);
         continue;
       }
 
       processingLock.add(lockKey);
 
-      // ✅ Safety unlock (VERY IMPORTANT)
-      setTimeout(() => processingLock.delete(lockKey), 20000);
+      // Safety unlock — generous timeout for slow Claude + WhatsApp delays
+      // (3 message parts × up to 7s delay + typing indicators + Claude call
+      //  can realistically take 20-30s; give it real headroom)
+      const safetyUnlock = setTimeout(() => processingLock.delete(lockKey), 120000);
 
       processBatch(batch)
         .catch(err => console.error("Batch error:", err.message))
-        .finally(() => processingLock.delete(lockKey));
+        .finally(() => {
+          clearTimeout(safetyUnlock);
+          processingLock.delete(lockKey);
+        });
     }
 
   } catch (err) {
@@ -67,7 +92,7 @@ async function processBatch(batch) {
     access_token,
     messages,
     wa_message_ids,
-    message_count,
+    pending_ids,
   } = batch;
 
   try {
@@ -79,6 +104,11 @@ async function processBatch(batch) {
 
     if (["manual", "needs-help"].includes(convRows[0]?.status)) {
       console.log(`⏭️ Skipping ${customer_phone} — manual mode`);
+      // Mark these specific rows processed so they don't get retried forever
+      await query(`
+        UPDATE pending_messages SET processed = TRUE, processed_at = NOW()
+        WHERE id = ANY($1::uuid[])
+      `, [pending_ids]);
       return;
     }
 
@@ -99,17 +129,23 @@ async function processBatch(batch) {
       waMessageId: lastWaMessageId,
     });
 
-    // ✅ ONLY mark processed if reply was attempted
+    // ✅ Mark THESE SPECIFIC rows as processed (by id, not by customer/business)
+    // This prevents accidentally marking newer messages (that arrived during
+    // processing) as processed when they haven't been replied to yet.
     if (reply) {
       await query(`
         UPDATE pending_messages
         SET processed = TRUE, processed_at = NOW()
-        WHERE customer_phone = $1
-          AND business_id = $2
-          AND processed = FALSE
-      `, [customer_phone, business_id]);
+        WHERE id = ANY($1::uuid[])
+      `, [pending_ids]);
     } else {
       console.warn(`⚠️ No reply generated for ${customer_phone}, will retry`);
+      // Release the processing lock so it can be retried
+      await query(`
+        UPDATE pending_messages
+        SET processing_started_at = NULL
+        WHERE id = ANY($1::uuid[])
+      `, [pending_ids]);
     }
 
   } catch (err) {
@@ -131,13 +167,12 @@ async function processBatch(batch) {
       return;
     }
 
-    // ✅ Retry: reset processed flag
+    // ✅ Retry: release the processing lock on these specific rows
     await query(`
       UPDATE pending_messages
-      SET processed = FALSE, processed_at = NULL
-      WHERE customer_phone = $1
-        AND business_id = $2
-    `, [customer_phone, business_id]).catch(() => {});
+      SET processing_started_at = NULL
+      WHERE id = ANY($1::uuid[])
+    `, [pending_ids]).catch(() => {});
   }
 }
 

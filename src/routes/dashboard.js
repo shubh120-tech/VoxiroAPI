@@ -1308,4 +1308,20 @@ router.delete("/followups/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// ── DELETE /orders/:id ────────────────────────────────────────
+router.delete("/orders/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM orders WHERE id=$1 AND business_id=$2", [req.params.id, req.user.business_id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// ── DELETE /appointments/:id ──────────────────────────────────
+router.delete("/appointments/:id", async (req, res) => {
+  try {
+    await query("DELETE FROM appointments WHERE id=$1 AND business_id=$2", [req.params.id, req.user.business_id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
 export default router;

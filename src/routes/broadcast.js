@@ -63,15 +63,69 @@ const upload = multer({
   },
 });
 
-// ── Upload media ──────────────────────────────────────────────
+// ── Upload media — uploads directly to Meta's servers ────────
+// This avoids the /tmp ephemeral storage problem on Railway
+// We get a Meta media handle back which is permanent
 router.post("/broadcast/templates/upload-media", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message:"No file uploaded" });
-    const fileType  = req.file.mimetype.startsWith("image/") ? "image" : "video";
-    const publicUrl = `${BACKEND_URL}/api/broadcast/media/${req.file.filename}`;
-    console.log(`📎 Media uploaded: ${req.file.filename} (${fileType}) → ${publicUrl}`);
-    res.json({ url:publicUrl, type:fileType, fileName:req.file.filename });
-  } catch (err) { res.status(500).json({ message:"Upload failed: "+err.message }); }
+
+    const fileType = req.file.mimetype.startsWith("image/") ? "image" : "video";
+    const filePath = req.file.path;
+    const fileName = req.file.originalname;
+    const mimeType = req.file.mimetype;
+    const fileSize = req.file.size;
+
+    // Try to get WhatsApp config to upload directly to Meta
+    // Use the first available business config (or the authenticated user's)
+    let metaHandle = null;
+    let publicUrl  = null;
+
+    try {
+      // Get user's WhatsApp config if auth is available
+      const wabaId     = req.user?.business_id ? (await query("SELECT waba_id, access_token FROM whatsapp_configs WHERE business_id=$1",[req.user.business_id])).rows[0] : null;
+      const accessToken = wabaId?.access_token;
+      const waId        = wabaId?.waba_id;
+
+      if (accessToken && waId) {
+        // Upload to Meta
+        const fileBuffer = fs.readFileSync(filePath);
+
+        // Step 1: Create upload session
+        const sessionRes = await axios.post(
+          `https://graph.facebook.com/${META_VERSION}/${waId}/uploads`,
+          null,
+          { params:{ file_name:fileName, file_length:fileSize, file_type:mimeType, access_token:accessToken }, headers:{ Authorization:`Bearer ${accessToken}` } }
+        );
+        const sessionId = sessionRes.data?.id;
+
+        // Step 2: Upload bytes
+        const uploadRes = await axios.post(
+          `https://graph.facebook.com/${META_VERSION}/${sessionId}`,
+          fileBuffer,
+          { headers:{ Authorization:`OAuth ${accessToken}`, "Content-Type":mimeType, file_offset:"0" } }
+        );
+        metaHandle = uploadRes.data?.h;
+        if (metaHandle) {
+          publicUrl = `meta_handle:${metaHandle}`;
+          console.log(`✅ Media uploaded to Meta: handle=${metaHandle}`);
+        }
+      }
+    } catch (metaErr) {
+      console.warn("⚠️ Meta upload failed, falling back to local URL:", metaErr.message);
+    }
+
+    // Fallback: local URL (works until Railway restarts)
+    if (!publicUrl) {
+      publicUrl = `${BACKEND_URL}/api/broadcast/media/${req.file.filename}`;
+      console.log(`📎 Media stored locally: ${publicUrl} (⚠️ lost on Railway restart)`);
+    }
+
+    res.json({ url:publicUrl, type:fileType, fileName:req.file.filename, metaHandle });
+  } catch (err) {
+    console.error("Upload error:", err.message);
+    res.status(500).json({ message:"Upload failed: "+err.message });
+  }
 });
 
 // ── Serve broadcast media (ALSO registered in server.js for public access) ──
@@ -435,23 +489,74 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       }
       components.push(headerComp);
 
-    } else if (headerType === "image" && template.header_media_url) {
-      // Meta requires uploading the file to get a media handle first
-      // then pass it as header_handle. We pass the URL as the handle
-      // which works when using their resumable upload API.
-      // For now we include the URL in example — Meta accepts public HTTPS URLs during review
-      components.push({
-        type:    "HEADER",
-        format:  "IMAGE",
-        example: { header_handle: [template.header_media_url] },
-      });
+    } else if ((headerType === "image" || headerType === "video") && template.header_media_url) {
+      // If URL is already a Meta handle (from direct upload), use it directly
+      if (template.header_media_url.startsWith("meta_handle:")) {
+        const existingHandle = template.header_media_url.replace("meta_handle:","");
+        components.push({
+          type:    "HEADER",
+          format:  headerType.toUpperCase(),
+          example: { header_handle: [existingHandle] },
+        });
+        console.log(`✅ Using stored Meta handle: ${existingHandle}`);
+      } else {
+      // Meta requires uploading the media to their servers first to get a handle ID
+      // Step 1: Upload the file to Meta's media upload API
+      // Step 2: Use the returned handle in header_handle array
+      let mediaHandle = null;
+      try {
+        const mediaUrl = template.header_media_url;
 
-    } else if (headerType === "video" && template.header_media_url) {
-      components.push({
-        type:    "HEADER",
-        format:  "VIDEO",
-        example: { header_handle: [template.header_media_url] },
-      });
+        // Download the file from our server
+        const fileRes = await axios.get(mediaUrl, { responseType: "arraybuffer" });
+        const fileBuffer = Buffer.from(fileRes.data);
+        const mimeType   = headerType === "image" ? "image/png" : "video/mp4";
+        const fileName   = mediaUrl.split("/").pop() || `media.${headerType === "image" ? "png" : "mp4"}`;
+
+        // Step 1: Start upload session with Meta
+        const sessionRes = await axios.post(
+          `https://graph.facebook.com/${META_VERSION}/${finalWabaId}/uploads`,
+          null,
+          {
+            params: { file_name: fileName, file_length: fileBuffer.length, file_type: mimeType, access_token },
+            headers: { Authorization: `Bearer ${access_token}` },
+          }
+        );
+        const uploadSessionId = sessionRes.data?.id;
+        if (!uploadSessionId) throw new Error("Failed to create upload session");
+
+        // Step 2: Upload the file bytes
+        const uploadRes = await axios.post(
+          `https://graph.facebook.com/${META_VERSION}/${uploadSessionId}`,
+          fileBuffer,
+          {
+            headers: {
+              Authorization: `OAuth ${access_token}`,
+              "Content-Type": mimeType,
+              file_offset: "0",
+            },
+          }
+        );
+        mediaHandle = uploadRes.data?.h;
+        console.log(`✅ Media uploaded to Meta, handle: ${mediaHandle}`);
+      } catch (uploadErr) {
+        console.error("⚠️ Could not upload media to Meta:", uploadErr.message);
+        // If upload fails, skip the header — template will be text-only
+        // User can resubmit after fixing media
+        console.warn("⚠️ Submitting without image header — media upload to Meta failed");
+      }
+
+      if (mediaHandle) {
+        components.push({
+          type:    "HEADER",
+          format:  headerType.toUpperCase(),
+          example: { header_handle: [mediaHandle] },
+        });
+        console.log(`✅ Using freshly uploaded Meta handle: ${mediaHandle}`);
+      } else {
+        console.warn("⚠️ Skipping image/video header — could not get Meta media handle");
+      }
+      } // end else (not meta_handle: URL)
     }
 
     // Body component with example values for each variable

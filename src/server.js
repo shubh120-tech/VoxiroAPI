@@ -137,9 +137,12 @@ app.get("/api/media/:messageId", async (req, res) => {
 
 // ── Public: Broadcast media ───────────────────────────────────
 app.get("/api/broadcast/media/:filename", (req, res) => {
-  const filePath = `/tmp/broadcast_media/${req.params.filename}`;
-  if (!fs.existsSync(filePath)) return res.status(404).json({ message:"File not found" });
-  res.sendFile(path.resolve(filePath));
+  const filePath = path.resolve("/tmp/broadcast_media", req.params.filename);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`⚠️ Broadcast media not found: ${filePath}`);
+    return res.status(404).json({ message:"File not found" });
+  }
+  res.sendFile(filePath);
 });
 
 // ── Public: Complaint media ───────────────────────────────────

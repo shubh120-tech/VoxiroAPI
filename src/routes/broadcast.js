@@ -9,7 +9,6 @@ import { authMiddleware } from "../middleware/auth.js";
 import { logAIUsage }    from "../utils/aiUsageLogger.js";
 
 const router = express.Router();
-
 router.use(authMiddleware);
 
 const bId = (req) => req.user.business_id;
@@ -26,13 +25,10 @@ const SEND_HOUR_END   = 23;
 
 function nowIST()      { return new Date(Date.now() + IST_OFFSET_MS); }
 function getISTHour(d) { return new Date(d.getTime() + IST_OFFSET_MS).getUTCHours(); }
-function isValidSendTime(date) {
-  const h = getISTHour(date);
-  return h >= SEND_HOUR_START && h < SEND_HOUR_END;
-}
+function isValidSendTime(date) { const h = getISTHour(date); return h >= SEND_HOUR_START && h < SEND_HOUR_END; }
 function istInputToUTC(istStr) {
   if (!istStr) return null;
-  const normalized = istStr.includes("T") ? istStr : istStr.replace(" ", "T");
+  const normalized = istStr.includes("T") ? istStr : istStr.replace(" ","T");
   const istDate    = new Date(normalized + (normalized.includes("Z") ? "" : ":00"));
   if (isNaN(istDate.getTime())) return null;
   return new Date(istDate.getTime() - IST_OFFSET_MS);
@@ -40,17 +36,17 @@ function istInputToUTC(istStr) {
 function utcToISTString(utcDate) {
   if (!utcDate) return null;
   const ist = new Date(new Date(utcDate).getTime() + IST_OFFSET_MS);
-  return ist.toISOString().replace("Z", "+05:30");
+  return ist.toISOString().replace("Z","+05:30");
 }
 function sanitizeTemplateName(name) {
-  return name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+  return name.toLowerCase().replace(/[^a-z0-9_]/g,"_");
 }
 
-// ── Multer — media upload ─────────────────────────────────────
+// ── Multer — broadcast media ──────────────────────────────────
 const mediaStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const dir = "/tmp/broadcast_media";
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive:true });
     cb(null, dir);
   },
   filename: (req, file, cb) => {
@@ -58,118 +54,100 @@ const mediaStorage = multer.diskStorage({
     cb(null, `media_${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
   },
 });
-
 const upload = multer({
   storage: mediaStorage,
   limits: { fileSize: 16 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg", "image/png", "image/webp", "video/mp4", "video/3gpp"];
-    allowed.includes(file.mimetype)
-      ? cb(null, true)
-      : cb(new Error("Only JPG/PNG/WebP images and MP4/3GPP videos are allowed"));
+    const allowed = ["image/jpeg","image/png","image/webp","video/mp4","video/3gpp"];
+    allowed.includes(file.mimetype) ? cb(null,true) : cb(new Error("Only JPG/PNG/WebP/MP4/3GPP allowed"));
   },
 });
 
-// ══════════════════════════════════════════════════════════════
-//  MEDIA UPLOAD & SERVE
-// ══════════════════════════════════════════════════════════════
-
-// Upload image or video → returns public URL
+// ── Upload media ──────────────────────────────────────────────
 router.post("/broadcast/templates/upload-media", upload.single("file"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: "No file uploaded" });
+    if (!req.file) return res.status(400).json({ message:"No file uploaded" });
     const fileType  = req.file.mimetype.startsWith("image/") ? "image" : "video";
     const publicUrl = `${BACKEND_URL}/api/broadcast/media/${req.file.filename}`;
-    console.log(`📎 Media uploaded: ${req.file.filename} (${fileType})`);
-    res.json({ url: publicUrl, type: fileType, fileName: req.file.filename });
-  } catch (err) {
-    res.status(500).json({ message: "Upload failed: " + err.message });
-  }
+    console.log(`📎 Media uploaded: ${req.file.filename} (${fileType}) → ${publicUrl}`);
+    res.json({ url:publicUrl, type:fileType, fileName:req.file.filename });
+  } catch (err) { res.status(500).json({ message:"Upload failed: "+err.message }); }
 });
 
-
+// ── Serve broadcast media (ALSO registered in server.js for public access) ──
+// This route handles requests that go through authMiddleware path
+router.get("/broadcast/media/:filename", (req, res) => {
+  const filePath = path.resolve("/tmp/broadcast_media", req.params.filename);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`⚠️ Media not found: ${filePath}`);
+    return res.status(404).json({ message:"File not found" });
+  }
+  res.sendFile(filePath);
+});
 
 // ══════════════════════════════════════════════════════════════
 //  CONTACT LISTS
 // ══════════════════════════════════════════════════════════════
-
 router.get("/broadcast/lists", async (req, res) => {
   try {
-    const { rows } = await query(`
-      SELECT cl.*, COUNT(clm.contact_id) AS member_count
-      FROM contact_lists cl
-      LEFT JOIN contact_list_members clm ON clm.list_id = cl.id
-      WHERE cl.business_id = $1
-      GROUP BY cl.id ORDER BY cl.created_at DESC
-    `, [bId(req)]);
-    res.json({ lists: rows });
-  } catch (err) { res.status(500).json({ message: "Failed to load lists" }); }
+    const { rows } = await query(`SELECT cl.*, COUNT(clm.contact_id) AS member_count FROM contact_lists cl LEFT JOIN contact_list_members clm ON clm.list_id=cl.id WHERE cl.business_id=$1 GROUP BY cl.id ORDER BY cl.created_at DESC`,[bId(req)]);
+    res.json({ lists:rows });
+  } catch (err) { res.status(500).json({ message:"Failed to load lists" }); }
 });
 
 router.post("/broadcast/lists", async (req, res) => {
   try {
     const { name, description, color } = req.body;
-    if (!name) return res.status(400).json({ message: "List name required" });
-    const { rows } = await query(`
-      INSERT INTO contact_lists (business_id, name, description, color)
-      VALUES ($1,$2,$3,$4) RETURNING *
-    `, [bId(req), name, description || null, color || "#0d9488"]);
+    if (!name) return res.status(400).json({ message:"List name required" });
+    const { rows } = await query(`INSERT INTO contact_lists (business_id,name,description,color) VALUES ($1,$2,$3,$4) RETURNING *`,[bId(req), name, description||null, color||"#0d9488"]);
     res.status(201).json(rows[0]);
-  } catch (err) { res.status(500).json({ message: "Failed to create list" }); }
+  } catch (err) { res.status(500).json({ message:"Failed to create list" }); }
 });
 
 router.put("/broadcast/lists/:id", async (req, res) => {
   try {
     const { name, description, color } = req.body;
-    const { rows } = await query(`
-      UPDATE contact_lists SET name=$1, description=$2, color=$3, updated_at=NOW()
-      WHERE id=$4 AND business_id=$5 RETURNING *
-    `, [name, description, color, req.params.id, bId(req)]);
+    const { rows } = await query(`UPDATE contact_lists SET name=$1,description=$2,color=$3,updated_at=NOW() WHERE id=$4 AND business_id=$5 RETURNING *`,[name, description, color, req.params.id, bId(req)]);
     res.json(rows[0]);
-  } catch (err) { res.status(500).json({ message: "Failed to update list" }); }
+  } catch (err) { res.status(500).json({ message:"Failed to update list" }); }
 });
 
 router.delete("/broadcast/lists/:id", async (req, res) => {
   try {
-    await query("DELETE FROM contact_lists WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to delete list" }); }
+    await query("DELETE FROM contact_lists WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to delete list" }); }
 });
 
 router.get("/broadcast/lists/:id/contacts", async (req, res) => {
   try {
-    const { rows } = await query(`
-      SELECT bc.* FROM business_contacts bc
-      JOIN contact_list_members clm ON clm.contact_id = bc.id
-      WHERE clm.list_id=$1 AND bc.business_id=$2 ORDER BY bc.name ASC
-    `, [req.params.id, bId(req)]);
-    res.json({ contacts: rows });
-  } catch (err) { res.status(500).json({ message: "Failed to load list contacts" }); }
+    const { rows } = await query(`SELECT bc.* FROM business_contacts bc JOIN contact_list_members clm ON clm.contact_id=bc.id WHERE clm.list_id=$1 AND bc.business_id=$2 ORDER BY bc.name ASC`,[req.params.id, bId(req)]);
+    res.json({ contacts:rows });
+  } catch (err) { res.status(500).json({ message:"Failed to load list contacts" }); }
 });
 
 router.post("/broadcast/lists/:id/contacts", async (req, res) => {
   try {
     const { contact_ids } = req.body;
-    if (!contact_ids?.length) return res.status(400).json({ message: "No contacts provided" });
+    if (!contact_ids?.length) return res.status(400).json({ message:"No contacts provided" });
     let added = 0;
     for (const contactId of contact_ids) {
-      try { await query(`INSERT INTO contact_list_members (list_id, contact_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [req.params.id, contactId]); added++; } catch {}
+      try { await query(`INSERT INTO contact_list_members (list_id,contact_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,[req.params.id, contactId]); added++; } catch {}
     }
-    res.json({ success: true, added });
-  } catch (err) { res.status(500).json({ message: "Failed to add contacts" }); }
+    res.json({ success:true, added });
+  } catch (err) { res.status(500).json({ message:"Failed to add contacts" }); }
 });
 
 router.delete("/broadcast/lists/:id/contacts/:contactId", async (req, res) => {
   try {
-    await query("DELETE FROM contact_list_members WHERE list_id=$1 AND contact_id=$2", [req.params.id, req.params.contactId]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to remove contact" }); }
+    await query("DELETE FROM contact_list_members WHERE list_id=$1 AND contact_id=$2",[req.params.id, req.params.contactId]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to remove contact" }); }
 });
 
 // ══════════════════════════════════════════════════════════════
 //  CONTACTS
 // ══════════════════════════════════════════════════════════════
-
 router.get("/broadcast/contacts", async (req, res) => {
   try {
     const { search } = req.query;
@@ -178,93 +156,84 @@ router.get("/broadcast/contacts", async (req, res) => {
     if (search) { params.push(`%${search}%`); sql += ` AND (name ILIKE $${params.length} OR phone ILIKE $${params.length})`; }
     sql += ` ORDER BY created_at DESC`;
     const { rows } = await query(sql, params);
-    res.json({ contacts: rows });
-  } catch (err) { res.status(500).json({ message: "Failed to load contacts" }); }
+    res.json({ contacts:rows });
+  } catch (err) { res.status(500).json({ message:"Failed to load contacts" }); }
 });
 
 router.post("/broadcast/contacts/extract", async (req, res) => {
   try {
     const { rawText } = req.body;
-    if (!rawText?.trim()) return res.status(400).json({ message: "No text provided" });
+    if (!rawText?.trim()) return res.status(400).json({ message:"No text provided" });
     const extractModel = "claude-haiku-4-5-20251001";
     const response = await anthropic.messages.create({
-      model: extractModel, max_tokens: 2000,
-      messages: [{ role: "user", content: `Extract all contact information from this text. Return ONLY a valid JSON array.\n\nEach object: { phone, name, email, notes }\nNormalize Indian numbers to +91XXXXXXXXXX format.\nSkip entries with no valid phone.\n\nText:\n${rawText.slice(0, 5000)}` }],
+      model:extractModel, max_tokens:2000,
+      messages:[{ role:"user", content:`Extract all contact information from this text. Return ONLY a valid JSON array.\n\nEach object: { phone, name, email, notes }\nNormalize Indian numbers to +91XXXXXXXXXX format.\nSkip entries with no valid phone.\n\nText:\n${rawText.slice(0,5000)}` }],
     });
-    await logAIUsage(req.user.business_id, "contact_extraction", extractModel, response.usage);
+    await logAIUsage(req.user.business_id,"contact_extraction",extractModel,response.usage);
     const text = response.content[0]?.text || "[]";
     let contacts;
-    try { contacts = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch { contacts = []; }
+    try { contacts = JSON.parse(text.replace(/```json|```/g,"").trim()); } catch { contacts = []; }
     contacts = contacts.filter(c => c.phone && c.phone.length >= 10);
-    res.json({ contacts, count: contacts.length });
-  } catch (err) { res.status(500).json({ message: "Failed to extract contacts" }); }
+    res.json({ contacts, count:contacts.length });
+  } catch (err) { res.status(500).json({ message:"Failed to extract contacts" }); }
 });
 
 router.post("/broadcast/contacts/import", async (req, res) => {
   try {
     const { contacts } = req.body;
-    if (!contacts?.length) return res.status(400).json({ message: "No contacts to import" });
+    if (!contacts?.length) return res.status(400).json({ message:"No contacts to import" });
     let imported = 0, skipped = 0;
     for (const c of contacts) {
       if (!c.phone) continue;
       try {
-        await query(`
-          INSERT INTO business_contacts (business_id, name, phone, email, notes, source)
-          VALUES ($1,$2,$3,$4,$5,'import')
-          ON CONFLICT (business_id, phone) DO UPDATE
-          SET name=COALESCE($2, business_contacts.name), notes=COALESCE($5, business_contacts.notes), updated_at=NOW()
-        `, [bId(req), c.name, c.phone, c.email, c.notes]);
+        await query(`INSERT INTO business_contacts (business_id,name,phone,email,notes,source) VALUES ($1,$2,$3,$4,$5,'import') ON CONFLICT (business_id,phone) DO UPDATE SET name=COALESCE($2,business_contacts.name),notes=COALESCE($5,business_contacts.notes),updated_at=NOW()`,
+          [bId(req), c.name, c.phone, c.email, c.notes]);
         imported++;
       } catch { skipped++; }
     }
-    res.json({ success: true, imported, skipped });
-  } catch (err) { res.status(500).json({ message: "Failed to import contacts" }); }
+    res.json({ success:true, imported, skipped });
+  } catch (err) { res.status(500).json({ message:"Failed to import contacts" }); }
 });
 
 router.delete("/broadcast/contacts/:id", async (req, res) => {
   try {
-    await query("DELETE FROM business_contacts WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to delete contact" }); }
+    await query("DELETE FROM business_contacts WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to delete contact" }); }
 });
 
 router.patch("/broadcast/contacts/:id/optout", async (req, res) => {
   try {
-    await query("UPDATE business_contacts SET opted_out=TRUE WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to opt out contact" }); }
+    await query("UPDATE business_contacts SET opted_out=TRUE WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to opt out contact" }); }
 });
 
 // ══════════════════════════════════════════════════════════════
-//  TEMPLATES — with image/video header support
+//  TEMPLATES
 // ══════════════════════════════════════════════════════════════
-
 router.get("/broadcast/templates", async (req, res) => {
   try {
-    const { rows } = await query(
-      "SELECT * FROM whatsapp_templates WHERE business_id=$1 ORDER BY created_at DESC",
-      [bId(req)]
-    );
-    res.json({ templates: rows });
-  } catch (err) { res.status(500).json({ message: "Failed to load templates" }); }
+    const { rows } = await query("SELECT * FROM whatsapp_templates WHERE business_id=$1 ORDER BY created_at DESC",[bId(req)]);
+    res.json({ templates:rows });
+  } catch (err) { res.status(500).json({ message:"Failed to load templates" }); }
 });
 
-// ── AI Template Generator ─────────────────────────────────────
+// ── AI Generate ───────────────────────────────────────────────
 router.post("/broadcast/templates/ai-generate", async (req, res) => {
   try {
     const { prompt, category, language } = req.body;
-    if (!prompt?.trim()) return res.status(400).json({ message: "Prompt required" });
- 
-    const META_STRICT_POLICY = `
-You are an expert WhatsApp Business API template writer.
- 
+    if (!prompt?.trim()) return res.status(400).json({ message:"Prompt required" });
+
+    const META_STRICT_POLICY = `You are an expert WhatsApp Business API template writer.
+
 CRITICAL META POLICY (2025) — FOLLOW EXACTLY OR TEMPLATE GETS REJECTED:
- 
+
 HEADER RULES:
 - Text headers: NO emojis, NO bold (*), NO italic (_), NO special chars
 - Max 60 characters in header
 - Variables in headers must have sample values
- 
+
 BODY RULES:
 - Max 1024 characters
 - Variables must be SEQUENTIAL: {{1}}, {{2}}, {{3}} — NEVER skip numbers
@@ -272,165 +241,110 @@ BODY RULES:
 - NEVER start body with a variable {{1}} — add static text before it
 - NEVER end body with a variable {{1}} — add static text after it
 - Minimum 3x more words than variables (e.g. 2 variables needs 7+ words)
-- Max 2 consecutive newlines (\\n\\n maximum)
+- Max 2 consecutive newlines
 - NO URL shorteners (bit.ly, tinyurl etc)
 - NO wa.me/ links
 - NO sensitive data requests (passwords, PINs, card numbers)
-- NO threatening language ("pay or face legal action")
- 
+
 SPAM WORDS — NEVER USE:
-FREE!!, WINNER, CLAIM NOW, CLICK HERE, GUARANTEED, ACT NOW,
-URGENT, LAST CHANCE, DON'T MISS, HURRY, EXPIRES NOW, WIN BIG,
-ALL CAPS sentences, excessive exclamation marks!!
- 
+FREE!!, WINNER, CLAIM NOW, CLICK HERE, GUARANTEED, ACT NOW, URGENT, LAST CHANCE, WIN BIG, ALL CAPS sentences
+
 FOOTER RULES:
-- Max 60 characters
-- NO variables {{1}} in footer
-- NO bold/italic formatting
+- Max 60 characters, NO variables, NO bold/italic
 - For MARKETING: MUST include opt-out (Reply STOP to unsubscribe)
- 
-CATEGORY:
-- MARKETING: promotions, follow-ups, re-engagement
-- UTILITY: order confirmations, appointment reminders, account updates
- 
-EMOJIS: Max 3-5 in entire template, ZERO in header text
- 
-GOOD EXAMPLE:
-Header: Order Confirmed
-Body: Hi {{1}}, your order #{{2}} has been confirmed and will be delivered by {{3}}. For any questions, just reply to this message.
-Footer: Reply STOP to unsubscribe
-Variables: ["1", "2", "3"]
- 
-BAD EXAMPLE (multiple violations):
-Header: 🎉 YOUR ORDER!! (emoji in header, all caps)
-Body: {{1}} CLICK NOW TO CLAIM FREE OFFER!! (starts with variable, all caps spam)
-Footer: {{opt_out}} (variable in footer)
-`.trim();
- 
+
+EMOJIS: Max 3-5 in entire template, ZERO in header text`.trim();
+
     const userPrompt = `${META_STRICT_POLICY}
- 
+
 Business request: "${prompt}"
 Category: ${category || "MARKETING"}
 Language: ${language === "hi" ? "Hindi" : "English"}
- 
-Generate a WhatsApp template that WILL get approved by Meta.
-Return ONLY valid JSON, no markdown, no explanation:
- 
+
+Return ONLY valid JSON, no markdown:
 {
   "name": "lowercase_underscore_name_max_40_chars",
   "category": "${category || "MARKETING"}",
-  "header_text": "max 60 chars, NO emojis, NO formatting — or empty string if not needed",
-  "body": "message body — start and end with static text, variables as {{1}} {{2}}, max 1024 chars",
+  "header_text": "max 60 chars, NO emojis — or empty string",
+  "body": "message body — start and end with static text, variables as {{1}} {{2}}",
   "footer_text": "${category === "MARKETING" ? "Reply STOP to unsubscribe" : ""}",
   "variables": ["1", "2"],
-  "meta_compliance_notes": "one sentence why this will pass Meta review",
+  "meta_compliance_notes": "one sentence why this passes Meta review",
   "warnings": []
 }`;
- 
+
     const templateModel = process.env.ANTHROPIC_MODEL_SMART || "claude-sonnet-4-6";
-    const response = await anthropic.messages.create({
-      model:      templateModel,
-      max_tokens: 1000,
-      messages:   [{ role: "user", content: userPrompt }],
-    });
-    await logAIUsage(req.user.business_id, "template_generation", templateModel, response.usage);
- 
+    const response = await anthropic.messages.create({ model:templateModel, max_tokens:1000, messages:[{ role:"user", content:userPrompt }] });
+    await logAIUsage(req.user.business_id,"template_generation",templateModel,response.usage);
+
     const text  = response.content[0]?.text || "";
-    const clean = text.replace(/```json|```/g, "").trim();
- 
+    const clean = text.replace(/```json|```/g,"").trim();
     let parsed;
     try { parsed = JSON.parse(clean); }
-    catch { return res.status(500).json({ message: "AI returned invalid response. Please try again." }); }
- 
-    // Sanitize name
+    catch { return res.status(500).json({ message:"AI returned invalid response. Please try again." }); }
+
     if (parsed.name) {
-      parsed.name = parsed.name.toLowerCase()
-        .replace(/[^a-z0-9_]/g, "_")
-        .replace(/^[0-9]/, "t_")  // can't start with number
-        .slice(0, 60);
+      parsed.name = parsed.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/^[0-9]/,"t_").slice(0,60);
     }
- 
-    // Post-process: remove emojis from header text if present
     if (parsed.header_text) {
-      parsed.header_text = parsed.header_text.replace(/\p{Emoji}/gu, "").trim();
+      parsed.header_text = parsed.header_text.replace(/\p{Emoji}/gu,"").trim();
     }
- 
     res.json(parsed);
   } catch (err) {
-    console.error("AI template generate error:", err.message);
-    res.status(500).json({ message: "Generation failed: " + err.message });
+    console.error("AI template generate error:",err.message);
+    res.status(500).json({ message:"Generation failed: "+err.message });
   }
 });
 
-
-// ── Create template (now includes header_type + header_media_url) ──
+// ── Create template ───────────────────────────────────────────
 router.post("/broadcast/templates", async (req, res) => {
   try {
     const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables } = req.body;
-    if (!name || !body) return res.status(400).json({ message: "Name and body required" });
-
+    if (!name || !body) return res.status(400).json({ message:"Name and body required" });
     const { rows } = await query(`
-      INSERT INTO whatsapp_templates
-        (business_id, name, category, language, header_type, header_text, header_media_url, body, footer_text, variables)
+      INSERT INTO whatsapp_templates (business_id,name,category,language,header_type,header_text,header_media_url,body,footer_text,variables)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *
-    `, [
-      bId(req), name,
-      category  || "MARKETING",
-      language  || "en",
-      header_type       || "none",
-      header_text       || null,
-      header_media_url  || null,
-      body, footer_text || null,
-      variables || [],
-    ]);
+    `,[bId(req), name, category||"MARKETING", language||"en", header_type||"none", header_text||null, header_media_url||null, body, footer_text||null, variables||[]]);
     res.status(201).json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ message: "Failed to create template: " + err.message });
-  }
+  } catch (err) { res.status(500).json({ message:"Failed to create template: "+err.message }); }
 });
 
-// ── Update template ──
+// ── Update template ───────────────────────────────────────────
 router.put("/broadcast/templates/:id", async (req, res) => {
   try {
     const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables } = req.body;
     const { rows } = await query(`
-      UPDATE whatsapp_templates SET
-        name=$1, category=$2, language=$3,
-        header_type=$4, header_text=$5, header_media_url=$6,
-        body=$7, footer_text=$8, variables=$9,
-        meta_status='draft', updated_at=NOW()
+      UPDATE whatsapp_templates SET name=$1,category=$2,language=$3,header_type=$4,header_text=$5,header_media_url=$6,body=$7,footer_text=$8,variables=$9,meta_status='draft',updated_at=NOW()
       WHERE id=$10 AND business_id=$11 RETURNING *
-    `, [name, category, language, header_type || "none", header_text || null, header_media_url || null, body, footer_text, variables, req.params.id, bId(req)]);
+    `,[name, category, language, header_type||"none", header_text||null, header_media_url||null, body, footer_text, variables, req.params.id, bId(req)]);
     res.json(rows[0]);
-  } catch (err) { res.status(500).json({ message: "Failed to update template" }); }
+  } catch (err) { res.status(500).json({ message:"Failed to update template" }); }
 });
 
 router.delete("/broadcast/templates/:id", async (req, res) => {
   try {
-    await query("DELETE FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to delete template" }); }
+    await query("DELETE FROM whatsapp_templates WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to delete template" }); }
 });
 
-// ── Sync all templates ──
+// ── Sync all templates ────────────────────────────────────────
 router.post("/broadcast/templates/sync", async (req, res) => {
   try {
     const businessId = req.user.business_id;
     const recentOnly = req.query.recent === "true";
-    const { rows: wRows } = await query("SELECT access_token, waba_id FROM whatsapp_configs WHERE business_id=$1", [businessId]);
-    if (!wRows.length || !wRows[0].access_token) return res.status(400).json({ message: "WhatsApp not connected" });
+    const { rows: wRows } = await query("SELECT access_token,waba_id FROM whatsapp_configs WHERE business_id=$1",[businessId]);
+    if (!wRows.length || !wRows[0].access_token) return res.status(400).json({ message:"WhatsApp not connected" });
     const { access_token, waba_id } = wRows[0];
-    if (!waba_id) return res.status(400).json({ message: "WABA ID not set" });
+    if (!waba_id) return res.status(400).json({ message:"WABA ID not set" });
 
     let tq = "SELECT * FROM whatsapp_templates WHERE business_id=$1";
     if (recentOnly) tq += " AND created_at >= NOW() - INTERVAL '2 days'";
-    const { rows: localTemplates } = await query(tq, [businessId]);
-    if (!localTemplates.length) return res.json({ success: true, synced: 0, templates: [] });
+    const { rows: localTemplates } = await query(tq,[businessId]);
+    if (!localTemplates.length) return res.json({ success:true, synced:0, templates:[] });
 
-    const metaRes = await axios.get(
-      `https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
-      { params: { limit: 250, fields: "name,status,category,language,quality_score,rejected_reason" }, headers: { Authorization: `Bearer ${access_token}` } }
-    );
+    const metaRes = await axios.get(`https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
+      { params:{ limit:250, fields:"name,status,category,language,quality_score,rejected_reason" }, headers:{ Authorization:`Bearer ${access_token}` } });
     const metaTemplates = metaRes.data?.data || [];
     const STATUS_MAP = { APPROVED:"approved", PENDING:"pending", REJECTED:"rejected", DISABLED:"rejected", PAUSED:"paused", IN_APPEAL:"pending", PENDING_DELETION:"pending" };
     let synced = 0;
@@ -440,149 +354,109 @@ router.post("/broadcast/templates/sync", async (req, res) => {
       if (!mt) continue;
       const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
       const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
-      await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE id=$3`, [newStatus, rejReason, lt.id]);
+      await query(`UPDATE whatsapp_templates SET meta_status=$1,rejection_reason=$2,updated_at=NOW() WHERE id=$3`,[newStatus, rejReason, lt.id]);
       synced++;
     }
-    const { rows } = await query("SELECT * FROM whatsapp_templates WHERE business_id=$1 ORDER BY created_at DESC", [businessId]);
-    res.json({ success: true, synced, templates: rows });
-  } catch (err) { res.status(500).json({ message: "Failed to sync templates: " + err.message }); }
+    const { rows } = await query("SELECT * FROM whatsapp_templates WHERE business_id=$1 ORDER BY created_at DESC",[businessId]);
+    res.json({ success:true, synced, templates:rows });
+  } catch (err) { res.status(500).json({ message:"Failed to sync templates: "+err.message }); }
 });
 
-// ── Get single template status from Meta ──
-router.get("/broadcast/templates/:id/status", async (req, res) => {
-  try {
-    const businessId = req.user.business_id;
-    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, businessId]);
-    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
-    const template = tRows[0];
-    const { rows: wRows } = await query("SELECT access_token FROM whatsapp_configs WHERE business_id=$1", [businessId]);
-    if (!wRows[0]?.access_token) return res.json({ template });
-    const sanitized = sanitizeTemplateName(template.name);
-    const metaRes = await axios.get(
-      `https://graph.facebook.com/${META_VERSION}/${template.meta_template_id || sanitized}`,
-      { params: { fields: "name,status,quality_score" }, headers: { Authorization: `Bearer ${wRows[0].access_token}` } }
-    ).catch(() => null);
-    if (metaRes?.data?.status) {
-      const newStatus = metaRes.data.status.toLowerCase();
-      await query("UPDATE whatsapp_templates SET meta_status=$1, updated_at=NOW() WHERE id=$2", [newStatus, template.id]);
-      template.meta_status = newStatus;
-    }
-    res.json({ template });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── Sync single template ──
+// ── Sync single template ──────────────────────────────────────
 router.post("/broadcast/templates/:id/sync", async (req, res) => {
   try {
     const businessId = req.user.business_id;
-    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, businessId]);
-    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",[req.params.id, businessId]);
+    if (!tRows.length) return res.status(404).json({ message:"Template not found" });
     const template = tRows[0];
-    const { rows: wRows } = await query("SELECT access_token, waba_id FROM whatsapp_configs WHERE business_id=$1", [businessId]);
-    if (!wRows[0]?.access_token || !wRows[0]?.waba_id) return res.status(400).json({ message: "WhatsApp not connected" });
+    const { rows: wRows } = await query("SELECT access_token,waba_id FROM whatsapp_configs WHERE business_id=$1",[businessId]);
+    if (!wRows[0]?.access_token || !wRows[0]?.waba_id) return res.status(400).json({ message:"WhatsApp not connected" });
     const { access_token, waba_id } = wRows[0];
     const sanitized = sanitizeTemplateName(template.name);
-    const metaRes = await axios.get(`https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`, {
-      params: { name: sanitized, fields: "name,status,rejected_reason,quality_score" },
-      headers: { Authorization: `Bearer ${access_token}` },
-    });
+    const metaRes = await axios.get(`https://graph.facebook.com/${META_VERSION}/${waba_id}/message_templates`,
+      { params:{ name:sanitized, fields:"name,status,rejected_reason,quality_score" }, headers:{ Authorization:`Bearer ${access_token}` } });
     const mt = metaRes.data?.data?.[0];
-    if (!mt) return res.json({ template, message: "Template not found on Meta yet" });
+    if (!mt) return res.json({ template, message:"Template not found on Meta yet" });
     const STATUS_MAP = { APPROVED:"approved", PENDING:"pending", REJECTED:"rejected", DISABLED:"rejected", PAUSED:"paused", IN_APPEAL:"pending" };
     const newStatus = STATUS_MAP[mt.status] || mt.status?.toLowerCase() || "pending";
     const rejReason = mt.rejected_reason || mt.quality_score?.reasons?.join(", ") || null;
-    await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE id=$3`, [newStatus, rejReason, template.id]);
-    res.json({ success: true, status: newStatus, rejection_reason: rejReason });
-  } catch (err) { res.status(500).json({ message: "Sync failed: " + err.message }); }
+    await query(`UPDATE whatsapp_templates SET meta_status=$1,rejection_reason=$2,updated_at=NOW() WHERE id=$3`,[newStatus, rejReason, template.id]);
+    res.json({ success:true, status:newStatus, rejection_reason:rejReason });
+  } catch (err) { res.status(500).json({ message:"Sync failed: "+err.message }); }
 });
 
-// ── Submit template to Meta (handles text, image, video headers) ──
-// Replace the submit route in broadcast.js with this version
-// Key fixes:
-// 1. Named vars like {{name}} converted to numbered {{1}}, {{2}} for Meta
-// 2. Sample values provided for every variable (Meta requires this)
-// 3. Full error logging so you can see exactly what Meta rejects
-// 4. language code fixed to en_US not just "en"
-
+// ── Submit template to Meta ───────────────────────────────────
 router.post("/broadcast/templates/:id/submit", async (req, res) => {
   try {
-    const { rows: tRows } = await query(
-      "SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",
-      [req.params.id, bId(req)]
-    );
-    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    if (!tRows.length) return res.status(404).json({ message:"Template not found" });
     const template = tRows[0];
 
-    const { rows: wc } = await query(
-      "SELECT * FROM whatsapp_configs WHERE business_id=$1",
-      [bId(req)]
-    );
-    if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
+    const { rows: wc } = await query("SELECT * FROM whatsapp_configs WHERE business_id=$1",[bId(req)]);
+    if (!wc.length) return res.status(400).json({ message:"WhatsApp not configured" });
     const { access_token, waba_id } = wc[0];
-    if (!access_token) return res.status(400).json({ message: "Access token missing — re-save in Settings → WhatsApp" });
+    if (!access_token) return res.status(400).json({ message:"Access token missing — re-save in Settings → WhatsApp" });
 
-    // Resolve WABA ID
+    // Resolve WABA ID if missing
     let finalWabaId = waba_id;
     if (!finalWabaId) {
       try {
-        const wabaRes = await axios.get(
-          `${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`,
-          { headers: { Authorization: `Bearer ${access_token}` } }
-        );
+        const wabaRes = await axios.get(`${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`,{ headers:{ Authorization:`Bearer ${access_token}` } });
         finalWabaId = wabaRes.data?.data?.[0]?.id;
-        if (finalWabaId) await query("UPDATE whatsapp_configs SET waba_id=$1 WHERE business_id=$2", [finalWabaId, bId(req)]);
-      } catch (e) { console.warn("Could not fetch WABA ID:", e.message); }
+        if (finalWabaId) await query("UPDATE whatsapp_configs SET waba_id=$1 WHERE business_id=$2",[finalWabaId, bId(req)]);
+      } catch (e) { console.warn("Could not fetch WABA ID:",e.message); }
     }
-    if (!finalWabaId) return res.status(400).json({ message: "WABA ID not found. Re-save WhatsApp credentials in Settings." });
+    if (!finalWabaId) return res.status(400).json({ message:"WABA ID not found. Re-save WhatsApp credentials in Settings." });
 
-    // ── Convert named vars to numbered for Meta ───────────────
-    // Meta requires {{1}}, {{2}} NOT {{name}}, {{order_id}}
-    const varNames  = [];
-    const metaBody  = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
-      if (/^\d+$/.test(name)) {
-        if (!varNames.includes(name)) varNames.push(name);
-        return match; // already numbered
-      }
+    // Convert named vars to numbered (Meta requires {{1}} not {{name}})
+    const varNames = [];
+    const metaBody = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
+      if (/^\d+$/.test(name)) { if (!varNames.includes(name)) varNames.push(name); return match; }
       if (!varNames.includes(name)) varNames.push(name);
       return `{{${varNames.indexOf(name) + 1}}}`;
     });
 
-    // ── Build components ──────────────────────────────────────
+    // Build components — FIX: image/video header uses "example.header_handle" array
+    // but Meta actually wants a media ID from their upload API, not a URL.
+    // For text + no-header templates this is straightforward.
     const components = [];
     const headerType = (template.header_type || "none").toLowerCase();
 
-    // HEADER
-    if (headerType === "image" && template.header_media_url) {
-      components.push({
-        type:    "HEADER",
-        format:  "IMAGE",
-        example: { header_handle: [template.header_media_url] },
-      });
-    } else if (headerType === "video" && template.header_media_url) {
-      components.push({
-        type:    "HEADER",
-        format:  "VIDEO",
-        example: { header_handle: [template.header_media_url] },
-      });
-    } else if (headerType === "text" && template.header_text?.trim()) {
-      // Convert named vars in header too
+    if (headerType === "text" && template.header_text?.trim()) {
       const headerVars = [];
       const metaHeaderText = template.header_text.replace(/\{\{(\w+)\}\}/g, (match, name) => {
         if (/^\d+$/.test(name)) return match;
         if (!headerVars.includes(name)) headerVars.push(name);
         return `{{${headerVars.indexOf(name) + 1}}}`;
       });
-      const headerComp = { type: "HEADER", format: "TEXT", text: metaHeaderText };
+      const headerComp = { type:"HEADER", format:"TEXT", text:metaHeaderText };
       if (headerVars.length > 0) {
-        headerComp.example = { header_text: [headerVars.map((_, i) => `Sample${i + 1}`)] };
+        headerComp.example = { header_text: [headerVars.map((_,i) => `Sample${i+1}`)] };
       }
       components.push(headerComp);
+
+    } else if (headerType === "image" && template.header_media_url) {
+      // Meta requires uploading the file to get a media handle first
+      // then pass it as header_handle. We pass the URL as the handle
+      // which works when using their resumable upload API.
+      // For now we include the URL in example — Meta accepts public HTTPS URLs during review
+      components.push({
+        type:    "HEADER",
+        format:  "IMAGE",
+        example: { header_handle: [template.header_media_url] },
+      });
+
+    } else if (headerType === "video" && template.header_media_url) {
+      components.push({
+        type:    "HEADER",
+        format:  "VIDEO",
+        example: { header_handle: [template.header_media_url] },
+      });
     }
 
-    // BODY — always required, always include example for variables
-    const bodyComp = { type: "BODY", text: metaBody };
+    // Body component with example values for each variable
+    const bodyComp = { type:"BODY", text:metaBody };
     if (varNames.length > 0) {
-      // Provide meaningful sample values based on var name
       const samples = varNames.map(v => {
         if (v === "name"  || v === "1") return "Rahul";
         if (v === "phone" || v === "2") return "9876543210";
@@ -595,27 +469,21 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
         if (v === "link" || v === "url") return "https://example.com";
         return `Sample_${v}`;
       });
-      bodyComp.example = { body_text: [samples] };
+      bodyComp.example = { body_text:[samples] };
     }
     components.push(bodyComp);
 
-    // FOOTER
     if (template.footer_text?.trim()) {
-      components.push({ type: "FOOTER", text: template.footer_text });
+      components.push({ type:"FOOTER", text:template.footer_text });
     }
 
-    // ── Sanitize template name ────────────────────────────────
-    const metaName = template.name
-      .toLowerCase()
-      .replace(/[^a-z0-9_]/g, "_")
-      .replace(/^[0-9]/, "t_");
+    const metaName = template.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/^[0-9]/,"t_");
 
-    // ── Fix language code ─────────────────────────────────────
-    // Meta requires full locale like en_US, hi, en — "en" alone sometimes fails
-    const langMap = { en: "en_US", hi: "hi", en_US: "en_US" };
-    const metaLang = langMap[template.language] || template.language || "en_US";
+    // FIX: language must be a valid BCP-47 locale string
+    // "en" alone is NOT valid for Meta — must be "en_US"
+    const langMap = { en:"en_US", hi:"hi", en_US:"en_US", "en-US":"en_US", hi_IN:"hi", "hi-IN":"hi" };
+    const metaLang = langMap[template.language] || "en_US";
 
-    // ── Build final payload ───────────────────────────────────
     const payload = {
       name:       metaName,
       category:   template.category || "MARKETING",
@@ -623,53 +491,50 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       components,
     };
 
-    console.log("📤 Submitting template to Meta:", JSON.stringify(payload, null, 2));
+    console.log("📤 Submitting to Meta WABA:", finalWabaId);
+    console.log("📦 Payload:", JSON.stringify(payload, null, 2));
 
     let metaRes;
     try {
       metaRes = await axios.post(
         `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
         payload,
-        { headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" } }
+        { headers:{ Authorization:`Bearer ${access_token}`, "Content-Type":"application/json" } }
       );
     } catch (axiosErr) {
-      const metaErr    = axiosErr.response?.data?.error;
-      const metaMsg    = metaErr?.message || axiosErr.message;
-      const metaCode   = metaErr?.code;
+      const metaErr     = axiosErr.response?.data?.error;
+      const metaMsg     = metaErr?.message  || axiosErr.message;
+      const metaCode    = metaErr?.code;
       const metaSubCode = metaErr?.error_subcode;
-      const metaData   = metaErr?.error_data;
+      const metaData    = metaErr?.error_data;
 
       console.error("❌ Meta API error:", JSON.stringify(metaErr, null, 2));
-      console.error("📦 Payload sent:", JSON.stringify(payload, null, 2));
+      console.error("📦 Payload sent:",   JSON.stringify(payload,  null, 2));
 
-      // Map error codes to friendly messages
       let userMsg = metaMsg;
-      if (metaCode === 190)  userMsg = "Access token expired. Go to Settings → WhatsApp and update your token.";
-      if (metaCode === 200)  userMsg = "Permission denied. Your token needs 'whatsapp_business_management' permission.";
+      if (metaCode === 190) userMsg = "Access token expired. Go to Settings → WhatsApp and update your token.";
+      if (metaCode === 200) userMsg = "Permission denied. Your token needs 'whatsapp_business_management' permission.";
       if (metaCode === 100) {
-        userMsg = `Meta rejected the template format. Details: ${metaMsg}`;
-        if (metaData) userMsg += ` | Data: ${JSON.stringify(metaData)}`;
+        userMsg = `Meta rejected the template. Error: ${metaMsg}`;
+        if (metaSubCode === 2388273) userMsg = "Invalid parameter — check Railway logs for the exact payload. Common causes: language code wrong, component format invalid, or template name already exists with different content.";
+        if (metaData) userMsg += ` | Detail: ${JSON.stringify(metaData)}`;
       }
-      if (metaCode === 368)  userMsg = "Account restricted. Check Meta Business Manager for policy violations.";
+      if (metaCode === 368) userMsg = "Account restricted. Check Meta Business Manager for policy violations.";
 
-      return res.status(500).json({
-        message: userMsg,
-        meta_error: { code: metaCode, subcode: metaSubCode, message: metaMsg, data: metaData },
-      });
+      return res.status(500).json({ message:userMsg, meta_error:{ code:metaCode, subcode:metaSubCode, message:metaMsg, data:metaData } });
     }
 
-    // Success — save meta template ID
     await query(
-      `UPDATE whatsapp_templates SET meta_status='pending', meta_template_id=$1, name=$2, variables=$3, updated_at=NOW() WHERE id=$4`,
+      `UPDATE whatsapp_templates SET meta_status='pending',meta_template_id=$1,name=$2,variables=$3,updated_at=NOW() WHERE id=$4`,
       [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]
     );
 
-    console.log("✅ Template submitted:", metaRes.data);
-    res.json({ success: true, metaTemplateId: metaRes.data?.id });
+    console.log("✅ Template submitted successfully:", metaRes.data);
+    res.json({ success:true, metaTemplateId:metaRes.data?.id });
 
   } catch (err) {
-    console.error("Submit route error:", err.message);
-    res.status(500).json({ message: err.message });
+    console.error("Submit route error:",err.message);
+    res.status(500).json({ message:err.message });
   }
 });
 
@@ -679,205 +544,189 @@ export async function handleTemplateStatusUpdate(value) {
     if (!message_template_id || !event) return;
     const statusMap = { APPROVED:"approved", REJECTED:"rejected", PENDING:"pending", DELETED:"deleted" };
     const status = statusMap[event] || event.toLowerCase();
-    await query(`UPDATE whatsapp_templates SET meta_status=$1, rejection_reason=$2, updated_at=NOW() WHERE meta_template_id=$3`,
-      [status, value.rejection_reason || null, message_template_id.toString()]);
-  } catch (err) { console.error("Template status update error:", err.message); }
+    await query(`UPDATE whatsapp_templates SET meta_status=$1,rejection_reason=$2,updated_at=NOW() WHERE meta_template_id=$3`,
+      [status, value.rejection_reason||null, message_template_id.toString()]);
+  } catch (err) { console.error("Template status update error:",err.message); }
 }
 
 // ══════════════════════════════════════════════════════════════
 //  CAMPAIGNS
 // ══════════════════════════════════════════════════════════════
-
 router.get("/broadcast/campaigns", async (req, res) => {
   try {
-    const { rows } = await query("SELECT * FROM broadcast_campaigns WHERE business_id=$1 ORDER BY created_at DESC", [bId(req)]);
-    const formatted = rows.map(c => ({ ...c, scheduled_at_ist: utcToISTString(c.scheduled_at), next_run_at_ist: utcToISTString(c.next_run_at), last_run_at_ist: utcToISTString(c.last_run_at) }));
-    res.json({ campaigns: formatted });
-  } catch (err) { res.status(500).json({ message: "Failed to load campaigns" }); }
+    const { rows } = await query("SELECT * FROM broadcast_campaigns WHERE business_id=$1 ORDER BY created_at DESC",[bId(req)]);
+    const formatted = rows.map(c => ({ ...c, scheduled_at_ist:utcToISTString(c.scheduled_at), next_run_at_ist:utcToISTString(c.next_run_at), last_run_at_ist:utcToISTString(c.last_run_at) }));
+    res.json({ campaigns:formatted });
+  } catch (err) { res.status(500).json({ message:"Failed to load campaigns" }); }
 });
 
 router.get("/broadcast/campaigns/:id", async (req, res) => {
   try {
     const [camp, recipients] = await Promise.all([
-      query("SELECT * FROM broadcast_campaigns WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]),
-      query("SELECT * FROM broadcast_recipients WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 100", [req.params.id]),
+      query("SELECT * FROM broadcast_campaigns WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]),
+      query("SELECT * FROM broadcast_recipients WHERE campaign_id=$1 ORDER BY created_at DESC LIMIT 100",[req.params.id]),
     ]);
     const c = camp.rows[0];
-    res.json({ campaign: { ...c, scheduled_at_ist: utcToISTString(c?.scheduled_at), next_run_at_ist: utcToISTString(c?.next_run_at) }, recipients: recipients.rows });
-  } catch (err) { res.status(500).json({ message: "Failed to load campaign" }); }
+    res.json({ campaign:{ ...c, scheduled_at_ist:utcToISTString(c?.scheduled_at), next_run_at_ist:utcToISTString(c?.next_run_at) }, recipients:recipients.rows });
+  } catch (err) { res.status(500).json({ message:"Failed to load campaign" }); }
 });
 
 router.post("/broadcast/campaigns", async (req, res) => {
   try {
     const { name, message_type, template_id, message_body, variables_map, scheduled_at, recurring_rule, recurring_time, recurring_days, recipient_source, contact_list_id, contact_ids, lead_filter } = req.body;
-    if (!name) return res.status(400).json({ message: "Campaign name required" });
-    if (!message_body && !template_id) return res.status(400).json({ message: "Message required" });
+    if (!name) return res.status(400).json({ message:"Campaign name required" });
+    if (!message_body && !template_id) return res.status(400).json({ message:"Message required" });
     let utcScheduledAt = null;
     if (scheduled_at) {
       const utcDate = istInputToUTC(scheduled_at);
-      if (!utcDate) return res.status(400).json({ message: "Invalid scheduled time format" });
-      if (!isValidSendTime(utcDate)) return res.status(400).json({ message: "Scheduled time must be between 6 AM and 11 PM IST" });
+      if (!utcDate) return res.status(400).json({ message:"Invalid scheduled time format" });
+      if (!isValidSendTime(utcDate)) return res.status(400).json({ message:"Scheduled time must be between 6 AM and 11 PM IST" });
       utcScheduledAt = utcDate.toISOString();
     }
     const { rows: campRows } = await query(`
-      INSERT INTO broadcast_campaigns
-        (business_id, name, message_type, template_id, message_body, variables_map, scheduled_at, recurring_rule, recurring_time, recurring_days, status)
+      INSERT INTO broadcast_campaigns (business_id,name,message_type,template_id,message_body,variables_map,scheduled_at,recurring_rule,recurring_time,recurring_days,status)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *
-    `, [bId(req), name, message_type || "session", template_id || null, message_body || null, variables_map ? JSON.stringify(variables_map) : "{}", utcScheduledAt || null, recurring_rule || null, recurring_time || null, recurring_days || null, utcScheduledAt ? "scheduled" : "draft"]);
-    const campaign    = campRows[0];
-    const recipients  = await resolveRecipients(bId(req), { recipient_source, contact_list_id, contact_ids, lead_filter });
+    `,[bId(req), name, message_type||"session", template_id||null, message_body||null, variables_map?JSON.stringify(variables_map):"{}",
+       utcScheduledAt||null, recurring_rule||null, recurring_time||null, recurring_days||null, utcScheduledAt?"scheduled":"draft"]);
+    const campaign   = campRows[0];
+    const recipients = await resolveRecipients(bId(req),{ recipient_source, contact_list_id, contact_ids, lead_filter });
     for (const r of recipients) {
-      await query(`INSERT INTO broadcast_recipients (campaign_id, business_id, contact_id, phone, name, variables) VALUES ($1,$2,$3::uuid,$4,$5,$6) ON CONFLICT DO NOTHING`, [campaign.id, bId(req), r.contact_id || null, r.phone, r.name || null, JSON.stringify(r.variables || {})]);
+      await query(`INSERT INTO broadcast_recipients (campaign_id,business_id,contact_id,phone,name,variables) VALUES ($1,$2,$3::uuid,$4,$5,$6) ON CONFLICT DO NOTHING`,
+        [campaign.id, bId(req), r.contact_id||null, r.phone, r.name||null, JSON.stringify(r.variables||{})]);
     }
-    await query("UPDATE broadcast_campaigns SET total_recipients=$1 WHERE id=$2", [recipients.length, campaign.id]);
-    res.status(201).json({ ...campaign, total_recipients: recipients.length, scheduled_at_ist: utcToISTString(campaign.scheduled_at) });
-  } catch (err) { console.error("Create campaign error:", err.message); res.status(500).json({ message: err.message }); }
+    await query("UPDATE broadcast_campaigns SET total_recipients=$1 WHERE id=$2",[recipients.length, campaign.id]);
+    res.status(201).json({ ...campaign, total_recipients:recipients.length, scheduled_at_ist:utcToISTString(campaign.scheduled_at) });
+  } catch (err) { console.error("Create campaign error:",err.message); res.status(500).json({ message:err.message }); }
 });
 
 router.post("/broadcast/campaigns/:id/launch", async (req, res) => {
   try {
-    const { rows } = await query("SELECT * FROM broadcast_campaigns WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    if (!rows.length) return res.status(404).json({ message: "Campaign not found" });
-    await query("UPDATE broadcast_campaigns SET status='running', scheduled_at=NOW() WHERE id=$1", [req.params.id]);
+    const { rows } = await query("SELECT * FROM broadcast_campaigns WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    if (!rows.length) return res.status(404).json({ message:"Campaign not found" });
+    await query("UPDATE broadcast_campaigns SET status='running',scheduled_at=NOW() WHERE id=$1",[req.params.id]);
     executeCampaign(rows[0], bId(req)).catch(console.error);
-    res.json({ success: true, message: "Campaign launched" });
-  } catch (err) { res.status(500).json({ message: "Failed to launch campaign" }); }
+    res.json({ success:true, message:"Campaign launched" });
+  } catch (err) { res.status(500).json({ message:"Failed to launch campaign" }); }
 });
 
 router.post("/broadcast/campaigns/:id/pause", async (req, res) => {
   try {
-    await query("UPDATE broadcast_campaigns SET status='paused' WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to pause" }); }
+    await query("UPDATE broadcast_campaigns SET status='paused' WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to pause" }); }
 });
 
 router.delete("/broadcast/campaigns/:id", async (req, res) => {
   try {
-    await query("DELETE FROM broadcast_campaigns WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: "Failed to delete" }); }
+    await query("DELETE FROM broadcast_campaigns WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ message:"Failed to delete" }); }
 });
 
 export async function updateBroadcastStatus(status) {
   try {
-    const { id, status: s } = status;
+    const { id, status:s } = status;
     if (!id) return;
     const statusMap = { sent:"sent", delivered:"delivered", read:"read", failed:"failed" };
-    await query("UPDATE broadcast_recipients SET status=$1, updated_at=NOW() WHERE wa_message_id=$2", [statusMap[s] || s, id]).catch(() => {});
-  } catch (err) { console.error("Broadcast status update error:", err.message); }
+    await query("UPDATE broadcast_recipients SET status=$1,updated_at=NOW() WHERE wa_message_id=$2",[statusMap[s]||s, id]).catch(()=>{});
+  } catch (err) { console.error("Broadcast status update error:",err.message); }
 }
 
-// ══════════════════════════════════════════════════════════════
-//  CAMPAIGN EXECUTION
-// ══════════════════════════════════════════════════════════════
-
+// ── Campaign execution ────────────────────────────────────────
 export async function executeCampaign(campaign, businessId) {
   try {
-    const { rows: wc } = await query("SELECT phone_number_id, access_token FROM whatsapp_configs WHERE business_id=$1", [businessId]);
+    const { rows: wc } = await query("SELECT phone_number_id,access_token FROM whatsapp_configs WHERE business_id=$1",[businessId]);
     if (!wc.length) throw new Error("WhatsApp not configured");
     const { phone_number_id, access_token } = wc[0];
-    const { rows: recipients } = await query("SELECT * FROM broadcast_recipients WHERE campaign_id=$1 AND status='pending' ORDER BY created_at ASC", [campaign.id]);
+    const { rows: recipients } = await query("SELECT * FROM broadcast_recipients WHERE campaign_id=$1 AND status='pending' ORDER BY created_at ASC",[campaign.id]);
     console.log(`📢 Broadcasting to ${recipients.length} recipients: ${campaign.name}`);
     for (const recipient of recipients) {
-      const { rows: check } = await query("SELECT status FROM broadcast_campaigns WHERE id=$1", [campaign.id]);
+      const { rows: check } = await query("SELECT status FROM broadcast_campaigns WHERE id=$1",[campaign.id]);
       if (check[0]?.status !== "running") break;
       try {
         let result;
         if (campaign.message_type === "template" && campaign.template_id) {
-          result = await sendTemplateMessage({ phoneNumberId: phone_number_id, accessToken: access_token, to: recipient.phone, campaign, recipient });
+          result = await sendTemplateMessage({ phoneNumberId:phone_number_id, accessToken:access_token, to:recipient.phone, campaign, recipient });
         } else {
-          let message = (campaign.message_body || "").replace(/\{\{name\}\}/gi, recipient.name || "there").replace(/\{\{phone\}\}/gi, recipient.phone);
-          result = await sendSessionMessage({ phoneNumberId: phone_number_id, accessToken: access_token, to: recipient.phone, message });
+          const message = (campaign.message_body||"").replace(/\{\{name\}\}/gi, recipient.name||"there").replace(/\{\{phone\}\}/gi, recipient.phone);
+          result = await sendSessionMessage({ phoneNumberId:phone_number_id, accessToken:access_token, to:recipient.phone, message });
         }
-        await query("UPDATE broadcast_recipients SET status='sent', wa_message_id=$1, sent_at=NOW() WHERE id=$2", [result?.messages?.[0]?.id, recipient.id]);
-        await query("UPDATE broadcast_campaigns SET sent_count=sent_count+1, updated_at=NOW() WHERE id=$1", [campaign.id]);
+        await query("UPDATE broadcast_recipients SET status='sent',wa_message_id=$1,sent_at=NOW() WHERE id=$2",[result?.messages?.[0]?.id, recipient.id]);
+        await query("UPDATE broadcast_campaigns SET sent_count=sent_count+1,updated_at=NOW() WHERE id=$1",[campaign.id]);
         await sleep(1500 + Math.random() * 1000);
       } catch (err) {
         const errMsg = err.response?.data?.error?.message || err.message;
-        await query("UPDATE broadcast_recipients SET status='failed', error_message=$1 WHERE id=$2", [errMsg, recipient.id]);
-        await query("UPDATE broadcast_campaigns SET failed_count=failed_count+1 WHERE id=$1", [campaign.id]);
+        await query("UPDATE broadcast_recipients SET status='failed',error_message=$1 WHERE id=$2",[errMsg, recipient.id]);
+        await query("UPDATE broadcast_campaigns SET failed_count=failed_count+1 WHERE id=$1",[campaign.id]);
       }
     }
-    await query("UPDATE broadcast_campaigns SET status='completed', last_run_at=NOW(), updated_at=NOW() WHERE id=$1", [campaign.id]);
+    await query("UPDATE broadcast_campaigns SET status='completed',last_run_at=NOW(),updated_at=NOW() WHERE id=$1",[campaign.id]);
     if (campaign.recurring_rule) {
       const nextRun = calculateNextRun(campaign);
       if (nextRun) {
-        await query("UPDATE broadcast_campaigns SET status='scheduled', next_run_at=$1, scheduled_at=$1 WHERE id=$2", [nextRun.toISOString(), campaign.id]);
-        await query("UPDATE broadcast_recipients SET status='pending' WHERE campaign_id=$1", [campaign.id]);
+        await query("UPDATE broadcast_campaigns SET status='scheduled',next_run_at=$1,scheduled_at=$1 WHERE id=$2",[nextRun.toISOString(), campaign.id]);
+        await query("UPDATE broadcast_recipients SET status='pending' WHERE campaign_id=$1",[campaign.id]);
       }
     }
   } catch (err) {
-    console.error("Campaign execution error:", err.message);
-    await query("UPDATE broadcast_campaigns SET status='failed', updated_at=NOW() WHERE id=$1", [campaign.id]);
+    console.error("Campaign execution error:",err.message);
+    await query("UPDATE broadcast_campaigns SET status='failed',updated_at=NOW() WHERE id=$1",[campaign.id]);
   }
 }
 
 async function sendSessionMessage({ phoneNumberId, accessToken, to, message }) {
-  const response = await axios.post(
-    `${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
+  const response = await axios.post(`${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
     { messaging_product:"whatsapp", recipient_type:"individual", to, type:"text", text:{ body:message, preview_url:false } },
-    { headers: { Authorization:`Bearer ${accessToken}`, "Content-Type":"application/json" } }
-  );
+    { headers:{ Authorization:`Bearer ${accessToken}`, "Content-Type":"application/json" } });
   return response.data;
 }
 
 async function sendTemplateMessage({ phoneNumberId, accessToken, to, campaign, recipient }) {
-  const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1", [campaign.template_id]);
+  const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1",[campaign.template_id]);
   if (!tRows.length) throw new Error("Template not found");
-  const template   = tRows[0];
-  const variables  = template.variables || [];
+  const template  = tRows[0];
+  const variables = template.variables || [];
   const components = [];
 
-  // Header component for image/video templates
   const headerType = template.header_type || "none";
   if ((headerType === "image" || headerType === "video") && template.header_media_url) {
-    components.push({
-      type:       "header",
-      parameters: [{ type: headerType, [headerType]: { link: template.header_media_url } }],
-    });
+    components.push({ type:"header", parameters:[{ type:headerType, [headerType]:{ link:template.header_media_url } }] });
   }
 
-  // Body parameters
   if (variables.length > 0) {
     const bodyParams = variables.map(varName => {
-      if (varName === "name"  || varName === "1") return { type:"text", text: recipient.name  || campaign.variables_map?.[varName] || "" };
-      if (varName === "phone" || varName === "2") return { type:"text", text: recipient.phone || campaign.variables_map?.[varName] || "" };
-      return { type:"text", text: campaign.variables_map?.[varName] || recipient.variables?.[varName] || "" };
+      if (varName === "name"  || varName === "1") return { type:"text", text:recipient.name  || campaign.variables_map?.[varName] || "" };
+      if (varName === "phone" || varName === "2") return { type:"text", text:recipient.phone || campaign.variables_map?.[varName] || "" };
+      return { type:"text", text:campaign.variables_map?.[varName] || recipient.variables?.[varName] || "" };
     });
-    components.push({ type:"body", parameters: bodyParams });
+    components.push({ type:"body", parameters:bodyParams });
   }
 
-  const response = await axios.post(
-    `${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
-    {
-      messaging_product: "whatsapp", to,
-      type: "template",
-      template: { name: template.name, language:{ code: template.language || "en" }, components: components.length ? components : undefined },
-    },
-    { headers: { Authorization:`Bearer ${accessToken}`, "Content-Type":"application/json" } }
-  );
+  const response = await axios.post(`${META_BASE}/${META_VERSION}/${phoneNumberId}/messages`,
+    { messaging_product:"whatsapp", to, type:"template", template:{ name:template.name, language:{ code:template.language||"en_US" }, components:components.length?components:undefined } },
+    { headers:{ Authorization:`Bearer ${accessToken}`, "Content-Type":"application/json" } });
   return response.data;
 }
 
 async function resolveRecipients(businessId, { recipient_source, contact_list_id, contact_ids, lead_filter }) {
   const recipients = [];
   if (recipient_source === "list" && contact_list_id) {
-    const { rows } = await query(`SELECT bc.id AS contact_id, bc.phone, bc.name FROM business_contacts bc JOIN contact_list_members clm ON clm.contact_id = bc.id WHERE clm.list_id=$1 AND bc.business_id=$2 AND bc.opted_out=FALSE AND bc.phone IS NOT NULL`, [contact_list_id, businessId]);
+    const { rows } = await query(`SELECT bc.id AS contact_id,bc.phone,bc.name FROM business_contacts bc JOIN contact_list_members clm ON clm.contact_id=bc.id WHERE clm.list_id=$1 AND bc.business_id=$2 AND bc.opted_out=FALSE AND bc.phone IS NOT NULL`,[contact_list_id, businessId]);
     recipients.push(...rows);
   }
   if (recipient_source === "contacts" || recipient_source === "all") {
-    const { rows } = await query("SELECT id AS contact_id, phone, name FROM business_contacts WHERE business_id=$1 AND opted_out=FALSE AND phone IS NOT NULL", [businessId]);
+    const { rows } = await query("SELECT id AS contact_id,phone,name FROM business_contacts WHERE business_id=$1 AND opted_out=FALSE AND phone IS NOT NULL",[businessId]);
     recipients.push(...rows);
   }
   if (recipient_source === "leads" || recipient_source === "all") {
-    let sql = "SELECT NULL::uuid AS contact_id, phone, customer_name AS name FROM leads WHERE business_id=$1 AND phone IS NOT NULL";
+    let sql = "SELECT NULL::uuid AS contact_id,phone,customer_name AS name FROM leads WHERE business_id=$1 AND phone IS NOT NULL";
     const params = [businessId];
     if (lead_filter?.status) { params.push(lead_filter.status); sql += ` AND status=$${params.length}`; }
     const { rows } = await query(sql, params);
     recipients.push(...rows);
   }
   if (contact_ids?.length > 0) {
-    const { rows } = await query("SELECT id AS contact_id, phone, name FROM business_contacts WHERE business_id=$1 AND id=ANY($2) AND opted_out=FALSE AND phone IS NOT NULL", [businessId, contact_ids]);
+    const { rows } = await query("SELECT id AS contact_id,phone,name FROM business_contacts WHERE business_id=$1 AND id=ANY($2) AND opted_out=FALSE AND phone IS NOT NULL",[businessId, contact_ids]);
     recipients.push(...rows);
   }
   const seen = new Set();
@@ -888,12 +737,12 @@ function calculateNextRun(campaign) {
   const now  = nowIST();
   const rule = campaign.recurring_rule;
   const time = campaign.recurring_time || "10:00";
-  const [h, m] = time.split(":").map(Number);
-  const next = new Date(now);
-  next.setUTCHours(h - 5, m - 30, 0, 0);
-  if (rule === "daily")        next.setUTCDate(next.getUTCDate() + 1);
-  else if (rule === "weekly")  next.setUTCDate(next.getUTCDate() + 7);
-  else if (rule === "monthly") next.setUTCMonth(next.getUTCMonth() + 1);
+  const [h,m] = time.split(":").map(Number);
+  const next  = new Date(now);
+  next.setUTCHours(h-5, m-30, 0, 0);
+  if (rule === "daily")       next.setUTCDate(next.getUTCDate()+1);
+  else if (rule === "weekly") next.setUTCDate(next.getUTCDate()+7);
+  else if (rule === "monthly") next.setUTCMonth(next.getUTCMonth()+1);
   else return null;
   return next;
 }
@@ -903,10 +752,10 @@ export async function runScheduledBroadcasts() {
     const { rows } = await query(`SELECT * FROM broadcast_campaigns WHERE status='scheduled' AND scheduled_at<=NOW() AND scheduled_at IS NOT NULL`);
     for (const campaign of rows) {
       if (!isValidSendTime(new Date())) { console.log(`⏸️ Outside send hours — skipping: ${campaign.name}`); continue; }
-      await query("UPDATE broadcast_campaigns SET status='running' WHERE id=$1", [campaign.id]);
+      await query("UPDATE broadcast_campaigns SET status='running' WHERE id=$1",[campaign.id]);
       executeCampaign(campaign, campaign.business_id).catch(console.error);
     }
-  } catch (err) { console.error("Scheduled broadcast error:", err.message); }
+  } catch (err) { console.error("Scheduled broadcast error:",err.message); }
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));

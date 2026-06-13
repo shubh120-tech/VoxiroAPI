@@ -442,204 +442,146 @@ router.post("/broadcast/templates/:id/sync", async (req, res) => {
 // ── Submit template to Meta ───────────────────────────────────
 router.post("/broadcast/templates/:id/submit", async (req, res) => {
   try {
-    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",[req.params.id, bId(req)]);
-    if (!tRows.length) return res.status(404).json({ message:"Template not found" });
+    const { rows: tRows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",
+      [req.params.id, bId(req)]
+    );
+    if (!tRows.length) return res.status(404).json({ message: "Template not found" });
+
     const template = tRows[0];
 
-    const { rows: wc } = await query("SELECT * FROM whatsapp_configs WHERE business_id=$1",[bId(req)]);
-    if (!wc.length) return res.status(400).json({ message:"WhatsApp not configured" });
+    const { rows: wc } = await query(
+      "SELECT * FROM whatsapp_configs WHERE business_id=$1",
+      [bId(req)]
+    );
+    if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
+
     const { access_token, waba_id } = wc[0];
-    if (!access_token) return res.status(400).json({ message:"Access token missing — re-save in Settings → WhatsApp" });
+    const META_URL = `https://graph.facebook.com/v19.0/${waba_id}/message_templates`;
 
-    // Resolve WABA ID if missing
-    let finalWabaId = waba_id;
-    if (!finalWabaId) {
-      try {
-        const wabaRes = await axios.get(`${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`,{ headers:{ Authorization:`Bearer ${access_token}` } });
-        finalWabaId = wabaRes.data?.data?.[0]?.id;
-        if (finalWabaId) await query("UPDATE whatsapp_configs SET waba_id=$1 WHERE business_id=$2",[finalWabaId, bId(req)]);
-      } catch (e) { console.warn("Could not fetch WABA ID:",e.message); }
-    }
-    if (!finalWabaId) return res.status(400).json({ message:"WABA ID not found. Re-save WhatsApp credentials in Settings." });
-
-    // Convert named vars to numbered (Meta requires {{1}} not {{name}})
+    // Convert named variables to sequential numeric: {{name}} → {{1}}, {{order}} → {{2}}
     const varNames = [];
     const metaBody = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
-      if (/^\d+$/.test(name)) { if (!varNames.includes(name)) varNames.push(name); return match; }
+      if (/^\d+$/.test(name)) {
+        // Already numeric — track it in order
+        const num = parseInt(name);
+        while (varNames.length < num) varNames.push(String(varNames.length + 1));
+        return match;
+      }
       if (!varNames.includes(name)) varNames.push(name);
       return `{{${varNames.indexOf(name) + 1}}}`;
     });
 
-    // Build components — FIX: image/video header uses "example.header_handle" array
-    // but Meta actually wants a media ID from their upload API, not a URL.
-    // For text + no-header templates this is straightforward.
     const components = [];
-    const headerType = (template.header_type || "none").toLowerCase();
 
-    if (headerType === "text" && template.header_text?.trim()) {
-      const headerVars = [];
-      const metaHeaderText = template.header_text.replace(/\{\{(\w+)\}\}/g, (match, name) => {
-        if (/^\d+$/.test(name)) return match;
-        if (!headerVars.includes(name)) headerVars.push(name);
-        return `{{${headerVars.indexOf(name) + 1}}}`;
+    // ── HEADER ──────────────────────────────────────────────
+    if (template.header_type === "text" && template.header_text) {
+      components.push({
+        type: "HEADER",
+        format: "TEXT",
+        text: template.header_text,
       });
-      const headerComp = { type:"HEADER", format:"TEXT", text:metaHeaderText };
-      if (headerVars.length > 0) {
-        headerComp.example = { header_text: [headerVars.map((_,i) => `Sample${i+1}`)] };
-      }
-      components.push(headerComp);
-
-    } else if ((headerType === "image" || headerType === "video") && template.header_media_url) {
-      // If URL is already a Meta handle (from direct upload), use it directly
-      if (template.header_media_url.startsWith("meta_handle:")) {
-        const existingHandle = template.header_media_url.replace("meta_handle:","");
-        components.push({
-          type:    "HEADER",
-          format:  headerType.toUpperCase(),
-          example: { header_handle: [existingHandle] },
+    } else if (template.header_type === "image") {
+      if (!template.header_media_url?.startsWith("meta_handle:")) {
+        return res.status(400).json({
+          message: "❌ Image must be uploaded via the Upload button (not an external URL). Meta requires a media handle.",
         });
-        console.log(`✅ Using stored Meta handle: ${existingHandle}`);
-      } else {
-      // Meta requires uploading the media to their servers first to get a handle ID
-      // Step 1: Upload the file to Meta's media upload API
-      // Step 2: Use the returned handle in header_handle array
-      let mediaHandle = null;
-      try {
-        const mediaUrl = template.header_media_url;
-
-        // Download the file from our server
-        const fileRes = await axios.get(mediaUrl, { responseType: "arraybuffer" });
-        const fileBuffer = Buffer.from(fileRes.data);
-        const mimeType   = headerType === "image" ? "image/png" : "video/mp4";
-        const fileName   = mediaUrl.split("/").pop() || `media.${headerType === "image" ? "png" : "mp4"}`;
-
-        // Step 1: Start upload session with Meta
-        const sessionRes = await axios.post(
-          `https://graph.facebook.com/${META_VERSION}/${finalWabaId}/uploads`,
-          null,
-          {
-            params: { file_name: fileName, file_length: fileBuffer.length, file_type: mimeType, access_token },
-            headers: { Authorization: `Bearer ${access_token}` },
-          }
-        );
-        const uploadSessionId = sessionRes.data?.id;
-        if (!uploadSessionId) throw new Error("Failed to create upload session");
-
-        // Step 2: Upload the file bytes
-        const uploadRes = await axios.post(
-          `https://graph.facebook.com/${META_VERSION}/${uploadSessionId}`,
-          fileBuffer,
-          {
-            headers: {
-              Authorization: `OAuth ${access_token}`,
-              "Content-Type": mimeType,
-              file_offset: "0",
-            },
-          }
-        );
-        mediaHandle = uploadRes.data?.h;
-        console.log(`✅ Media uploaded to Meta, handle: ${mediaHandle}`);
-      } catch (uploadErr) {
-        console.error("⚠️ Could not upload media to Meta:", uploadErr.message);
-        // If upload fails, skip the header — template will be text-only
-        // User can resubmit after fixing media
-        console.warn("⚠️ Submitting without image header — media upload to Meta failed");
       }
-
-      if (mediaHandle) {
-        components.push({
-          type:    "HEADER",
-          format:  headerType.toUpperCase(),
-          example: { header_handle: [mediaHandle] },
-        });
-        console.log(`✅ Using freshly uploaded Meta handle: ${mediaHandle}`);
-      } else {
-        console.warn("⚠️ Skipping image/video header — could not get Meta media handle");
-      }
-      } // end else (not meta_handle: URL)
-    }
-
-    // Body component with example values for each variable
-    const bodyComp = { type:"BODY", text:metaBody };
-    if (varNames.length > 0) {
-      const samples = varNames.map(v => {
-        if (v === "name"  || v === "1") return "Rahul";
-        if (v === "phone" || v === "2") return "9876543210";
-        if (v === "date"  || v === "3") return "15 Jun 2026";
-        if (v === "time")               return "2:00 PM";
-        if (v === "order_id" || v === "order") return "ORD-12345";
-        if (v === "amount")             return "500";
-        if (v === "product")            return "Laptop Bag";
-        if (v === "service")            return "Consultation";
-        if (v === "link" || v === "url") return "https://example.com";
-        return `Sample_${v}`;
+      const handle = template.header_media_url.replace("meta_handle:", "");
+      components.push({
+        type: "HEADER",
+        format: "IMAGE",
+        example: { header_handle: [handle] },
       });
-      bodyComp.example = { body_text:[samples] };
+    } else if (template.header_type === "video") {
+      if (!template.header_media_url?.startsWith("meta_handle:")) {
+        return res.status(400).json({
+          message: "❌ Video must be uploaded via the Upload button (not an external URL). Meta requires a media handle.",
+        });
+      }
+      const handle = template.header_media_url.replace("meta_handle:", "");
+      components.push({
+        type: "HEADER",
+        format: "VIDEO",
+        example: { header_handle: [handle] },
+      });
     }
-    components.push(bodyComp);
 
-    if (template.footer_text?.trim()) {
-      components.push({ type:"FOOTER", text:template.footer_text });
+    // ── BODY ─────────────────────────────────────────────────
+    // Count numeric placeholders in the converted body to know how many examples to send
+    const numericVarsInBody = [...metaBody.matchAll(/\{\{(\d+)\}\}/g)].map(m => parseInt(m[1]));
+    const maxVarIndex = numericVarsInBody.length > 0 ? Math.max(...numericVarsInBody) : 0;
+
+    const bodyComponent = {
+      type: "BODY",
+      text: metaBody,
+    };
+
+    // Only add example if there are actual variables — Meta rejects example with empty arrays
+    if (maxVarIndex > 0) {
+      const sampleValues = Array.from({ length: maxVarIndex }, (_, i) => {
+        const originalName = varNames[i] || String(i + 1);
+        // Use meaningful sample values based on variable name
+        const samples = {
+          name: "John", customer: "John", customer_name: "John",
+          phone: "+91 98765 43210", mobile: "+91 98765 43210",
+          order: "ORD-12345", order_id: "ORD-12345", order_number: "ORD-12345",
+          date: "15 Jun 2025", delivery_date: "15 Jun 2025",
+          amount: "₹1,499", price: "₹1,499", total: "₹1,499",
+          link: "https://example.com", url: "https://example.com",
+          code: "SAVE20", coupon: "SAVE20", otp: "123456",
+          time: "10:30 AM", slot: "10:30 AM",
+          address: "123 Main St, Mumbai",
+          product: "Blue Kurta (M)",
+          company: "Acme Corp",
+          agent: "Priya",
+        };
+        return samples[originalName.toLowerCase()] || `Sample ${i + 1}`;
+      });
+
+      bodyComponent.example = {
+        body_text: [sampleValues], // ← Must be array of arrays: [[val1, val2]]
+      };
     }
 
-    const metaName = template.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/^[0-9]/,"t_");
+    components.push(bodyComponent);
 
-    // FIX: language must be a valid BCP-47 locale string
-    // "en" alone is NOT valid for Meta — must be "en_US"
-    const langMap = { en:"en_US", hi:"hi", en_US:"en_US", "en-US":"en_US", hi_IN:"hi", "hi-IN":"hi" };
-    const metaLang = langMap[template.language] || "en_US";
+    // ── FOOTER ───────────────────────────────────────────────
+    if (template.footer_text) {
+      components.push({
+        type: "FOOTER",
+        text: template.footer_text,
+      });
+    }
 
     const payload = {
-      name:       metaName,
-      category:   template.category || "MARKETING",
-      language:   metaLang,
+      name: template.name.toLowerCase().replace(/[^a-z0-9_]/g, "_"),
+      language: template.language || "en",
+      category: template.category || "MARKETING",
       components,
     };
 
-    console.log("📤 Submitting to Meta WABA:", finalWabaId);
-    console.log("📦 Payload:", JSON.stringify(payload, null, 2));
+    console.log("📦 FINAL META PAYLOAD:", JSON.stringify(payload, null, 2));
 
-    let metaRes;
-    try {
-      metaRes = await axios.post(
-        `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
-        payload,
-        { headers:{ Authorization:`Bearer ${access_token}`, "Content-Type":"application/json" } }
+    const response = await axios.post(META_URL, payload, {
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
+
+    // Store the Meta template ID for future status syncing
+    if (response.data?.id) {
+      await query(
+        "UPDATE whatsapp_templates SET meta_template_id=$1, meta_status='pending', updated_at=NOW() WHERE id=$2",
+        [response.data.id, template.id]
       );
-    } catch (axiosErr) {
-      const metaErr     = axiosErr.response?.data?.error;
-      const metaMsg     = metaErr?.message  || axiosErr.message;
-      const metaCode    = metaErr?.code;
-      const metaSubCode = metaErr?.error_subcode;
-      const metaData    = metaErr?.error_data;
-
-      console.error("❌ Meta API error:", JSON.stringify(metaErr, null, 2));
-      console.error("📦 Payload sent:",   JSON.stringify(payload,  null, 2));
-
-      let userMsg = metaMsg;
-      if (metaCode === 190) userMsg = "Access token expired. Go to Settings → WhatsApp and update your token.";
-      if (metaCode === 200) userMsg = "Permission denied. Your token needs 'whatsapp_business_management' permission.";
-      if (metaCode === 100) {
-        userMsg = `Meta rejected the template. Error: ${metaMsg}`;
-        if (metaSubCode === 2388273) userMsg = "Invalid parameter — check Railway logs for the exact payload. Common causes: language code wrong, component format invalid, or template name already exists with different content.";
-        if (metaData) userMsg += ` | Detail: ${JSON.stringify(metaData)}`;
-      }
-      if (metaCode === 368) userMsg = "Account restricted. Check Meta Business Manager for policy violations.";
-
-      return res.status(500).json({ message:userMsg, meta_error:{ code:metaCode, subcode:metaSubCode, message:metaMsg, data:metaData } });
     }
 
-    await query(
-      `UPDATE whatsapp_templates SET meta_status='pending',meta_template_id=$1,name=$2,variables=$3,updated_at=NOW() WHERE id=$4`,
-      [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]
-    );
-
-    console.log("✅ Template submitted successfully:", metaRes.data);
-    res.json({ success:true, metaTemplateId:metaRes.data?.id });
-
+    res.json({ success: true, data: response.data });
   } catch (err) {
-    console.error("Submit route error:",err.message);
-    res.status(500).json({ message:err.message });
+    console.error("❌ META ERROR:", err.response?.data || err.message);
+    res.status(500).json({
+      message: "Meta rejected the template",
+      meta_error: err.response?.data?.error,
+    });
   }
 });
 

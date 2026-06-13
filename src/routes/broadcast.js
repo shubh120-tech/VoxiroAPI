@@ -497,96 +497,179 @@ router.post("/broadcast/templates/:id/sync", async (req, res) => {
 });
 
 // ── Submit template to Meta (handles text, image, video headers) ──
+// Replace the submit route in broadcast.js with this version
+// Key fixes:
+// 1. Named vars like {{name}} converted to numbered {{1}}, {{2}} for Meta
+// 2. Sample values provided for every variable (Meta requires this)
+// 3. Full error logging so you can see exactly what Meta rejects
+// 4. language code fixed to en_US not just "en"
+
 router.post("/broadcast/templates/:id/submit", async (req, res) => {
   try {
-    const { rows: tRows } = await query("SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2", [req.params.id, bId(req)]);
+    const { rows: tRows } = await query(
+      "SELECT * FROM whatsapp_templates WHERE id=$1 AND business_id=$2",
+      [req.params.id, bId(req)]
+    );
     if (!tRows.length) return res.status(404).json({ message: "Template not found" });
     const template = tRows[0];
 
-    const { rows: wc } = await query("SELECT * FROM whatsapp_configs WHERE business_id=$1", [bId(req)]);
+    const { rows: wc } = await query(
+      "SELECT * FROM whatsapp_configs WHERE business_id=$1",
+      [bId(req)]
+    );
     if (!wc.length) return res.status(400).json({ message: "WhatsApp not configured" });
-    const { access_token, waba_id, phone_number_id } = wc[0];
-    if (!access_token) return res.status(400).json({ message: "Access token missing" });
+    const { access_token, waba_id } = wc[0];
+    if (!access_token) return res.status(400).json({ message: "Access token missing — re-save in Settings → WhatsApp" });
 
-    // Resolve WABA ID if missing
+    // Resolve WABA ID
     let finalWabaId = waba_id;
     if (!finalWabaId) {
       try {
-        const wabaRes = await axios.get(`${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`, { headers: { Authorization: `Bearer ${access_token}` } });
+        const wabaRes = await axios.get(
+          `${META_BASE}/${META_VERSION}/me/whatsapp_business_accounts`,
+          { headers: { Authorization: `Bearer ${access_token}` } }
+        );
         finalWabaId = wabaRes.data?.data?.[0]?.id;
         if (finalWabaId) await query("UPDATE whatsapp_configs SET waba_id=$1 WHERE business_id=$2", [finalWabaId, bId(req)]);
-      } catch (err) { console.warn("Could not fetch WABA ID:", err.message); }
+      } catch (e) { console.warn("Could not fetch WABA ID:", e.message); }
     }
-    if (!finalWabaId) return res.status(400).json({ message: "WABA ID not found. Please re-save WhatsApp credentials." });
+    if (!finalWabaId) return res.status(400).json({ message: "WABA ID not found. Re-save WhatsApp credentials in Settings." });
 
-    // Convert named vars ({{name}}) → numbered ({{1}}) for Meta
+    // ── Convert named vars to numbered for Meta ───────────────
+    // Meta requires {{1}}, {{2}} NOT {{name}}, {{order_id}}
     const varNames  = [];
     const metaBody  = (template.body || "").replace(/\{\{(\w+)\}\}/g, (match, name) => {
-      if (/^\d+$/.test(name)) { if (!varNames.includes(name)) varNames.push(name); return match; }
+      if (/^\d+$/.test(name)) {
+        if (!varNames.includes(name)) varNames.push(name);
+        return match; // already numbered
+      }
       if (!varNames.includes(name)) varNames.push(name);
       return `{{${varNames.indexOf(name) + 1}}}`;
     });
 
-    // ── Build components array ────────────────────────────────
+    // ── Build components ──────────────────────────────────────
     const components = [];
-    const headerType = template.header_type || (template.header_text ? "text" : "none");
+    const headerType = (template.header_type || "none").toLowerCase();
 
+    // HEADER
     if (headerType === "image" && template.header_media_url) {
-      // Image header — Meta needs a public URL to fetch during review
       components.push({
         type:    "HEADER",
         format:  "IMAGE",
         example: { header_handle: [template.header_media_url] },
       });
     } else if (headerType === "video" && template.header_media_url) {
-      // Video header
       components.push({
         type:    "HEADER",
         format:  "VIDEO",
         example: { header_handle: [template.header_media_url] },
       });
-    } else if (headerType === "text" && template.header_text) {
-      // Text header — convert named vars too
+    } else if (headerType === "text" && template.header_text?.trim()) {
+      // Convert named vars in header too
+      const headerVars = [];
       const metaHeaderText = template.header_text.replace(/\{\{(\w+)\}\}/g, (match, name) => {
         if (/^\d+$/.test(name)) return match;
-        if (!varNames.includes(name)) varNames.push(name);
-        return `{{${varNames.indexOf(name) + 1}}}`;
+        if (!headerVars.includes(name)) headerVars.push(name);
+        return `{{${headerVars.indexOf(name) + 1}}}`;
       });
-      components.push({ type: "HEADER", format: "TEXT", text: metaHeaderText });
+      const headerComp = { type: "HEADER", format: "TEXT", text: metaHeaderText };
+      if (headerVars.length > 0) {
+        headerComp.example = { header_text: [headerVars.map((_, i) => `Sample${i + 1}`)] };
+      }
+      components.push(headerComp);
     }
 
-    // Body component
-    const bodyComponent = { type: "BODY", text: metaBody };
+    // BODY — always required, always include example for variables
+    const bodyComp = { type: "BODY", text: metaBody };
     if (varNames.length > 0) {
-      bodyComponent.example = { body_text: [varNames.map((_, i) => `example_${i + 1}`)] };
+      // Provide meaningful sample values based on var name
+      const samples = varNames.map(v => {
+        if (v === "name"  || v === "1") return "Rahul";
+        if (v === "phone" || v === "2") return "9876543210";
+        if (v === "date"  || v === "3") return "15 Jun 2026";
+        if (v === "time")               return "2:00 PM";
+        if (v === "order_id" || v === "order") return "ORD-12345";
+        if (v === "amount")             return "500";
+        if (v === "product")            return "Laptop Bag";
+        if (v === "service")            return "Consultation";
+        if (v === "link" || v === "url") return "https://example.com";
+        return `Sample_${v}`;
+      });
+      bodyComp.example = { body_text: [samples] };
     }
-    components.push(bodyComponent);
+    components.push(bodyComp);
 
-    if (template.footer_text) {
+    // FOOTER
+    if (template.footer_text?.trim()) {
       components.push({ type: "FOOTER", text: template.footer_text });
     }
 
-    const metaName = sanitizeTemplateName(template.name);
-    const metaRes  = await axios.post(
-      `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
-      { name: metaName, category: template.category || "MARKETING", language: template.language || "en_US", components },
-      { headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" } }
-    );
+    // ── Sanitize template name ────────────────────────────────
+    const metaName = template.name
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, "_")
+      .replace(/^[0-9]/, "t_");
 
+    // ── Fix language code ─────────────────────────────────────
+    // Meta requires full locale like en_US, hi, en — "en" alone sometimes fails
+    const langMap = { en: "en_US", hi: "hi", en_US: "en_US" };
+    const metaLang = langMap[template.language] || template.language || "en_US";
+
+    // ── Build final payload ───────────────────────────────────
+    const payload = {
+      name:       metaName,
+      category:   template.category || "MARKETING",
+      language:   metaLang,
+      components,
+    };
+
+    console.log("📤 Submitting template to Meta:", JSON.stringify(payload, null, 2));
+
+    let metaRes;
+    try {
+      metaRes = await axios.post(
+        `${META_BASE}/${META_VERSION}/${finalWabaId}/message_templates`,
+        payload,
+        { headers: { Authorization: `Bearer ${access_token}`, "Content-Type": "application/json" } }
+      );
+    } catch (axiosErr) {
+      const metaErr    = axiosErr.response?.data?.error;
+      const metaMsg    = metaErr?.message || axiosErr.message;
+      const metaCode   = metaErr?.code;
+      const metaSubCode = metaErr?.error_subcode;
+      const metaData   = metaErr?.error_data;
+
+      console.error("❌ Meta API error:", JSON.stringify(metaErr, null, 2));
+      console.error("📦 Payload sent:", JSON.stringify(payload, null, 2));
+
+      // Map error codes to friendly messages
+      let userMsg = metaMsg;
+      if (metaCode === 190)  userMsg = "Access token expired. Go to Settings → WhatsApp and update your token.";
+      if (metaCode === 200)  userMsg = "Permission denied. Your token needs 'whatsapp_business_management' permission.";
+      if (metaCode === 100) {
+        userMsg = `Meta rejected the template format. Details: ${metaMsg}`;
+        if (metaData) userMsg += ` | Data: ${JSON.stringify(metaData)}`;
+      }
+      if (metaCode === 368)  userMsg = "Account restricted. Check Meta Business Manager for policy violations.";
+
+      return res.status(500).json({
+        message: userMsg,
+        meta_error: { code: metaCode, subcode: metaSubCode, message: metaMsg, data: metaData },
+      });
+    }
+
+    // Success — save meta template ID
     await query(
       `UPDATE whatsapp_templates SET meta_status='pending', meta_template_id=$1, name=$2, variables=$3, updated_at=NOW() WHERE id=$4`,
       [metaRes.data?.id?.toString(), metaName, JSON.stringify(varNames), req.params.id]
     );
 
+    console.log("✅ Template submitted:", metaRes.data);
     res.json({ success: true, metaTemplateId: metaRes.data?.id });
+
   } catch (err) {
-    const errMsg  = err.response?.data?.error?.message || err.message;
-    const errCode = err.response?.data?.error?.code;
-    let userMessage = errMsg;
-    if (errCode === 100) userMessage = "Invalid template format. Check your template body and variables.";
-    if (errCode === 190) userMessage = "Access token expired. Please update your WhatsApp token in Settings.";
-    if (errCode === 200) userMessage = "Permission denied. Make sure your token has whatsapp_business_management permission.";
-    res.status(500).json({ message: userMessage });
+    console.error("Submit route error:", err.message);
+    res.status(500).json({ message: err.message });
   }
 });
 

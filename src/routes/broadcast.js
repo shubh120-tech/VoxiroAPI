@@ -63,65 +63,24 @@ const upload = multer({
   },
 });
 
-// ── Upload media — uploads directly to Meta's servers ────────
-// This avoids the /tmp ephemeral storage problem on Railway
-// We get a Meta media handle back which is permanent
+// ── Upload media ──────────────────────────────────────────────
+// Strategy: keep the file locally for PREVIEW (instant, always works)
+// AND upload to Meta's resumable upload API to get a permanent file handle
+// for template SUBMISSION (handles last ~7 days, re-uploaded on submit if expired)
 router.post("/broadcast/templates/upload-media", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ message:"No file uploaded" });
 
-    const fileType = req.file.mimetype.startsWith("image/") ? "image" : "video";
-    const filePath = req.file.path;
-    const fileName = req.file.originalname;
-    const mimeType = req.file.mimetype;
-    const fileSize = req.file.size;
+    const fileType  = req.file.mimetype.startsWith("image/") ? "image" : "video";
+    const localUrl  = `${BACKEND_URL}/api/broadcast/media/${req.file.filename}`;
 
-    // Try to get WhatsApp config to upload directly to Meta
-    // Use the first available business config (or the authenticated user's)
-    let metaHandle = null;
-    let publicUrl  = null;
+    console.log(`📎 Media saved locally for preview: ${localUrl}`);
 
-    try {
-      // Get user's WhatsApp config if auth is available
-      const wabaId     = req.user?.business_id ? (await query("SELECT waba_id, access_token FROM whatsapp_configs WHERE business_id=$1",[req.user.business_id])).rows[0] : null;
-      const accessToken = wabaId?.access_token;
-      const waId        = wabaId?.waba_id;
-
-      if (accessToken && waId) {
-        // Upload to Meta
-        const fileBuffer = fs.readFileSync(filePath);
-
-        // Step 1: Create upload session
-        const sessionRes = await axios.post(
-          `https://graph.facebook.com/${META_VERSION}/${waId}/uploads`,
-          null,
-          { params:{ file_name:fileName, file_length:fileSize, file_type:mimeType, access_token:accessToken }, headers:{ Authorization:`Bearer ${accessToken}` } }
-        );
-        const sessionId = sessionRes.data?.id;
-
-        // Step 2: Upload bytes
-        const uploadRes = await axios.post(
-          `https://graph.facebook.com/${META_VERSION}/${sessionId}`,
-          fileBuffer,
-          { headers:{ Authorization:`OAuth ${accessToken}`, "Content-Type":mimeType, file_offset:"0" } }
-        );
-        metaHandle = uploadRes.data?.h;
-        if (metaHandle) {
-          publicUrl = `meta_handle:${metaHandle}`;
-          console.log(`✅ Media uploaded to Meta: handle=${metaHandle}`);
-        }
-      }
-    } catch (metaErr) {
-      console.warn("⚠️ Meta upload failed, falling back to local URL:", metaErr.message);
-    }
-
-    // Fallback: local URL (works until Railway restarts)
-    if (!publicUrl) {
-      publicUrl = `${BACKEND_URL}/api/broadcast/media/${req.file.filename}`;
-      console.log(`📎 Media stored locally: ${publicUrl} (⚠️ lost on Railway restart)`);
-    }
-
-    res.json({ url:publicUrl, type:fileType, fileName:req.file.filename, metaHandle });
+    // Always return the local URL for the preview — this is what gets
+    // stored in header_media_url and rendered in the WhatsApp mockup.
+    // The Meta file handle is generated fresh at SUBMIT time (see /submit route)
+    // because handles expire and a template might sit in draft for days.
+    res.json({ url: localUrl, type: fileType, fileName: req.file.filename });
   } catch (err) {
     console.error("Upload error:", err.message);
     res.status(500).json({ message:"Upload failed: "+err.message });
@@ -353,12 +312,12 @@ Return ONLY valid JSON, no markdown:
 // ── Create template ───────────────────────────────────────────
 router.post("/broadcast/templates", async (req, res) => {
   try {
-    const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables } = req.body;
+    const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables, buttons } = req.body;
     if (!name || !body) return res.status(400).json({ message:"Name and body required" });
     const { rows } = await query(`
-      INSERT INTO whatsapp_templates (business_id,name,category,language,header_type,header_text,header_media_url,body,footer_text,variables)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *
-    `,[bId(req), name, category||"MARKETING", language||"en", header_type||"none", header_text||null, header_media_url||null, body, footer_text||null, variables||[]]);
+      INSERT INTO whatsapp_templates (business_id,name,category,language,header_type,header_text,header_media_url,body,footer_text,variables,buttons)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *
+    `,[bId(req), name, category||"MARKETING", language||"en", header_type||"none", header_text||null, header_media_url||null, body, footer_text||null, variables||[], JSON.stringify(buttons||[])]);
     res.status(201).json(rows[0]);
   } catch (err) { res.status(500).json({ message:"Failed to create template: "+err.message }); }
 });
@@ -366,13 +325,13 @@ router.post("/broadcast/templates", async (req, res) => {
 // ── Update template ───────────────────────────────────────────
 router.put("/broadcast/templates/:id", async (req, res) => {
   try {
-    const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables } = req.body;
+    const { name, category, language, header_type, header_text, header_media_url, body, footer_text, variables, buttons } = req.body;
     const { rows } = await query(`
-      UPDATE whatsapp_templates SET name=$1,category=$2,language=$3,header_type=$4,header_text=$5,header_media_url=$6,body=$7,footer_text=$8,variables=$9,meta_status='draft',updated_at=NOW()
-      WHERE id=$10 AND business_id=$11 RETURNING *
-    `,[name, category, language, header_type||"none", header_text||null, header_media_url||null, body, footer_text, variables, req.params.id, bId(req)]);
+      UPDATE whatsapp_templates SET name=$1,category=$2,language=$3,header_type=$4,header_text=$5,header_media_url=$6,body=$7,footer_text=$8,variables=$9,buttons=$10,meta_status='draft',updated_at=NOW()
+      WHERE id=$11 AND business_id=$12 RETURNING *
+    `,[name, category, language, header_type||"none", header_text||null, header_media_url||null, body, footer_text, variables, JSON.stringify(buttons||[]), req.params.id, bId(req)]);
     res.json(rows[0]);
-  } catch (err) { res.status(500).json({ message:"Failed to update template" }); }
+  } catch (err) { res.status(500).json({ message:"Failed to update template: "+err.message }); }
 });
 
 router.delete("/broadcast/templates/:id", async (req, res) => {
@@ -470,9 +429,7 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       return `{{${varNames.indexOf(name) + 1}}}`;
     });
 
-    // Build components — FIX: image/video header uses "example.header_handle" array
-    // but Meta actually wants a media ID from their upload API, not a URL.
-    // For text + no-header templates this is straightforward.
+    // ── Build components ──────────────────────────────────────
     const components = [];
     const headerType = (template.header_type || "none").toLowerCase();
 
@@ -490,60 +447,41 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
       components.push(headerComp);
 
     } else if ((headerType === "image" || headerType === "video") && template.header_media_url) {
-      // If URL is already a Meta handle (from direct upload), use it directly
-      if (template.header_media_url.startsWith("meta_handle:")) {
-        const existingHandle = template.header_media_url.replace("meta_handle:","");
-        components.push({
-          type:    "HEADER",
-          format:  headerType.toUpperCase(),
-          example: { header_handle: [existingHandle] },
-        });
-        console.log(`✅ Using stored Meta handle: ${existingHandle}`);
-      } else {
-      // Meta requires uploading the media to their servers first to get a handle ID
-      // Step 1: Upload the file to Meta's media upload API
-      // Step 2: Use the returned handle in header_handle array
+      // Upload the media to Meta's resumable upload API to get a file handle.
+      // Correct endpoint: /{app_id}/uploads (NOT /{waba_id}/uploads)
       let mediaHandle = null;
       try {
-        const mediaUrl = template.header_media_url;
+        const appId = process.env.META_APP_ID;
+        if (!appId) {
+          console.warn("⚠️ META_APP_ID env var not set — cannot upload media to Meta");
+        } else {
+          // Download our locally-hosted file
+          const fileRes    = await axios.get(template.header_media_url, { responseType:"arraybuffer" });
+          const fileBuffer = Buffer.from(fileRes.data);
+          const mimeType   = fileRes.headers["content-type"] || (headerType === "image" ? "image/jpeg" : "video/mp4");
+          const ext        = mimeType.split("/")[1] || (headerType === "image" ? "jpg" : "mp4");
+          const fileName   = `template_media_${Date.now()}.${ext}`;
 
-        // Download the file from our server
-        const fileRes = await axios.get(mediaUrl, { responseType: "arraybuffer" });
-        const fileBuffer = Buffer.from(fileRes.data);
-        const mimeType   = headerType === "image" ? "image/png" : "video/mp4";
-        const fileName   = mediaUrl.split("/").pop() || `media.${headerType === "image" ? "png" : "mp4"}`;
+          // Step 1: Create upload session on the APP, not the WABA
+          const sessionRes = await axios.post(
+            `${META_BASE}/${META_VERSION}/${appId}/uploads`,
+            null,
+            { params:{ file_name:fileName, file_length:fileBuffer.length, file_type:mimeType, access_token:access_token } }
+          );
+          const uploadSessionId = sessionRes.data?.id;
+          if (!uploadSessionId) throw new Error("No upload session ID returned from Meta");
 
-        // Step 1: Start upload session with Meta
-        const sessionRes = await axios.post(
-          `https://graph.facebook.com/${META_VERSION}/${finalWabaId}/uploads`,
-          null,
-          {
-            params: { file_name: fileName, file_length: fileBuffer.length, file_type: mimeType, access_token },
-            headers: { Authorization: `Bearer ${access_token}` },
-          }
-        );
-        const uploadSessionId = sessionRes.data?.id;
-        if (!uploadSessionId) throw new Error("Failed to create upload session");
-
-        // Step 2: Upload the file bytes
-        const uploadRes = await axios.post(
-          `https://graph.facebook.com/${META_VERSION}/${uploadSessionId}`,
-          fileBuffer,
-          {
-            headers: {
-              Authorization: `OAuth ${access_token}`,
-              "Content-Type": mimeType,
-              file_offset: "0",
-            },
-          }
-        );
-        mediaHandle = uploadRes.data?.h;
-        console.log(`✅ Media uploaded to Meta, handle: ${mediaHandle}`);
+          // Step 2: Upload the bytes to the session
+          const uploadRes = await axios.post(
+            `${META_BASE}/${META_VERSION}/${uploadSessionId}`,
+            fileBuffer,
+            { headers:{ Authorization:`OAuth ${access_token}`, file_offset:"0", "Content-Type":mimeType } }
+          );
+          mediaHandle = uploadRes.data?.h;
+          if (mediaHandle) console.log(`✅ Media uploaded to Meta, handle: ${mediaHandle.slice(0,30)}...`);
+        }
       } catch (uploadErr) {
-        console.error("⚠️ Could not upload media to Meta:", uploadErr.message);
-        // If upload fails, skip the header — template will be text-only
-        // User can resubmit after fixing media
-        console.warn("⚠️ Submitting without image header — media upload to Meta failed");
+        console.error("⚠️ Meta media upload failed:", uploadErr.response?.data || uploadErr.message);
       }
 
       if (mediaHandle) {
@@ -552,11 +490,11 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
           format:  headerType.toUpperCase(),
           example: { header_handle: [mediaHandle] },
         });
-        console.log(`✅ Using freshly uploaded Meta handle: ${mediaHandle}`);
       } else {
-        console.warn("⚠️ Skipping image/video header — could not get Meta media handle");
+        return res.status(400).json({
+          message: `Could not upload ${headerType} to Meta. Make sure META_APP_ID is set in environment variables and the image URL (${template.header_media_url}) is publicly accessible. You can also remove the ${headerType} header and submit as text-only.`,
+        });
       }
-      } // end else (not meta_handle: URL)
     }
 
     // Body component with example values for each variable
@@ -580,6 +518,35 @@ router.post("/broadcast/templates/:id/submit", async (req, res) => {
 
     if (template.footer_text?.trim()) {
       components.push({ type:"FOOTER", text:template.footer_text });
+    }
+
+    // ── Buttons ────────────────────────────────────────────────
+    const buttons = Array.isArray(template.buttons) ? template.buttons : [];
+    if (buttons.length > 0) {
+      const buttonComponents = buttons.slice(0, 10).map(btn => {
+        if (btn.type === "QUICK_REPLY") {
+          return { type:"QUICK_REPLY", text:btn.text };
+        }
+        if (btn.type === "URL") {
+          const comp = { type:"URL", text:btn.text, url:btn.url };
+          // Dynamic URL with variable — needs example
+          if (/\{\{\d+\}\}/.test(btn.url)) {
+            comp.example = [btn.url.replace(/\{\{\d+\}\}/, "sample123")];
+          }
+          return comp;
+        }
+        if (btn.type === "PHONE_NUMBER") {
+          return { type:"PHONE_NUMBER", text:btn.text, phone_number:btn.phone_number };
+        }
+        if (btn.type === "COPY_CODE") {
+          return { type:"COPY_CODE", example:btn.example || "COPY123" };
+        }
+        return null;
+      }).filter(Boolean);
+
+      if (buttonComponents.length > 0) {
+        components.push({ type:"BUTTONS", buttons:buttonComponents });
+      }
     }
 
     const metaName = template.name.toLowerCase().replace(/[^a-z0-9_]/g,"_").replace(/^[0-9]/,"t_");

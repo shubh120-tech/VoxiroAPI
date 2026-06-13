@@ -1177,18 +1177,19 @@ router.get("/agent/team-members", async (req, res) => {
   }
 });
 
-// Add these routes to your existing dashboard/leads/orders backend file
-// They handle POST (create), PUT (update), DELETE for leads, orders, appointments
+// Add these to your existing dashboard.js backend file
+// These add POST (create) and PUT (update) for leads, orders, appointments, followups
 
 // ── POST /leads — create lead manually ───────────────────────
 router.post("/leads", async (req, res) => {
   try {
-    const { customer_name, customer_phone, product_interest, budget, intent, status, notes } = req.body;
+    const { customer_name, phone, product_interest, budget, intent, status, notes } = req.body;
     if (!customer_name?.trim()) return res.status(400).json({ message: "Customer name required" });
     const { rows } = await query(`
-      INSERT INTO leads (business_id, customer_name, customer_phone, product_interest, budget, intent, status, notes, created_at)
+      INSERT INTO leads (business_id, customer_name, phone, product_interest, budget, intent, status, notes, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()) RETURNING id`,
-      [req.user.business_id, customer_name, customer_phone||null, product_interest||null, budget||null, intent||"warm", status||"new", notes||null]
+      [req.user.business_id, customer_name, phone||null, product_interest||null,
+       budget||null, intent||"warm", status||"new", notes||null]
     );
     res.json({ success: true, id: rows[0].id });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -1197,21 +1198,14 @@ router.post("/leads", async (req, res) => {
 // ── PUT /leads/:id — update lead ─────────────────────────────
 router.put("/leads/:id", async (req, res) => {
   try {
-    const { customer_name, customer_phone, product_interest, budget, intent, status, notes } = req.body;
+    const { customer_name, phone, product_interest, budget, intent, status, notes } = req.body;
     await query(`
-      UPDATE leads SET customer_name=$1, customer_phone=$2, product_interest=$3, budget=$4,
+      UPDATE leads SET customer_name=$1, phone=$2, product_interest=$3, budget=$4,
         intent=$5, status=$6, notes=$7, updated_at=NOW()
       WHERE id=$8 AND business_id=$9`,
-      [customer_name, customer_phone||null, product_interest||null, budget||null, intent, status, notes||null, req.params.id, req.user.business_id]
+      [customer_name, phone||null, product_interest||null, budget||null,
+       intent, status, notes||null, req.params.id, req.user.business_id]
     );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE /leads/:id ─────────────────────────────────────────
-router.delete("/leads/:id", async (req, res) => {
-  try {
-    await query("DELETE FROM leads WHERE id=$1 AND business_id=$2", [req.params.id, req.user.business_id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -1222,7 +1216,7 @@ router.post("/orders", async (req, res) => {
     const { customer_name, customer_phone, items, total_amount, payment_method, delivery_address, status, notes } = req.body;
     if (!customer_name?.trim()) return res.status(400).json({ message: "Customer name required" });
     const { rows } = await query(`
-      INSERT INTO orders (business_id, customer_name, customer_phone, items, total_amount, payment_method, delivery_address, status, notes, created_at)
+      INSERT INTO orders (business_id, customer_name, customer_phone, items, amount, payment_method, delivery_address, status, notes, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) RETURNING id`,
       [req.user.business_id, customer_name, customer_phone||null, JSON.stringify(items||[]),
        total_amount||null, payment_method||"COD", delivery_address||null, status||"pending", notes||null]
@@ -1236,20 +1230,13 @@ router.put("/orders/:id", async (req, res) => {
   try {
     const { customer_name, customer_phone, items, total_amount, payment_method, delivery_address, status, notes } = req.body;
     await query(`
-      UPDATE orders SET customer_name=$1, customer_phone=$2, items=$3, total_amount=$4,
+      UPDATE orders SET customer_name=$1, customer_phone=$2, items=$3, amount=$4,
         payment_method=$5, delivery_address=$6, status=$7, notes=$8, updated_at=NOW()
       WHERE id=$9 AND business_id=$10`,
       [customer_name, customer_phone||null, JSON.stringify(items||[]), total_amount||null,
-       payment_method||"COD", delivery_address||null, status, notes||null, req.params.id, req.user.business_id]
+       payment_method||"COD", delivery_address||null, status, notes||null,
+       req.params.id, req.user.business_id]
     );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE /orders/:id ────────────────────────────────────────
-router.delete("/orders/:id", async (req, res) => {
-  try {
-    await query("DELETE FROM orders WHERE id=$1 AND business_id=$2", [req.params.id, req.user.business_id]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
@@ -1257,14 +1244,14 @@ router.delete("/orders/:id", async (req, res) => {
 // ── POST /appointments — create manually ─────────────────────
 router.post("/appointments", async (req, res) => {
   try {
-    const { customer_name, customer_phone, service, appointment_date, status, notes } = req.body;
+    const { customer_name, customer_phone, service, scheduled_at, status, notes } = req.body;
     if (!customer_name?.trim()) return res.status(400).json({ message: "Customer name required" });
     if (!service?.trim())       return res.status(400).json({ message: "Service required" });
     const { rows } = await query(`
-      INSERT INTO appointments (business_id, customer_name, customer_phone, service, appointment_date, status, notes, created_at)
+      INSERT INTO appointments (business_id, customer_name, customer_phone, service, scheduled_at, status, notes, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW()) RETURNING id`,
       [req.user.business_id, customer_name, customer_phone||null, service,
-       appointment_date||null, status||"pending", notes||null]
+       scheduled_at||null, status||"pending", notes||null]
     );
     res.json({ success: true, id: rows[0].id });
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -1273,67 +1260,48 @@ router.post("/appointments", async (req, res) => {
 // ── PUT /appointments/:id ─────────────────────────────────────
 router.put("/appointments/:id", async (req, res) => {
   try {
-    const { customer_name, customer_phone, service, appointment_date, status, notes } = req.body;
+    const { customer_name, customer_phone, service, scheduled_at, status, notes } = req.body;
     await query(`
       UPDATE appointments SET customer_name=$1, customer_phone=$2, service=$3,
-        appointment_date=$4, status=$5, notes=$6, updated_at=NOW()
+        scheduled_at=$4, status=$5, notes=$6, updated_at=NOW()
       WHERE id=$7 AND business_id=$8`,
-      [customer_name, customer_phone||null, service, appointment_date||null,
+      [customer_name, customer_phone||null, service, scheduled_at||null,
        status, notes||null, req.params.id, req.user.business_id]
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── DELETE /appointments/:id ──────────────────────────────────
-router.delete("/appointments/:id", async (req, res) => {
-  try {
-    await query("DELETE FROM appointments WHERE id=$1 AND business_id=$2", [req.params.id, req.user.business_id]);
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── POST /follow-ups — schedule manually ─────────────────────
-router.post("/follow-ups", async (req, res) => {
+// ── POST /followups — schedule manually ──────────────────────
+router.post("/followups", async (req, res) => {
   try {
     const { customer_phone, message, scheduled_at } = req.body;
     if (!customer_phone?.trim()) return res.status(400).json({ message: "Customer phone required" });
     if (!message?.trim())        return res.status(400).json({ message: "Message required" });
     const { rows } = await query(`
       INSERT INTO follow_ups (business_id, customer_phone, message, scheduled_at, sent, created_at)
-      VALUES ($1,$2,$3,$4,false,NOW()) RETURNING id`,
-      [req.user.business_id, customer_phone, message, scheduled_at || null]
+      VALUES ($1,$2,$3,$4,FALSE,NOW()) RETURNING id`,
+      [req.user.business_id, customer_phone, message, scheduled_at||null]
     );
     res.json({ success: true, id: rows[0].id });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── PUT /follow-ups/:id ───────────────────────────────────────
-router.put("/follow-ups/:id", async (req, res) => {
+// ── PUT /followups/:id ────────────────────────────────────────
+router.put("/followups/:id", async (req, res) => {
   try {
-    const { customer_phone, message, scheduled_at, status } = req.body;
+    const { customer_phone, message, scheduled_at } = req.body;
     await query(`
-      UPDATE follow_ups SET customer_phone=$1, message=$2, scheduled_at=$3, sent=$4
-      WHERE id=$5 AND business_id=$6`,
-      [customer_phone, message, scheduled_at||null, status||true, req.params.id, req.user.business_id]
+      UPDATE follow_ups SET customer_phone=$1, message=$2, scheduled_at=$3
+      WHERE id=$4 AND business_id=$5 AND sent=FALSE`,
+      [customer_phone, message, scheduled_at||null, req.params.id, req.user.business_id]
     );
     res.json({ success: true });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ── PATCH /follow-ups/:id/cancel ─────────────────────────────
-router.patch("/follow-ups/:id/cancel", async (req, res) => {
-  try {
-    await query(
-      "UPDATE follow_ups SET reason='cancelled' WHERE id=$1 AND business_id=$2 AND send=false",
-      [req.params.id, req.user.business_id]
-    );
-    res.json({ success: true });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// ── DELETE /follow-ups/:id ────────────────────────────────────
-router.delete("/follow-ups/:id", async (req, res) => {
+// ── DELETE /followups/:id ─────────────────────────────────────
+router.delete("/followups/:id", async (req, res) => {
   try {
     await query("DELETE FROM follow_ups WHERE id=$1 AND business_id=$2", [req.params.id, req.user.business_id]);
     res.json({ success: true });

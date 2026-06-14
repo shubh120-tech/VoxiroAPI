@@ -187,7 +187,7 @@ router.get("/analytics/dashboard", async (req, res) => {
 // ── Leads ─────────────────────────────────────────────────────
 router.get("/leads", async (req, res) => {
   try {
-    const { page=1, limit=20, status, search } = req.query;
+    const { page=1, limit=20, status, search, date_from, date_to } = req.query;
     const offset = (page-1)*limit;
     const isTeam = req.user.type === "team_member";
     let sql = `SELECT * FROM leads WHERE business_id=$1`;
@@ -195,12 +195,55 @@ router.get("/leads", async (req, res) => {
     if (isTeam) { params.push(req.user.id); sql += ` AND conversation_id IN (SELECT id FROM conversations WHERE business_id=$1 AND assigned_to=$${params.length}::uuid)`; }
     if (status) { params.push(status); sql += ` AND status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); sql += ` AND (customer_name ILIKE $${params.length} OR phone ILIKE $${params.length})`; }
+    if (date_from) { params.push(date_from); sql += ` AND created_at >= $${params.length}::date`; }
+    if (date_to)   { params.push(date_to);   sql += ` AND created_at < ($${params.length}::date + INTERVAL '1 day')`; }
     const countSql = sql.replace("SELECT *","SELECT COUNT(*)");
     sql += ` ORDER BY created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`;
     params.push(limit, offset);
     const [data, count] = await Promise.all([query(sql, params), query(countSql, params.slice(0,-2))]);
     res.json({ leads:data.rows, total:parseInt(count.rows[0].count) });
   } catch (err) { res.status(500).json({ message:"Failed to load leads" }); }
+});
+
+// ── GET /leads/export — CSV download ──────────────────────────
+router.get("/leads/export", async (req, res) => {
+  try {
+    const { status, search, date_from, date_to } = req.query;
+    const isTeam = req.user.type === "team_member";
+    let sql = `SELECT * FROM leads WHERE business_id=$1`;
+    const params = [req.user.business_id];
+    if (isTeam) { params.push(req.user.id); sql += ` AND conversation_id IN (SELECT id FROM conversations WHERE business_id=$1 AND assigned_to=$${params.length}::uuid)`; }
+    if (status && status !== "all") { params.push(status); sql += ` AND status=$${params.length}`; }
+    if (search) { params.push(`%${search}%`); sql += ` AND (customer_name ILIKE $${params.length} OR phone ILIKE $${params.length})`; }
+    if (date_from) { params.push(date_from); sql += ` AND created_at >= $${params.length}::date`; }
+    if (date_to)   { params.push(date_to);   sql += ` AND created_at < ($${params.length}::date + INTERVAL '1 day')`; }
+    sql += ` ORDER BY created_at DESC`;
+
+    const { rows } = await query(sql, params);
+
+    // Build CSV
+    const headers = ["Customer Name","Phone","Product Interest","Budget","Intent","Status","Notes","Created At"];
+    const escapeCsv = (val) => {
+      if (val === null || val === undefined) return "";
+      const s = String(val).replace(/"/g, '""');
+      return /[",\n]/.test(s) ? `"${s}"` : s;
+    };
+    const lines = [headers.join(",")];
+    for (const l of rows) {
+      lines.push([
+        l.customer_name, l.phone, l.product_interest, l.budget, l.intent, l.status, l.notes,
+        l.created_at ? new Date(l.created_at).toISOString().slice(0,10) : "",
+      ].map(escapeCsv).join(","));
+    }
+    const csv = lines.join("\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="yougant-leads-${new Date().toISOString().slice(0,10)}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error("Leads export error:", err.message);
+    res.status(500).json({ message: "Failed to export leads: " + err.message });
+  }
 });
 
 router.post("/leads", async (req, res) => {

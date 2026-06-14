@@ -527,15 +527,24 @@ router.put("/settings/profile", async (req, res) => {
 
 router.put("/settings/whatsapp", async (req, res) => {
   try {
-    const { phoneNumberId, accessToken, webhookSecret } = req.body;
+    const { phoneNumberId, wabaId, accessToken, webhookSecret } = req.body;
     if (!phoneNumberId?.trim()) return res.status(400).json({ message:"Phone Number ID is required" });
-    const { rows: existing } = await query("SELECT id FROM whatsapp_configs WHERE business_id=$1",[req.user.business_id]);
+    if (!wabaId?.trim())        return res.status(400).json({ message:"WABA ID is required" });
+
+    const { rows: existing } = await query("SELECT id, access_token FROM whatsapp_configs WHERE business_id=$1",[req.user.business_id]);
+
+    // Access token required on first-time setup (no existing config or no token stored yet)
+    const hasExistingToken = existing.length > 0 && !!existing[0].access_token;
+    if (!hasExistingToken && !accessToken?.trim()) {
+      return res.status(400).json({ message:"Access Token is required" });
+    }
+
     if (existing.length > 0) {
-      await query(`UPDATE whatsapp_configs SET phone_number_id=$1, access_token=CASE WHEN $2::text IS NOT NULL AND $2::text!='' THEN $2 ELSE access_token END, webhook_secret=CASE WHEN $3::text IS NOT NULL AND $3::text!='' THEN $3 ELSE webhook_secret END, updated_at=NOW() WHERE business_id=$4`,
-        [phoneNumberId.trim(), accessToken||null, webhookSecret||null, req.user.business_id]);
+      await query(`UPDATE whatsapp_configs SET phone_number_id=$1, waba_id=$2, access_token=CASE WHEN $3::text IS NOT NULL AND $3::text!='' THEN $3 ELSE access_token END, webhook_secret=CASE WHEN $4::text IS NOT NULL AND $4::text!='' THEN $4 ELSE webhook_secret END, updated_at=NOW() WHERE business_id=$5`,
+        [phoneNumberId.trim(), wabaId.trim(), accessToken||null, webhookSecret||null, req.user.business_id]);
     } else {
-      await query(`INSERT INTO whatsapp_configs (business_id,phone_number_id,access_token,webhook_secret,is_verified) VALUES ($1,$2,$3,$4,FALSE)`,
-        [req.user.business_id, phoneNumberId.trim(), accessToken||null, webhookSecret||null]);
+      await query(`INSERT INTO whatsapp_configs (business_id,phone_number_id,waba_id,access_token,webhook_secret,is_verified) VALUES ($1,$2,$3,$4,$5,FALSE)`,
+        [req.user.business_id, phoneNumberId.trim(), wabaId.trim(), accessToken||null, webhookSecret||null]);
     }
     res.json({ success:true });
   } catch (err) { console.error("WhatsApp config error:",err.message); res.status(500).json({ message:"Failed to update WhatsApp config: "+err.message }); }

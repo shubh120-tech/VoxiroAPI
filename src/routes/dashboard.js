@@ -393,15 +393,35 @@ router.get("/agent/status", async (req, res) => {
       query("SELECT COUNT(*) FROM conversations WHERE business_id=$1 AND status!='closed'",[bId]),
       query(`SELECT COUNT(*) AS cnt FROM messages WHERE business_id=$1 AND role='agent' AND created_at>=date_trunc('month',NOW() AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`,[bId]).catch(()=>({rows:[{cnt:0}]})),
     ]);
-    let subUsed=null, subLimit=null;
+    let subUsed=null, subLimit=null, tokenLimit=0;
     try {
-      const sub = await query(`SELECT s.messages_used,p.message_limit FROM subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.business_id=$1 ORDER BY s.created_at DESC LIMIT 1`,[bId]);
-      if (sub.rows[0]) { subUsed=parseInt(sub.rows[0].messages_used); subLimit=parseInt(sub.rows[0].message_limit); }
+      const sub = await query(`SELECT s.messages_used,p.message_limit,COALESCE(p.token_limit,0) AS token_limit FROM subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.business_id=$1 ORDER BY s.created_at DESC LIMIT 1`,[bId]);
+      if (sub.rows[0]) { subUsed=parseInt(sub.rows[0].messages_used); subLimit=parseInt(sub.rows[0].message_limit); tokenLimit=parseInt(sub.rows[0].token_limit)||0; }
     } catch {}
+
+    // Token usage this month (same source as /billing/current)
+    let tokensUsed = 0;
+    try {
+      const tokenRows = await query(`
+        SELECT COALESCE(SUM(total_tokens),0) AS tokens_used
+        FROM ai_usage_logs
+        WHERE business_id=$1 AND created_at >= date_trunc('month', NOW())
+      `,[bId]);
+      tokensUsed = parseInt(tokenRows.rows[0]?.tokens_used) || 0;
+    } catch {}
+
     const actualUsed = parseInt(msgCount.rows[0]?.cnt)||0;
     const used  = (subUsed!==null&&subUsed>0)?subUsed:actualUsed;
     const limit = (subLimit!==null&&subLimit>0)?subLimit:(parseInt(agent.rows[0]?.message_limit)||1000);
-    res.json({ agentName:agent.rows[0]?.agent_name||"Aria", active:agent.rows[0]?.is_active||false, used, limit, activeConversations:parseInt(convs.rows[0]?.count)||0, unreadCount:0, notifCount:0 });
+    res.json({
+      agentName:agent.rows[0]?.agent_name||"Aria",
+      active:agent.rows[0]?.is_active||false,
+      used, limit,
+      tokens_used: tokensUsed,
+      token_limit: tokenLimit,
+      activeConversations:parseInt(convs.rows[0]?.count)||0,
+      unreadCount:0, notifCount:0,
+    });
   } catch (err) { console.error("Agent status error:",err.message); res.status(500).json({ message:"Failed to load agent status" }); }
 });
 

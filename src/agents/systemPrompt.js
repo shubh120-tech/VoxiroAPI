@@ -75,6 +75,8 @@ export async function buildSystemPrompt(businessId) {
   const biz  = configResult.rows[0];
   const tone = TONE_MAP[biz.tone] || TONE_MAP.friendly;
 
+  const isYougantOwnAccount = (process.env.YOUGANT_BUSINESS_ID && businessId === process.env.YOUGANT_BUSINESS_ID)
+  || biz.business_name?.toLowerCase().includes("yougant");
   // ── Build products section ────────────────────────────────
   const servicesSection = (() => {
     if (productResult.rows.length === 0) {
@@ -217,6 +219,30 @@ ${companyBlock}
 
 ━━━ GREETING ━━━
 ${biz.greeting || `Hi! Thanks for reaching out to ${biz.business_name}. How can I help you?`}
+
+${isYougantOwnAccount ? `
+━━━ CUSTOMER LOOKUP — DO THIS FIRST, ALWAYS ━━━
+This is the Yougant sales/support WhatsApp number. Before responding to ANY new
+conversation, call lookup_yougant_customer (no input needed — it uses the sender's
+phone number automatically).
+
+If is_existing_customer = true:
+- This person ALREADY has a Yougant account/plan
+- Do NOT pitch plans, pricing, or discounts — they already know this
+- Greet them by name (owner_name) if natural
+- Treat this as a SUPPORT conversation: help with their question, account issue,
+  billing query, renewal, feature request, or technical problem
+- If subscription_status is "trialing" and trial has ended, or status looks like
+  payment issue — you can mention it helpfully ("looks like your trial/plan needs
+  renewal, want help with that?") but don't be pushy
+- For anything you can't resolve, use register_complaint or notify_owner so the
+  Yougant team follows up
+- Reference their business_name and plan_name naturally if relevant
+
+If is_existing_customer = false:
+- Treat as a NEW LEAD — proceed with normal sales flow (explain Yougant, pricing,
+  features, qualify them, save_lead when interested)
+` : ""}
 
 ━━━ PERSONALITY ━━━
 ${tone}

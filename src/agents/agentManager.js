@@ -7,6 +7,7 @@ import { checkAvailabilityTool, executeCheckAvailability  } from "./tools/checkA
 import { notifyOwnerTool,       executeNotifyOwner        } from "./tools/notifyOwner.js";
 import { scheduleFollowupTool,  executeScheduleFollowup   } from "./tools/scheduleFollowup.js";
 import { registerComplaintTool, executeRegisterComplaint } from "./tools/registerComplaint.js";
+import { lookupYougantCustomerTool, executeLookupYougantCustomer } from "./tools/lookupYougantCustomer.js";
 import {
   updateAppointmentTool, executeUpdateAppointment,
   cancelAppointmentTool, executeCancelAppointment,
@@ -35,6 +36,7 @@ const TOOLS = [
   updateFollowupTool,
   cancelFollowupTool,
   registerComplaintTool,
+  lookupYougantCustomerTool,
 ];
 
 // ── Processing lock — prevents double replies ─────────────────
@@ -468,6 +470,7 @@ async function executeTool({ toolName, input, businessId, conversationId, custom
     case "update_followup":     return executeUpdateFollowup(ctx);
     case "cancel_followup":     return executeCancelFollowup(ctx);
     case "register_complaint": return executeRegisterComplaint(ctx);
+    case "lookup_yougant_customer": return executeLookupYougantCustomer(ctx);  // ← ADD THIS
     default:                    return { error: `Unknown tool: ${toolName}` };
   }
 }

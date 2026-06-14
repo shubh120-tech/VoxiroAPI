@@ -527,9 +527,12 @@ router.put("/settings/profile", async (req, res) => {
 
 router.put("/settings/whatsapp", async (req, res) => {
   try {
-    const { phoneNumberId, wabaId, accessToken, webhookSecret } = req.body;
+    // Accept both camelCase and snake_case in case frontend sends either
+    const { phoneNumberId, accessToken, webhookSecret } = req.body;
+    const wabaId = req.body.wabaId || req.body.waba_id;
+
     if (!phoneNumberId?.trim()) return res.status(400).json({ message:"Phone Number ID is required" });
-    if (!wabaId?.trim())        return res.status(400).json({ message:"WABA ID is required" });
+    if (!wabaId?.trim())        return res.status(400).json({ message:"WABA ID (WhatsApp Business Account ID) is required" });
 
     const { rows: existing } = await query("SELECT id, access_token FROM whatsapp_configs WHERE business_id=$1",[req.user.business_id]);
 
